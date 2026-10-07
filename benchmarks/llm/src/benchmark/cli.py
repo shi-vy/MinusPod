@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import hashlib
 import logging
 import shutil
 from datetime import datetime, timezone
@@ -14,7 +16,7 @@ from dotenv import load_dotenv
 # regardless of where the user invokes `benchmark` from. Shell-exported vars still win.
 load_dotenv(dotenv_path=Path(__file__).resolve().parents[2] / ".env", override=False)
 
-from . import auth, capture as capture_mod, corpus as corpus_mod, migrate as migrate_mod, parsing, pricing, report as report_mod, runner as runner_mod
+from . import auth, capture as capture_mod, corpus as corpus_mod, migrate as migrate_mod, parsing, pricing, report as report_mod, runner as runner_mod, variants
 from .config import BenchmarkConfig, load as load_config
 from .runner import build_work_list, precompute_prompt_hashes
 from .storage import find_call, hash_prompt, read_response, scan_calls
@@ -32,6 +34,14 @@ def _validate_addressing_mode(mode: str) -> None:
     if mode not in ADDRESSING_MODES:
         typer.echo(f"error: --addressing-mode must be one of {ADDRESSING_MODES}, got {mode!r}", err=True)
         raise typer.Exit(2)
+
+
+def _validate_prompt_variant(name: str) -> None:
+    try:
+        variants.validate_variant(name)
+    except ValueError as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(2) from e
 
 
 def _with_id_mode_section(system_prompt: str, addressing_mode: str) -> str:
@@ -64,6 +74,20 @@ def _resolve_prompt(snapshot: Path | None) -> tuple[str, str]:
     except (FileNotFoundError, ValueError) as e:
         typer.echo(f"error: {e}", err=True)
         raise typer.Exit(1) from e
+
+
+def _resolve_prompt_for_variant(prompt_variant: str, snapshot: Path | None, addressing_mode: str) -> tuple[str, str]:
+    """Segmentation uses its own frozen prompt and is mode-agnostic; --snapshot
+    doesn't apply to it. Detection keeps the existing live/snapshot + id-mode path."""
+    if prompt_variant == "segmentation":
+        if snapshot is not None:
+            typer.echo("error: segmentation variant uses its frozen prompt", err=True)
+            raise typer.Exit(2)
+        system_prompt = variants.segmentation_system_prompt()
+        sha8 = hashlib.sha256(system_prompt.encode()).hexdigest()[:8]
+        return system_prompt, f"segmentation-v1.txt (sha256:{sha8})"
+    system_prompt, prompt_source = _resolve_prompt(snapshot)
+    return _with_id_mode_section(system_prompt, addressing_mode), prompt_source
 
 
 @app.command()
@@ -187,17 +211,42 @@ def run(
         "and the model reports start_id/end_id). Lets an A/B run be a single command "
         "per side: `benchmark run` then `benchmark run --addressing-mode segment_ids`.",
     ),
+    prompt_variant: str = typer.Option(
+        variants.DEFAULT_VARIANT, "--prompt-variant",
+        help="System prompt variant: 'detection' (default, live/snapshot prompt) or "
+        "'segmentation' (frozen prompt; --snapshot not allowed with it).",
+    ),
+    model: list[str] = typer.Option(
+        [], "--model", help="Only run this model id (exact match); repeatable. Unknown ids exit 2.",
+    ),
+    episode: list[str] = typer.Option(
+        [], "--episode", help="Only run this episode directory name (exact match); repeatable. Unknown names exit 2.",
+    ),
 ) -> None:
     """Auto-fill all gaps in calls.jsonl, then regenerate report."""
     _setup_logging()
     _validate_addressing_mode(addressing_mode)
+    _validate_prompt_variant(prompt_variant)
     cfg = _load(config_path)
-    system_prompt, prompt_source = _resolve_prompt(snapshot)
-    system_prompt = _with_id_mode_section(system_prompt, addressing_mode)
+    system_prompt, prompt_source = _resolve_prompt_for_variant(prompt_variant, snapshot, addressing_mode)
     episodes = [corpus_mod.load_episode(cfg.corpus.path / e) for e in corpus_mod.list_episodes(cfg.corpus.path)]
     if not episodes:
         typer.echo("no corpus episodes; run `benchmark capture` first", err=True)
         raise typer.Exit(1)
+
+    if model:
+        unknown_models = sorted(set(model) - {m.id for m in cfg.models})
+        if unknown_models:
+            typer.echo(f"error: unknown --model value(s): {', '.join(unknown_models)}", err=True)
+            raise typer.Exit(2)
+        cfg = dataclasses.replace(cfg, models=[m for m in cfg.models if m.id in model])
+
+    if episode:
+        unknown_episodes = sorted(set(episode) - {e.ep_id for e in episodes})
+        if unknown_episodes:
+            typer.echo(f"error: unknown --episode value(s): {', '.join(unknown_episodes)}", err=True)
+            raise typer.Exit(2)
+        episodes = [e for e in episodes if e.ep_id in episode]
 
     paths = runner_mod.RunPaths.for_root(_root() / "results")
     snapshots_dir = _root() / "data" / "pricing_snapshots"
@@ -213,14 +262,14 @@ def run(
     if dry_run:
         units, skipped = _preview(
             cfg, episodes, paths=paths, system_prompt=system_prompt,
-            include_errored=retry_errors, addressing_mode=addressing_mode,
+            include_errored=retry_errors, addressing_mode=addressing_mode, prompt_variant=prompt_variant,
         )
         typer.echo(f"dry-run: {len(units)} calls would execute, {skipped} skipped (already done)")
         raise typer.Exit(0)
 
     stats = asyncio.run(runner_mod.run(
         cfg, episodes, paths=paths, pricing_snapshot=snap, system_prompt=system_prompt,
-        include_errored=retry_errors, addressing_mode=addressing_mode,
+        include_errored=retry_errors, addressing_mode=addressing_mode, prompt_variant=prompt_variant,
     ))
     typer.echo(f"run complete: total={stats.total_units} skipped={stats.skipped} completed={stats.completed} errored={stats.errored}")
 
@@ -256,12 +305,18 @@ def report(
         "addressing mode (records without the field are 'timestamps'). A report never "
         "mixes modes; run this twice to get both sides of an A/B.",
     ),
+    prompt_variant: str = typer.Option(
+        variants.DEFAULT_VARIANT, "--prompt-variant",
+        help="System prompt variant the report's prompt_source label describes: "
+        "'detection' (default, live/snapshot prompt) or 'segmentation' (frozen prompt).",
+    ),
 ) -> None:
     """Regenerate results/report.md from existing calls.jsonl."""
     _setup_logging()
     _validate_addressing_mode(addressing_mode)
+    _validate_prompt_variant(prompt_variant)
     cfg = _load(config_path)
-    _, prompt_source = _resolve_prompt(snapshot)
+    _, prompt_source = _resolve_prompt_for_variant(prompt_variant, snapshot, addressing_mode)
     episodes = [corpus_mod.load_episode(cfg.corpus.path / e) for e in corpus_mod.list_episodes(cfg.corpus.path)]
     paths = runner_mod.RunPaths.for_root(_root() / "results")
     snap = pricing.latest_snapshot(_root() / "data" / "pricing_snapshots") or pricing.fetch_current()
@@ -283,9 +338,17 @@ def report(
 @app.command()
 def dump_prompt(
     output: Path = typer.Argument(..., help="File to write the current live system prompt to"),
+    prompt_variant: str = typer.Option(
+        variants.DEFAULT_VARIANT, "--prompt-variant",
+        help="'detection' (default, dumps the live prompt) or 'segmentation' (dumps the frozen segmentation prompt).",
+    ),
 ) -> None:
-    """Freeze the current live system prompt to a file for use with `run --snapshot`."""
-    text = parsing.get_static_system_prompt()
+    """Freeze the current system prompt to a file for use with `run --snapshot`."""
+    _validate_prompt_variant(prompt_variant)
+    text = (
+        variants.segmentation_system_prompt() if prompt_variant == "segmentation"
+        else parsing.get_static_system_prompt()
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(text)
     typer.echo(f"wrote prompt snapshot: {output} ({len(text)} chars)")
@@ -338,18 +401,24 @@ def show_prompt_cmd(
         help="Must match the call record's stored addressing_mode if given; omit to trust "
         "the record (records without the field are 'timestamps').",
     ),
+    prompt_variant: str | None = typer.Option(
+        None, "--prompt-variant",
+        help="Must match the call record's stored prompt_variant if given; omit to trust "
+        "the record (records without the field are 'detection').",
+    ),
 ) -> None:
     """Reconstruct the exact user prompt for a call from the corpus and verify it against prompt_hash.
 
     Prompts are not stored on disk (schema v2); this rebuilds them
     deterministically from windows.json + metadata and proves fidelity by
-    recomputing the hash recorded at call time. The addressing mode used is
-    the one stored on the call record, not a global default.
+    recomputing the hash recorded at call time. The addressing mode and prompt
+    variant used are the ones stored on the call record, not a global default.
     """
     cfg = _load(config_path)
     paths = runner_mod.RunPaths.for_root(_root() / "results")
     rec = _find_call_or_exit(paths, call_id)
     record_mode = rec.get("addressing_mode", "timestamps")
+    record_variant = rec.get("prompt_variant", "detection")
     if addressing_mode is not None:
         _validate_addressing_mode(addressing_mode)
         if addressing_mode != record_mode:
@@ -358,13 +427,20 @@ def show_prompt_cmd(
                 f"stored addressing_mode {record_mode}", err=True,
             )
             raise typer.Exit(1)
+    if prompt_variant is not None:
+        _validate_prompt_variant(prompt_variant)
+        if prompt_variant != record_variant:
+            typer.echo(
+                f"error: --prompt-variant {prompt_variant} does not match this call's "
+                f"stored prompt_variant {record_variant}", err=True,
+            )
+            raise typer.Exit(1)
     try:
         user_prompt = runner_mod.reconstruct_user_prompt(rec, corpus_dir=cfg.corpus.path)
     except Exception as e:
         typer.echo(f"error reconstructing prompt: {e}", err=True)
         raise typer.Exit(1) from e
-    system_prompt, prompt_source = _resolve_prompt(snapshot)
-    system_prompt = _with_id_mode_section(system_prompt, record_mode)
+    system_prompt, prompt_source = _resolve_prompt_for_variant(record_variant, snapshot, record_mode)
     recomputed = hash_prompt(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
@@ -448,8 +524,10 @@ def rotate_raw_cmd(
     typer.echo(f"rotated {size_mb:.0f} MB to {dst}" + (" (original kept)" if keep else ""))
 
 
-def _preview(cfg, episodes, *, paths, system_prompt, include_errored=False, addressing_mode="timestamps"):
-    hashes = precompute_prompt_hashes(cfg, episodes, system_prompt=system_prompt, addressing_mode=addressing_mode)
+def _preview(cfg, episodes, *, paths, system_prompt, include_errored=False, addressing_mode="timestamps", prompt_variant="detection"):
+    hashes = precompute_prompt_hashes(
+        cfg, episodes, system_prompt=system_prompt, addressing_mode=addressing_mode, prompt_variant=prompt_variant,
+    )
     completed, err_keys = scan_calls(paths.calls_jsonl)
     units, skipped = build_work_list(
         cfg, episodes, completed=completed, prompt_hashes=hashes,

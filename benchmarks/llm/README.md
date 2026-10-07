@@ -97,7 +97,7 @@ benchmark run --dry-run                    # preview what would run, no API call
 benchmark run --retry-errors               # also retry calls recorded with error
 ```
 
-`benchmark run` always reads `[[models]]` from `benchmark.toml` and `data/corpus/` for episodes. To restrict scope, edit the config (set `deprecated = true`) or move episode directories. There are no `--model` or `--episode` filters.
+`benchmark run` reads `[[models]]` from `benchmark.toml` and all episodes in `data/corpus/`, scheduling everything unless narrowed. Repeatable `--model <id>` and `--episode <ep-id>` options restrict a run to exact-match model ids or episode directory names; an unknown name exits 2 and lists what it didn't recognize. Without these flags, restrict scope by editing the config (set `deprecated = true`) or moving episode directories.
 
 ### Regenerate the report from existing data
 

@@ -11,7 +11,7 @@ from pathlib import Path
 from utils.time import utc_now_iso
 from utils.prompt import scrub_description
 
-from . import llm, parsing, pricing
+from . import llm, parsing, pricing, variants
 from .config import BenchmarkConfig
 from .corpus import Episode, load_episode, stamp_id_windows
 from .metrics import compliance_score, schema_audit
@@ -114,6 +114,7 @@ def precompute_prompt_hashes(
     *,
     system_prompt: str,
     addressing_mode: str = "timestamps",
+    prompt_variant: str = "detection",
 ) -> dict[tuple[str, str, int, int], str]:
     """User prompt is identical across (model, trial); cache once per (episode, window).
 
@@ -129,7 +130,7 @@ def precompute_prompt_hashes(
             id_segments = id_windows[w.index] if id_windows is not None else None
             user_prompts[(ep.ep_id, w.index)] = _build_user_prompt(
                 ep, w, total_windows=len(ep.windows),
-                addressing_mode=addressing_mode, id_segments=id_segments,
+                addressing_mode=addressing_mode, prompt_variant=prompt_variant, id_segments=id_segments,
             )
     active_models = [m for m in cfg.models if not m.deprecated]
     hash_by_model_window: dict[tuple[str, str, int], str] = {
@@ -166,16 +167,18 @@ def reconstruct_user_prompt(record: dict, *, corpus_dir: Path) -> str:
         )
     window = episode.windows[window_index]
     addressing_mode = record.get("addressing_mode", "timestamps")
+    prompt_variant = record.get("prompt_variant", "detection")
     id_segments = stamp_id_windows(episode)[window_index] if addressing_mode == "segment_ids" else None
     return _build_user_prompt(
         episode, window, total_windows=len(episode.windows),
-        addressing_mode=addressing_mode, id_segments=id_segments,
+        addressing_mode=addressing_mode, prompt_variant=prompt_variant, id_segments=id_segments,
     )
 
 
 def _build_user_prompt(
     episode: Episode, window, *, total_windows: int,
     addressing_mode: str = "timestamps",
+    prompt_variant: str = "detection",
     id_segments: list[dict] | None = None,
 ) -> str:
     description = scrub_description(episode.metadata.description, max_length=4000)
@@ -184,6 +187,18 @@ def _build_user_prompt(
         transcript_lines = [f"[{seg['sid']}] {seg['text']}" for seg in (id_segments or [])]
     else:
         transcript_lines = window.transcript_lines
+    if prompt_variant == "segmentation":
+        return variants.format_segmentation_prompt(
+            podcast_name=episode.metadata.podcast_name,
+            episode_title=episode.metadata.title,
+            description_section=description_section,
+            transcript_lines=transcript_lines,
+            window_index=window.index,
+            total_windows=total_windows,
+            window_start=window.start,
+            window_end=window.end,
+            addressing_mode=addressing_mode,
+        )
     return parsing.format_window_prompt(
         podcast_name=episode.metadata.podcast_name,
         episode_title=episode.metadata.title,
@@ -206,9 +221,10 @@ async def run(
     system_prompt: str,
     include_errored: bool = False,
     addressing_mode: str = "timestamps",
+    prompt_variant: str = "detection",
 ) -> RunStats:
     prompt_hashes = precompute_prompt_hashes(
-        cfg, episodes, system_prompt=system_prompt, addressing_mode=addressing_mode,
+        cfg, episodes, system_prompt=system_prompt, addressing_mode=addressing_mode, prompt_variant=prompt_variant,
     )
     id_windows_by_ep = _id_windows_for_episodes(episodes, addressing_mode)
 
@@ -239,7 +255,7 @@ async def run(
         id_segments = id_windows[unit.window_index] if id_windows is not None else None
         user_prompt = _build_user_prompt(
             episode, window, total_windows=len(episode.windows),
-            addressing_mode=addressing_mode, id_segments=id_segments,
+            addressing_mode=addressing_mode, prompt_variant=prompt_variant, id_segments=id_segments,
         )
         ph = prompt_hashes[(unit.model_id, unit.episode_id, unit.trial, unit.window_index)]
 
@@ -282,7 +298,11 @@ async def run(
             elapsed_ms = int((time.perf_counter() - t0) * 1000)
             id_contract_miss = False
             try:
-                if addressing_mode == "segment_ids":
+                if prompt_variant == "segmentation":
+                    parsed_ads, extraction_method, id_contract_miss = variants.parse_segmentation_response(
+                        response_text, addressing_mode, id_segments,
+                    )
+                elif addressing_mode == "segment_ids":
                     parsed_ads, extraction_method, id_contract_miss = _parse_id_response(response_text, id_segments)
                 else:
                     parsed_ads, extraction_method = _parse_response(response_text)
@@ -312,6 +332,7 @@ async def run(
                 "window_index": unit.window_index,
                 "temperature": cfg.run.temperature,
                 "addressing_mode": addressing_mode,
+                "prompt_variant": prompt_variant,
                 "prompt_hash": ph,
                 "response_time_ms": elapsed_ms,
                 "input_tokens": input_tokens,
@@ -362,15 +383,18 @@ def derive_episode_results(cfg: BenchmarkConfig, episodes: list[Episode], *, pat
     if paths.episode_results_jsonl.exists():
         paths.episode_results_jsonl.unlink()
 
-    by_trial: dict[tuple[str, str, int], list[dict]] = {}
+    by_trial: dict[tuple[str, str, int, str, str], list[dict]] = {}
     for rec in read_jsonl(paths.calls_jsonl):
         if rec.get("error"):
             continue
-        key = (rec["model"], rec["episode_id"], rec["trial"])
+        key = (
+            rec["model"], rec["episode_id"], rec["trial"],
+            rec.get("addressing_mode", "timestamps"), rec.get("prompt_variant", "detection"),
+        )
         by_trial.setdefault(key, []).append(rec)
 
     episodes_by_id = {ep.ep_id: ep for ep in episodes}
-    for (model, episode_id, trial), records in by_trial.items():
+    for (model, episode_id, trial, addressing_mode, prompt_variant), records in by_trial.items():
         episode = episodes_by_id.get(episode_id)
         if episode is None:
             continue
@@ -387,6 +411,8 @@ def derive_episode_results(cfg: BenchmarkConfig, episodes: list[Episode], *, pat
             "model": model,
             "episode_id": episode_id,
             "trial": trial,
+            "addressing_mode": addressing_mode,
+            "prompt_variant": prompt_variant,
             "window_count": len(records),
             "merged_ads": deduped,
             "total_input_tokens": sum(r.get("input_tokens", 0) for r in records),

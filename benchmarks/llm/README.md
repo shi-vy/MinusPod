@@ -178,6 +178,34 @@ approximate boundaries.
 `benchmark show-prompt` reconstructs a call's prompt using the mode stored on
 that call's record, so it works unmodified for either mode.
 
+## Prompt variants
+
+Separate from addressing mode, the benchmark can run two system prompts:
+`detection` (default, the live/snapshot prompt production ships) and
+`segmentation` (a frozen prompt at `prompts/segmentation-v1.txt` that asks the
+model to segment the whole episode into typed blocks instead of only
+flagging ads).
+
+```sh
+benchmark run --prompt-variant segmentation --addressing-mode segment_ids
+benchmark report --prompt-variant segmentation --addressing-mode segment_ids
+```
+
+Each `(prompt_variant, addressing_mode)` pair is its own report cell. The
+default cell (`detection`, `timestamps`) keeps `results/report.md` and
+`results/report_assets/`; any other cell writes
+`results/report-<variant>-<mode>.md` and `results/report_assets-<variant>-
+<mode>/`, so cells never clobber each other's charts. `benchmark compare`
+renders every cell found in `calls.jsonl` side by side in
+`results/comparison.md`. `show-prompt` and `dump-prompt` also accept
+`--prompt-variant`.
+
+Rows imported from PR #801 via `scripts/import_calls.py` carry
+`prompt_variant=segmentation`, all recorded under `addressing_mode=segment_ids`.
+One imported row's `show-prompt` hash does not verify against the current
+`segmentation-v1.txt`; treat imported `prompt_hash` values as historical
+record, not reproducible against the live frozen prompt.
+
 ## Adding a new model or episode
 
 - New model: append `[[models]]` to `benchmark.toml`. `benchmark run` will fill the gaps (existing models stay cached).

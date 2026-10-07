@@ -3,6 +3,7 @@ response parsing, kept alongside the detection path production ships."""
 from __future__ import annotations
 
 import json
+import logging
 import re
 from pathlib import Path
 
@@ -10,8 +11,11 @@ from config import repair_segment_category  # type: ignore[import-not-found]
 
 from . import parsing
 
+logger = logging.getLogger(__name__)
+
 PROMPT_VARIANTS = ("detection", "segmentation")
 DEFAULT_VARIANT = "detection"
+ADDRESSING_MODES = ("timestamps", "segment_ids")
 SEGMENTATION_PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "segmentation-v1.txt"
 # main_content/teaser/transition fail repair_segment_category; intro/outro/recap
 # are dropped here too, so merged rows stay comparable to the detection prompt.
@@ -109,51 +113,64 @@ def format_segmentation_prompt(
     )
 
 
-def _is_int_valued(value) -> bool:
+def _to_int_or_none(value) -> int | None:
+    """value as an int if it is integer-valued (e.g. 1, 1.0, "1.0"), else None."""
     try:
-        return float(value) == int(float(value))
-    except (TypeError, ValueError):
-        return False
+        f = float(value)
+        return int(f) if f == int(f) else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _normalize_direct_method(method: str | None) -> str | None:
+    """A raw JSON-wrapping method that carries ads collapses to the one
+    compliance label the segmentation prompt's object shape earns."""
+    if method in ("json_object_segments_key", "json_array_direct"):
+        return "segmentation_object_direct"
+    return method
 
 
 def parse_segmentation_response(
     response_text: str, addressing_mode: str, id_segments: list[dict] | None,
-) -> tuple[list[dict], str, bool]:
+) -> tuple[list[dict], str | None, bool]:
     raw, method = parsing.extract_json_ads_array(response_text)
     if raw is None:
-        return [], method or "none", False
+        return [], method, False
 
     kept = [
         entry for entry in raw
         if isinstance(entry, dict) and repair_segment_category(entry.get("category")) in PROMO_CATEGORIES
     ]
     if not kept:
-        return [], method, False
+        # A valid all-main_content answer: no promo entries to judge the id
+        # contract against, so score it as full compliance for the mode in use.
+        no_promo_method = "segment_id_direct" if addressing_mode == "segment_ids" else "segmentation_object_direct"
+        return [], no_promo_method, False
 
     if addressing_mode == "segment_ids":
         id_entries = []
+        skipped = 0
         for entry in kept:
-            start, end = entry.get("start"), entry.get("end")
-            if _is_int_valued(start) and _is_int_valued(end):
+            start_id, end_id = _to_int_or_none(entry.get("start")), _to_int_or_none(entry.get("end"))
+            if start_id is not None and end_id is not None:
                 id_entry = {k: v for k, v in entry.items() if k not in ("start", "end")}
-                id_entry["start_id"] = int(start)
-                id_entry["end_id"] = int(end)
+                id_entry["start_id"] = start_id
+                id_entry["end_id"] = end_id
                 id_entries.append(id_entry)
+            else:
+                skipped += 1
         if id_entries:
+            if skipped:
+                logger.warning(
+                    "segmentation parse: ID-mode response mixed formats: "
+                    "skipped %d entr%s without integer-valued start/end", skipped, "y" if skipped == 1 else "ies",
+                )
             resolved = parsing.resolve_segment_id_ads(id_entries, id_segments or [])
             return resolved, "segment_id_direct", False
         # Model ignored the id contract but gave usable floats; mirrors
         # runner._parse_id_response's fallback-to-timestamps semantics.
         parsed = parsing.parse_ads_from_response(json.dumps(kept)) or []
-        fallback_method = (
-            "segmentation_object_direct" if method in ("json_object_segments_key", "json_array_direct")
-            else method
-        )
-        return list(parsed), fallback_method, True
+        return list(parsed), _normalize_direct_method(method), True
 
     parsed = parsing.parse_ads_from_response(json.dumps(kept)) or []
-    out_method = (
-        "segmentation_object_direct" if method in ("json_object_segments_key", "json_array_direct")
-        else method
-    )
-    return list(parsed), out_method, False
+    return list(parsed), _normalize_direct_method(method), False

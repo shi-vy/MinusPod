@@ -83,3 +83,95 @@ def test_compare_model_in_only_one_cell_is_omitted(
     )
     text = out.read_text()
     assert "`m1`" not in text
+
+
+def _row_cells(text: str, model: str) -> list[str]:
+    [row] = [line for line in text.splitlines() if line.startswith(f"| `{model}`")]
+    return [c.strip() for c in row.strip().strip("|").split("|")]
+
+
+def test_compare_cost_per_episode_is_divided_by_cell_episode_count(
+    tmp_path, minimal_cfg, pricing_snapshot, write_corpus_episode,
+):
+    """A cell scored over 2 episodes and one scored over 1 must report the
+    same dollars/episode for identical per-call token costs, not a total
+    that grows with how many episodes that cell happened to cover."""
+    ep1 = corpus.load_episode(write_corpus_episode(tmp_path / "corpus", ep_id="ep-1", segments=SEGMENTS))
+    ep2 = corpus.load_episode(write_corpus_episode(tmp_path / "corpus", ep_id="ep-2", segments=SEGMENTS))
+    calls_path = tmp_path / "calls.jsonl"
+    append_jsonl(calls_path, {
+        **CALL_TEMPLATE, "call_id": "det-1", "episode_id": ep1.ep_id,
+        "prompt_variant": "detection", "addressing_mode": "timestamps",
+        "parsed_ads": [{"start_time": 0.0, "end_time": 30.0}],
+    })
+    append_jsonl(calls_path, {
+        **CALL_TEMPLATE, "call_id": "det-2", "episode_id": ep2.ep_id,
+        "prompt_variant": "detection", "addressing_mode": "timestamps",
+        "parsed_ads": [{"start_time": 0.0, "end_time": 30.0}],
+    })
+    append_jsonl(calls_path, {
+        **CALL_TEMPLATE, "call_id": "seg-1", "episode_id": ep1.ep_id,
+        "prompt_variant": "segmentation", "addressing_mode": "segment_ids",
+        "parsed_ads": [{"start": 0.0, "end": 30.0}],
+    })
+
+    out = tmp_path / "comparison.md"
+    compare_mod.render(
+        cfg=minimal_cfg, episodes=[ep1, ep2], calls_path=calls_path,
+        pricing_snapshot=pricing_snapshot, output_path=out,
+    )
+    cells = _row_cells(out.read_text(), "m1")
+    detection_cost = cells[5]   # detection/timestamps cost/ep (2 episodes)
+    segmentation_cost = cells[13]  # segmentation/segment_ids cost/ep (1 episode)
+    assert detection_cost == segmentation_cost == "$0.0045"
+
+
+def test_compare_excludes_deprecated_models(
+    tmp_path, minimal_cfg, pricing_snapshot, write_corpus_episode,
+):
+    ep_dir = write_corpus_episode(tmp_path / "corpus", segments=SEGMENTS)
+    ep = corpus.load_episode(ep_dir)
+    calls_path = tmp_path / "calls.jsonl"
+    for call_id, variant, mode, ads in (
+        ("d1", "detection", "timestamps", [{"start_time": 0.0, "end_time": 30.0}]),
+        ("d2", "segmentation", "segment_ids", [{"start": 0.0, "end": 30.0}]),
+    ):
+        append_jsonl(calls_path, {
+            **CALL_TEMPLATE, "call_id": call_id, "model": "m-old", "episode_id": ep.ep_id,
+            "prompt_variant": variant, "addressing_mode": mode, "parsed_ads": ads,
+        })
+
+    out = tmp_path / "comparison.md"
+    compare_mod.render(
+        cfg=minimal_cfg, episodes=[ep], calls_path=calls_path,
+        pricing_snapshot=pricing_snapshot, output_path=out,
+    )
+    assert "m-old" not in out.read_text()
+
+
+def test_compare_renders_numeric_delta_and_pvalue_with_two_shared_episodes(
+    tmp_path, minimal_cfg, pricing_snapshot, write_corpus_episode,
+):
+    ep1 = corpus.load_episode(write_corpus_episode(tmp_path / "corpus", ep_id="ep-1", segments=SEGMENTS))
+    ep2 = corpus.load_episode(write_corpus_episode(tmp_path / "corpus", ep_id="ep-2", segments=SEGMENTS))
+    calls_path = tmp_path / "calls.jsonl"
+    for ep, det_ads in ((ep1, [{"start_time": 0.0, "end_time": 30.0}]), (ep2, [{"start_time": 0.0, "end_time": 5.0}])):
+        append_jsonl(calls_path, {
+            **CALL_TEMPLATE, "call_id": f"det-{ep.ep_id}", "episode_id": ep.ep_id,
+            "prompt_variant": "detection", "addressing_mode": "timestamps",
+            "parsed_ads": det_ads,
+        })
+        append_jsonl(calls_path, {
+            **CALL_TEMPLATE, "call_id": f"seg-{ep.ep_id}", "episode_id": ep.ep_id,
+            "prompt_variant": "segmentation", "addressing_mode": "segment_ids",
+            "parsed_ads": [{"start": 0.0, "end": 30.0}],
+        })
+
+    out = tmp_path / "comparison.md"
+    compare_mod.render(
+        cfg=minimal_cfg, episodes=[ep1, ep2], calls_path=calls_path,
+        pricing_snapshot=pricing_snapshot, output_path=out,
+    )
+    delta_cell, p_cell = _row_cells(out.read_text(), "m1")[-2:]
+    assert delta_cell != "n/a"
+    assert p_cell != "n/a"

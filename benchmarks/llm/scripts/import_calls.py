@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Iterator
 from pathlib import Path
 
 DEST_RAW = Path(__file__).resolve().parents[1] / "results" / "raw"
@@ -20,15 +21,25 @@ def _safe_model_id(model_id: str) -> str:
     return model_id.replace("/", "_").replace(":", "_")
 
 
+def _iter_jsonl(path: Path) -> Iterator[tuple[str, dict]]:
+    """Yield (stripped line, parsed dict); mirrors storage.read_jsonl's error shape."""
+    with path.open(encoding="utf-8") as f:
+        for lineno, raw in enumerate(f, start=1):
+            stripped = raw.strip()
+            if not stripped:
+                continue
+            try:
+                yield stripped, json.loads(stripped)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"{path}:{lineno}: invalid JSON: {e}") from e
+
+
 def _load_call_ids(path: Path) -> set[str]:
     ids: set[str] = set()
     if not path.is_file():
         return ids
-    with path.open(encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                ids.add(json.loads(line)["call_id"])
+    for _, rec in _iter_jsonl(path):
+        ids.add(rec["call_id"])
     return ids
 
 
@@ -42,26 +53,20 @@ def _insert_prompt_variant(row: dict, variant: str) -> dict:
 
 
 def import_calls(from_raw: Path, variant: str, dest_raw: Path = DEST_RAW) -> tuple[int, dict[str, int]]:
-    """Append new rows/shard lines from from_raw into dest_raw. Returns
-    (rows appended, {shard_filename: lines appended})."""
+    """Append new rows/shard lines from from_raw into dest_raw; returns (rows appended, {shard_filename: lines appended})."""
     dest_calls = dest_raw / "calls.jsonl"
     existing_ids = _load_call_ids(dest_calls)
 
     new_rows: list[dict] = []
     new_ids_by_model: dict[str, set[str]] = {}
-    with (from_raw / "calls.jsonl").open(encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            row = json.loads(line)
-            call_id = row["call_id"]
-            if call_id in existing_ids:
-                continue
-            if "addressing_mode" not in row:
-                raise ValueError(f"{call_id}: row has no addressing_mode field")
-            new_rows.append(_insert_prompt_variant(row, variant))
-            new_ids_by_model.setdefault(row["model"], set()).add(call_id)
+    for _, row in _iter_jsonl(from_raw / "calls.jsonl"):
+        call_id = row["call_id"]
+        if call_id in existing_ids:
+            continue
+        if "addressing_mode" not in row:
+            raise ValueError(f"{call_id}: row has no addressing_mode field")
+        new_rows.append(_insert_prompt_variant(row, variant))
+        new_ids_by_model.setdefault(row["model"], set()).add(call_id)
 
     if new_rows:
         dest_calls.parent.mkdir(parents=True, exist_ok=True)
@@ -84,15 +89,10 @@ def _import_shards(from_raw: Path, dest_raw: Path, new_ids_by_model: dict[str, s
         existing_shard_ids = _load_call_ids(dest_shard)
 
         appended_lines: list[str] = []
-        with src_shard.open(encoding="utf-8") as f:
-            for line in f:
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                rec = json.loads(stripped)
-                cid = rec["call_id"]
-                if cid in call_ids and cid not in existing_shard_ids:
-                    appended_lines.append(stripped)
+        for stripped, rec in _iter_jsonl(src_shard):
+            cid = rec["call_id"]
+            if cid in call_ids and cid not in existing_shard_ids:
+                appended_lines.append(stripped)
 
         if appended_lines:
             dest_shard.parent.mkdir(parents=True, exist_ok=True)

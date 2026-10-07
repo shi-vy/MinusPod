@@ -61,12 +61,9 @@ from .sections import (
 logger = logging.getLogger(__name__)
 
 def report_paths(results_dir: Path, prompt_variant: str, addressing_mode: str) -> tuple[Path, Path]:
-    """Per-(variant, mode) cell output paths. The default cell (detection,
-    timestamps) keeps the pre-existing report.md / report_assets so it never
-    moves for callers who don't opt into a variant or mode. Any other cell
-    gets its own suffixed report + assets dir so cells never clobber each
-    other's charts.
-    """
+    """Per-(variant, mode) cell output paths; the default cell keeps the
+    pre-existing report.md path, other cells get a suffixed path so they
+    don't clobber each other's charts."""
     if prompt_variant == "detection" and addressing_mode == "timestamps":
         return results_dir / "report.md", results_dir / "report_assets"
     suffix = f"{prompt_variant}-{addressing_mode}"

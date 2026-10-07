@@ -28,7 +28,7 @@ app = typer.Typer(
     help="Offline LLM ad-detection benchmark for MinusPod.",
 )
 
-ADDRESSING_MODES = ("timestamps", "segment_ids")
+ADDRESSING_MODES = variants.ADDRESSING_MODES
 
 
 def _validate_addressing_mode(mode: str) -> None:

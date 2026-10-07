@@ -5,11 +5,14 @@ Mirrors tests/test_addressing_mode.py's fixture style. No benchmark calls here.
 from __future__ import annotations
 
 import asyncio
+import json
 
 from typer.testing import CliRunner
 
-from benchmark import cli, corpus, report as report_mod, runner
+from benchmark import cli, corpus, report as report_mod, runner, variants
+from benchmark.corpus import EpisodeMetadata, compute_windows, hash_segments, write_metadata, write_windows
 from benchmark.llm import LLMResponse
+from benchmark.pricing import PricingSnapshot
 from benchmark.storage import append_jsonl, read_jsonl
 
 from tests.test_addressing_mode import CALL_TEMPLATE, SEGMENTS
@@ -194,6 +197,36 @@ def test_run_segmentation_with_snapshot_exits_2(tmp_path, monkeypatch):
     assert "segmentation variant uses its frozen prompt" in result.output
 
 
+def test_show_prompt_segmentation_record_with_snapshot_exits_2(tmp_path, monkeypatch, write_corpus_episode):
+    monkeypatch.setattr(cli, "_root", lambda: tmp_path)
+    cfg_path = write_minimal_config(tmp_path)
+    write_corpus_episode(tmp_path / "data" / "corpus")
+
+    paths = runner.RunPaths.for_root(tmp_path / "results")
+    append_jsonl(paths.calls_jsonl, {
+        **CALL_TEMPLATE, "call_id": "cseg1",
+        "prompt_variant": "segmentation", "addressing_mode": "timestamps",
+    })
+    snapshot_path = tmp_path / "snap.txt"
+    snapshot_path.write_text("frozen prompt")
+
+    cli_runner = CliRunner()
+    result = cli_runner.invoke(
+        cli.app,
+        ["show-prompt", "cseg1", "--config", str(cfg_path), "--snapshot", str(snapshot_path)],
+    )
+    assert result.exit_code == 2
+    assert "segmentation variant uses its frozen prompt" in result.output
+
+
+def test_dump_prompt_segmentation_writes_frozen_prompt(tmp_path):
+    cli_runner = CliRunner()
+    out = tmp_path / "seg_prompt.txt"
+    result = cli_runner.invoke(cli.app, ["dump-prompt", str(out), "--prompt-variant", "segmentation"])
+    assert result.exit_code == 0, result.output
+    assert out.read_text() == variants.segmentation_system_prompt()
+
+
 # --- report isolation by prompt variant --------------------------------------
 
 def test_report_isolates_prompt_variants(tmp_path, minimal_cfg, pricing_snapshot, write_corpus_episode):
@@ -299,8 +332,6 @@ def test_nondefault_cell_chart_links_point_at_own_assets_dir(
 # --- cli.report computes the suffixed paths for a non-default cell ----------
 
 def test_cli_report_computes_suffixed_paths_for_nondefault_cell(tmp_path, monkeypatch):
-    from benchmark.pricing import PricingSnapshot
-
     cli_runner = CliRunner()
     cfg_path = write_minimal_config(tmp_path)
     corpus_dir = tmp_path / "data" / "corpus"
@@ -326,9 +357,6 @@ def test_cli_report_computes_suffixed_paths_for_nondefault_cell(tmp_path, monkey
 
 
 def _make_corpus_episode(corpus_dir, ep_id):
-    import json
-    from benchmark.corpus import EpisodeMetadata, write_metadata, write_windows, compute_windows, hash_segments
-
     segments = [
         {"start": 0.0, "end": 5.0, "text": "This episode is brought to you by BetterHelp"},
         {"start": 5.0, "end": 60.0, "text": "Welcome back everyone"},

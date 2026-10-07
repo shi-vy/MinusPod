@@ -202,9 +202,14 @@ renders every cell found in `calls.jsonl` side by side in
 
 Rows imported from PR #801 via `scripts/import_calls.py` carry
 `prompt_variant=segmentation`, all recorded under `addressing_mode=segment_ids`.
-One imported row's `show-prompt` hash does not verify against the current
-`segmentation-v1.txt`; treat imported `prompt_hash` values as historical
-record, not reproducible against the live frozen prompt.
+A hash replay against the current `segmentation-v1.txt` found 5 of the 7
+imported models verify exactly, plus `gemma4:e4b`'s 2026-09-30 rows.
+`gemma4:e4b`'s 2026-09-29 rows and all 235 `google/gemini-3.1-flash-lite` rows
+do not; they ran on an earlier prompt revision the PR did not keep. Dedup
+keeps the last write per (model, episode, trial, window), so `gemma4:e4b`
+resolves to its verified 2026-09-30 campaign.
+`google/gemini-3.1-flash-lite`'s imported rows predate the frozen prompt and
+will be re-run separately under it.
 
 ## Adding a new model or episode
 

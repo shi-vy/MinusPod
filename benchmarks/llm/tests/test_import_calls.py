@@ -5,6 +5,8 @@ import importlib.util
 import json
 from pathlib import Path
 
+import pytest
+
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "import_calls.py"
 _spec = importlib.util.spec_from_file_location("import_calls", SCRIPT_PATH)
 import_calls = importlib.util.module_from_spec(_spec)
@@ -78,8 +80,16 @@ def test_missing_addressing_mode_raises(tmp_path):
     ])
     dest = tmp_path / "dest_raw"
 
-    try:
+    with pytest.raises(ValueError, match="addressing_mode"):
         import_calls.import_calls(src, "segmentation", dest_raw=dest)
-        assert False, "expected ValueError"
-    except ValueError:
-        pass
+
+
+def test_malformed_json_line_names_path_and_lineno(tmp_path):
+    src = tmp_path / "src_raw"
+    calls_path = src / "calls.jsonl"
+    calls_path.parent.mkdir(parents=True)
+    calls_path.write_text('{"call_id": "ok", "model": "m1", "addressing_mode": "segment_ids"}\n{not json}\n')
+    dest = tmp_path / "dest_raw"
+
+    with pytest.raises(ValueError, match=rf"{calls_path}:2: invalid JSON"):
+        import_calls.import_calls(src, "segmentation", dest_raw=dest)

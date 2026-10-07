@@ -137,7 +137,69 @@ def test_main_content_only_response_yields_empty_list_with_no_miss():
         response, "timestamps", None,
     )
     assert ads == []
+    assert method == "segmentation_object_direct"
     assert id_contract_miss is False
+
+
+def test_main_content_only_response_in_id_mode_scores_segment_id_direct():
+    response = '{"segments": [{"start": 0.0, "end": 100.0, "category": "main_content"}]}'
+    ads, method, id_contract_miss = variants.parse_segmentation_response(
+        response, "segment_ids", ID_SEGMENTS,
+    )
+    assert ads == []
+    assert method == "segment_id_direct"
+    assert id_contract_miss is False
+
+
+def test_unparseable_response_returns_none_method_not_the_string_none():
+    ads, method, id_contract_miss = variants.parse_segmentation_response(
+        "not json at all", "timestamps", None,
+    )
+    assert ads == []
+    assert method is None
+    assert id_contract_miss is False
+
+
+def test_unparseable_response_in_id_mode_also_returns_none_method():
+    ads, method, id_contract_miss = variants.parse_segmentation_response(
+        "not json at all", "segment_ids", ID_SEGMENTS,
+    )
+    assert ads == []
+    assert method is None
+    assert id_contract_miss is False
+
+
+def test_id_mode_accepts_string_and_infinite_values_without_raising():
+    response = (
+        '{"segments": ['
+        '{"start": "1.0", "end": 2, "category": "sponsor", "confidence": "high", "sponsor_name": "BetterHelp"},'
+        '{"start": "inf", "end": 3, "category": "sponsor"}'
+        ']}'
+    )
+    ads, method, id_contract_miss = variants.parse_segmentation_response(
+        response, "segment_ids", ID_SEGMENTS,
+    )
+    assert id_contract_miss is False
+    assert method == "segment_id_direct"
+    # The "inf" entry has no integer-valued end achievable, so only the first resolves.
+    assert len(ads) == 1
+
+
+def test_id_mode_mixed_int_and_float_entries_logs_and_drops_float(caplog):
+    response = (
+        '{"segments": ['
+        '{"start": 0, "end": 1, "category": "sponsor", "confidence": "high", "sponsor_name": "BetterHelp"},'
+        '{"start": 2.5, "end": 3.5, "category": "sponsor"}'
+        ']}'
+    )
+    ads, method, id_contract_miss = variants.parse_segmentation_response(
+        response, "segment_ids", ID_SEGMENTS,
+    )
+    assert id_contract_miss is False
+    assert method == "segment_id_direct"
+    assert len(ads) == 1
+    assert "mixed formats" in caplog.text
+    assert "skipped 1" in caplog.text
 
 
 def test_id_mode_with_float_timestamps_sets_id_contract_miss():

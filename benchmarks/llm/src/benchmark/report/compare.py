@@ -1,24 +1,21 @@
 """Cross-cell comparison: prompt variant x addressing mode, side by side.
 
-Builds one row per model across the four (prompt_variant, addressing_mode)
-cells, reusing the same per-model aggregation each per-cell report uses so
-the numbers match. The delta/p-value columns are paired on the episode
-intersection a model has scored in both the segmentation/segment_ids and
-detection/timestamps cells, which is MinusPod's production default versus
-its segment-id segmentation candidate.
+One row per model across the four cells, reusing each per-cell report's own
+aggregation so the numbers match; delta/p-value pair segmentation/segment_ids
+against detection/timestamps on the episodes a model scored in both.
 """
 from __future__ import annotations
 
 import statistics
+from collections import defaultdict
 from pathlib import Path
 
 from .. import pricing
 from ..corpus import Episode
 from ..storage import read_jsonl
-from ..variants import PROMPT_VARIANTS
+from ..variants import ADDRESSING_MODES, PROMPT_VARIANTS
 from .aggregate import ModelStats, _aggregate, _dedup_last_write_wins, _paired_t_pvalue
 
-ADDRESSING_MODES = ("timestamps", "segment_ids")
 _BASELINE_CELL = ("detection", "timestamps")
 _CANDIDATE_CELL = ("segmentation", "segment_ids")
 
@@ -35,6 +32,16 @@ def _filter_cell(calls: list[dict], variant: str, mode: str) -> list[dict]:
     ]
 
 
+def _episode_cost_counts_per_model(calls: list[dict]) -> dict[str, int]:
+    """Episodes each model has a non-errored row for in this cell, so
+    total_episode_cost (a sum across episodes) can be turned into dollars/episode."""
+    ids: dict[str, set[str]] = defaultdict(set)
+    for c in calls:
+        if c.get("episode_id") and not c.get("error"):
+            ids[c["model"]].add(c["episode_id"])
+    return {m: len(v) for m, v in ids.items()}
+
+
 def render(
     *,
     cfg,
@@ -44,8 +51,10 @@ def render(
     output_path: Path,
 ) -> None:
     all_calls = list(read_jsonl(calls_path))
+    deprecated_ids = {m.id for m in cfg.models if m.deprecated}
     cells: dict[tuple[str, str], dict[str, ModelStats]] = {}
     cell_episode_ids: dict[tuple[str, str], list[str]] = {}
+    cell_cost_episode_counts: dict[tuple[str, str], dict[str, int]] = {}
     for variant in PROMPT_VARIANTS:
         for mode in ADDRESSING_MODES:
             raw = _filter_cell(all_calls, variant, mode)
@@ -53,8 +62,9 @@ def render(
                 continue
             calls = _dedup_last_write_wins(raw)
             by_model, _extras = _aggregate(calls, episodes, pricing_snapshot=pricing_snapshot)
-            cells[(variant, mode)] = by_model
+            cells[(variant, mode)] = {mid: s for mid, s in by_model.items() if mid not in deprecated_ids}
             cell_episode_ids[(variant, mode)] = sorted({c["episode_id"] for c in calls if c.get("episode_id")})
+            cell_cost_episode_counts[(variant, mode)] = _episode_cost_counts_per_model(calls)
 
     if not cells:
         output_path.write_text(
@@ -106,9 +116,11 @@ def render(
             if s is None:
                 row += ["-"] * 8
                 continue
+            n_cost_episodes = cell_cost_episode_counts[(variant, mode)].get(model, 0)
+            cost_per_ep = s.total_episode_cost / n_cost_episodes if n_cost_episodes else 0.0
             row += [
                 f"{s.avg_f05:.3f}", f"{s.avg_precision:.3f}", f"{s.avg_recall:.3f}", f"{s.avg_f1:.3f}",
-                f"${s.total_episode_cost:.4f}", f"{s.p50_call_latency_ms / 1000:.1f}s",
+                f"${cost_per_ep:.4f}", f"{s.p50_call_latency_ms / 1000:.1f}s",
                 f"{s.json_compliance_mean:.2f}", str(len(s.f05_per_episode)),
             ]
         delta_cell = "n/a"

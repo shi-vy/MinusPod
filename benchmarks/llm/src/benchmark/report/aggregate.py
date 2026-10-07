@@ -639,9 +639,7 @@ def _betai(a: float, b: float, x: float) -> float:
 
 def _paired_t_pvalue(a: dict[str, float], b: dict[str, float]) -> float | None:
     """Two-sided p-value for the same paired t-test `_sig_worse` uses (a - b
-    over shared episodes). None when fewer than 2 shared episodes. The t-stat
-    to p-value step uses the standard closed form p = I_x(df/2, 1/2) with
-    x = df/(df+t^2), not a different test design."""
+    over shared episodes); None when fewer than 2 shared episodes."""
     stats = _paired_diff_stats(a, b)
     if stats is None:
         return None

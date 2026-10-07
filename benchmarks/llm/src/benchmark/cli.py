@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(__file__).resolve().parents[2] / ".env", override=False)
 
 from . import auth, capture as capture_mod, corpus as corpus_mod, migrate as migrate_mod, parsing, pricing, report as report_mod, runner as runner_mod, variants
+from .report import compare as compare_mod
 from .config import BenchmarkConfig, load as load_config
 from .runner import build_work_list, precompute_prompt_hashes
 from .storage import find_call, hash_prompt, read_response, scan_calls
@@ -277,8 +278,7 @@ def run(
         typer.echo("skipping report regen (--no-report-on-failure)")
         return
 
-    output = _root() / "results" / "report.md"
-    assets = _root() / "results" / "report_assets"
+    output, assets = report_mod.report_paths(_root() / "results", prompt_variant, addressing_mode)
     report_mod.render(
         cfg=cfg,
         episodes=episodes,
@@ -288,6 +288,7 @@ def run(
         assets_dir=assets,
         prompt_source=prompt_source,
         addressing_mode=addressing_mode,
+        prompt_variant=prompt_variant,
     )
     typer.echo(f"report written: {output}")
 
@@ -320,8 +321,7 @@ def report(
     episodes = [corpus_mod.load_episode(cfg.corpus.path / e) for e in corpus_mod.list_episodes(cfg.corpus.path)]
     paths = runner_mod.RunPaths.for_root(_root() / "results")
     snap = pricing.latest_snapshot(_root() / "data" / "pricing_snapshots") or pricing.fetch_current()
-    output = _root() / "results" / "report.md"
-    assets = _root() / "results" / "report_assets"
+    output, assets = report_mod.report_paths(_root() / "results", prompt_variant, addressing_mode)
     report_mod.render(
         cfg=cfg,
         episodes=episodes,
@@ -331,8 +331,30 @@ def report(
         assets_dir=assets,
         prompt_source=prompt_source,
         addressing_mode=addressing_mode,
+        prompt_variant=prompt_variant,
     )
     typer.echo(f"report written: {output}")
+
+
+@app.command()
+def compare(
+    config_path: Path = typer.Option(Path("benchmark.toml"), "--config"),
+) -> None:
+    """Compare all (prompt variant, addressing mode) cells side by side in results/comparison.md."""
+    _setup_logging()
+    cfg = _load(config_path)
+    episodes = [corpus_mod.load_episode(cfg.corpus.path / e) for e in corpus_mod.list_episodes(cfg.corpus.path)]
+    paths = runner_mod.RunPaths.for_root(_root() / "results")
+    snap = pricing.latest_snapshot(_root() / "data" / "pricing_snapshots") or pricing.fetch_current()
+    output = _root() / "results" / "comparison.md"
+    compare_mod.render(
+        cfg=cfg,
+        episodes=episodes,
+        calls_path=paths.calls_jsonl,
+        pricing_snapshot=snap,
+        output_path=output,
+    )
+    typer.echo(f"comparison written: {output}")
 
 
 @app.command()

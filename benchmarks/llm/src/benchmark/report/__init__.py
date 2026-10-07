@@ -60,6 +60,19 @@ from .sections import (
 
 logger = logging.getLogger(__name__)
 
+def report_paths(results_dir: Path, prompt_variant: str, addressing_mode: str) -> tuple[Path, Path]:
+    """Per-(variant, mode) cell output paths. The default cell (detection,
+    timestamps) keeps the pre-existing report.md / report_assets so it never
+    moves for callers who don't opt into a variant or mode. Any other cell
+    gets its own suffixed report + assets dir so cells never clobber each
+    other's charts.
+    """
+    if prompt_variant == "detection" and addressing_mode == "timestamps":
+        return results_dir / "report.md", results_dir / "report_assets"
+    suffix = f"{prompt_variant}-{addressing_mode}"
+    return results_dir / f"report-{suffix}.md", results_dir / f"report_assets-{suffix}"
+
+
 def render(
     *,
     cfg,
@@ -70,25 +83,45 @@ def render(
     assets_dir: Path,
     prompt_source: str = "live",
     addressing_mode: str = "timestamps",
+    prompt_variant: str = "detection",
 ) -> None:
     """Render results/report.md from calls.jsonl.
 
     ``addressing_mode`` isolates the report to one addressing scheme: calls
     are filtered to records whose ``addressing_mode`` field (missing on every
     call written before this field existed, which defaults to 'timestamps')
-    matches. A store holding both timestamps- and segment_ids-mode calls
-    never blends them into one set of numbers; run twice with each mode to
-    get two separate reports.
+    matches. ``prompt_variant`` does the same for the ``prompt_variant`` field
+    (missing records default to 'detection'). A store holding more than one
+    (variant, mode) cell never blends them into one set of numbers; render
+    once per cell to see each side of an A/B.
     """
-    title = "# MinusPod LLM Benchmark Report"
+    title_suffixes = []
+    if prompt_variant != "detection":
+        title_suffixes.append(f"prompt variant: {prompt_variant}")
     if addressing_mode != "timestamps":
-        title += f" (addressing mode: {addressing_mode})"
+        title_suffixes.append(f"addressing mode: {addressing_mode}")
+    title = "# MinusPod LLM Benchmark Report"
+    if title_suffixes:
+        title += " (" + ", ".join(title_suffixes) + ")"
 
     all_calls = list(read_jsonl(calls_path))
-    raw_calls = [r for r in all_calls if r.get("addressing_mode", "timestamps") == addressing_mode]
+    raw_calls = [
+        r for r in all_calls
+        if r.get("addressing_mode", "timestamps") == addressing_mode
+        and r.get("prompt_variant", "detection") == prompt_variant
+    ]
     if not raw_calls:
-        run_hint = "benchmark run" + ("" if addressing_mode == "timestamps" else f" --addressing-mode {addressing_mode}")
-        mode_note = "" if addressing_mode == "timestamps" else f" for addressing mode '{addressing_mode}'"
+        run_hint = "benchmark run"
+        if prompt_variant != "detection":
+            run_hint += f" --prompt-variant {prompt_variant}"
+        if addressing_mode != "timestamps":
+            run_hint += f" --addressing-mode {addressing_mode}"
+        mode_notes = []
+        if prompt_variant != "detection":
+            mode_notes.append(f"prompt variant '{prompt_variant}'")
+        if addressing_mode != "timestamps":
+            mode_notes.append(f"addressing mode '{addressing_mode}'")
+        mode_note = f" for {' and '.join(mode_notes)}" if mode_notes else ""
         output_path.write_text(f"{title}\n\nNo benchmark data yet{mode_note}. Run `{run_hint}` first.\n")
         return
     mixed = campaign_mixing(raw_calls)
@@ -118,14 +151,15 @@ def render(
             "trusting the affected models' numbers.", stale,
         )
 
+    assets_dir_name = assets_dir.name
     sections = [
         _render_how_to_read(episodes),
         _render_tldr(active, episodes),
-        _render_charts_section(active),
+        _render_charts_section(active, assets_dir_name),
         _render_failures(calls_active),
         _render_accuracy_breakdown(active),
         _render_boundary_accuracy(active),
-        _render_calibration_table(extras_active.calibration),
+        _render_calibration_table(extras_active.calibration, assets_dir_name),
         _render_latency_tail(active),
         _render_token_efficiency(active),
         _render_cost_breakdown(active),
@@ -147,6 +181,7 @@ def render(
         _render_run_metadata(
             calls, pricing_snapshot=pricing_snapshot, raw_calls=raw_calls,
             prompt_source=prompt_source, addressing_mode=addressing_mode,
+            prompt_variant=prompt_variant,
         ),
     ]
 

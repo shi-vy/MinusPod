@@ -8,10 +8,11 @@ import asyncio
 
 from typer.testing import CliRunner
 
-from benchmark import cli, corpus, runner
+from benchmark import cli, corpus, report as report_mod, runner
 from benchmark.llm import LLMResponse
 from benchmark.storage import append_jsonl, read_jsonl
 
+from tests.test_addressing_mode import CALL_TEMPLATE, SEGMENTS
 from tests.test_cli import write_minimal_config
 
 
@@ -191,6 +192,137 @@ def test_run_segmentation_with_snapshot_exits_2(tmp_path, monkeypatch):
     )
     assert result.exit_code == 2
     assert "segmentation variant uses its frozen prompt" in result.output
+
+
+# --- report isolation by prompt variant --------------------------------------
+
+def test_report_isolates_prompt_variants(tmp_path, minimal_cfg, pricing_snapshot, write_corpus_episode):
+    ep_dir = write_corpus_episode(tmp_path / "corpus", segments=SEGMENTS)
+    ep = corpus.load_episode(ep_dir)
+    calls_path = tmp_path / "calls.jsonl"
+    append_jsonl(calls_path, {
+        **CALL_TEMPLATE, "call_id": "c1", "episode_id": ep.ep_id,
+        "prompt_variant": "detection",
+        "parsed_ads": [{"start_time": 0.0, "end_time": 30.0}],
+    })
+    append_jsonl(calls_path, {
+        **CALL_TEMPLATE, "call_id": "c2", "episode_id": ep.ep_id,
+        "model": "m-seg-only", "prompt_variant": "segmentation",
+        "parsed_ads": [{"start": 0.0, "end": 30.0}],
+    })
+
+    out_det = tmp_path / "report_det.md"
+    report_mod.render(
+        cfg=minimal_cfg, episodes=[ep], calls_path=calls_path,
+        pricing_snapshot=pricing_snapshot, output_path=out_det, assets_dir=tmp_path / "assets_det",
+    )
+    text_det = out_det.read_text()
+    assert "`m1`" in text_det
+    assert "`m-seg-only`" not in text_det
+    assert "prompt variant:" not in text_det.splitlines()[0]
+
+    out_seg = tmp_path / "report_seg.md"
+    report_mod.render(
+        cfg=minimal_cfg, episodes=[ep], calls_path=calls_path,
+        pricing_snapshot=pricing_snapshot, output_path=out_seg, assets_dir=tmp_path / "assets_seg",
+        prompt_variant="segmentation",
+    )
+    text_seg = out_seg.read_text()
+    assert "(prompt variant: segmentation)" in text_seg.splitlines()[0]
+    assert "`m-seg-only`" in text_seg
+    assert "`m1`" not in text_seg
+
+
+def test_report_historical_record_without_prompt_variant_counts_as_detection(
+    tmp_path, minimal_cfg, pricing_snapshot, write_corpus_episode,
+):
+    ep_dir = write_corpus_episode(tmp_path / "corpus", segments=SEGMENTS)
+    ep = corpus.load_episode(ep_dir)
+    calls_path = tmp_path / "calls.jsonl"
+    append_jsonl(calls_path, {
+        **CALL_TEMPLATE, "call_id": "c1", "episode_id": ep.ep_id,
+        "parsed_ads": [{"start_time": 0.0, "end_time": 30.0}],
+    })  # no prompt_variant key, as every call before this feature existed
+
+    out_det = tmp_path / "report.md"
+    report_mod.render(
+        cfg=minimal_cfg, episodes=[ep], calls_path=calls_path,
+        pricing_snapshot=pricing_snapshot, output_path=out_det, assets_dir=tmp_path / "assets",
+    )
+    assert "`m1`" in out_det.read_text()
+
+    out_seg = tmp_path / "report_seg.md"
+    report_mod.render(
+        cfg=minimal_cfg, episodes=[ep], calls_path=calls_path,
+        pricing_snapshot=pricing_snapshot, output_path=out_seg, assets_dir=tmp_path / "assets_seg",
+        prompt_variant="segmentation",
+    )
+    assert "No benchmark data yet" in out_seg.read_text()
+
+
+# --- report_paths: default cell unchanged, other cells suffixed -------------
+
+def test_report_paths_default_cell_is_unchanged(tmp_path):
+    report_md, assets_dir = report_mod.report_paths(tmp_path, "detection", "timestamps")
+    assert report_md == tmp_path / "report.md"
+    assert assets_dir == tmp_path / "report_assets"
+
+
+def test_report_paths_nondefault_cell_is_suffixed(tmp_path):
+    report_md, assets_dir = report_mod.report_paths(tmp_path, "segmentation", "segment_ids")
+    assert report_md == tmp_path / "report-segmentation-segment_ids.md"
+    assert assets_dir == tmp_path / "report_assets-segmentation-segment_ids"
+
+
+def test_nondefault_cell_chart_links_point_at_own_assets_dir(
+    tmp_path, minimal_cfg, pricing_snapshot, write_corpus_episode,
+):
+    ep_dir = write_corpus_episode(tmp_path / "corpus", segments=SEGMENTS)
+    ep = corpus.load_episode(ep_dir)
+    calls_path = tmp_path / "calls.jsonl"
+    append_jsonl(calls_path, {
+        **CALL_TEMPLATE, "call_id": "c1", "episode_id": ep.ep_id,
+        "prompt_variant": "segmentation", "addressing_mode": "segment_ids",
+        "parsed_ads": [{"start": 0.0, "end": 30.0}],
+    })
+    report_md, assets_dir = report_mod.report_paths(tmp_path, "segmentation", "segment_ids")
+    report_mod.render(
+        cfg=minimal_cfg, episodes=[ep], calls_path=calls_path,
+        pricing_snapshot=pricing_snapshot, output_path=report_md, assets_dir=assets_dir,
+        prompt_variant="segmentation", addressing_mode="segment_ids",
+    )
+    text = report_md.read_text()
+    assert "(report_assets-segmentation-segment_ids/pareto.svg)" in text
+    assert (assets_dir / "pareto.svg").is_file()
+
+
+# --- cli.report computes the suffixed paths for a non-default cell ----------
+
+def test_cli_report_computes_suffixed_paths_for_nondefault_cell(tmp_path, monkeypatch):
+    from benchmark.pricing import PricingSnapshot
+
+    cli_runner = CliRunner()
+    cfg_path = write_minimal_config(tmp_path)
+    corpus_dir = tmp_path / "data" / "corpus"
+    monkeypatch.chdir(tmp_path)
+    _make_corpus_episode(corpus_dir, "ep-a")
+
+    captured = {}
+    monkeypatch.setattr(cli.report_mod, "render", lambda **kw: captured.update(kw))
+    monkeypatch.setattr(cli.pricing, "latest_snapshot", lambda _dir: PricingSnapshot(captured_at="x", entries=[]))
+
+    result = cli_runner.invoke(
+        cli.app,
+        ["report", "--config", str(cfg_path), "--prompt-variant", "segmentation", "--addressing-mode", "segment_ids"],
+    )
+    assert result.exit_code == 0, result.output
+    # cli._root() is the installed package location, not cwd; it is unaffected
+    # by monkeypatch.chdir, same as every other file path cli.py writes.
+    results_dir = cli._root() / "results"
+    assert captured["output_path"] == results_dir / "report-segmentation-segment_ids.md"
+    assert captured["assets_dir"] == results_dir / "report_assets-segmentation-segment_ids"
+    assert captured["prompt_variant"] == "segmentation"
+    assert captured["addressing_mode"] == "segment_ids"
 
 
 def _make_corpus_episode(corpus_dir, ep_id):

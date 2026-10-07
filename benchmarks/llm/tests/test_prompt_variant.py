@@ -5,12 +5,10 @@ Mirrors tests/test_addressing_mode.py's fixture style. No benchmark calls here.
 from __future__ import annotations
 
 import asyncio
-import json
 
 from typer.testing import CliRunner
 
 from benchmark import cli, corpus, report as report_mod, runner, variants
-from benchmark.corpus import EpisodeMetadata, compute_windows, hash_segments, write_metadata, write_windows
 from benchmark.llm import LLMResponse
 from benchmark.pricing import PricingSnapshot
 from benchmark.storage import append_jsonl, read_jsonl
@@ -131,13 +129,13 @@ def test_derive_episode_results_legacy_record_defaults(tmp_path, minimal_cfg, ma
 
 # --- CLI: --model / --episode filters ----------------------------------------
 
-def test_run_dry_run_model_filter_narrows_work_list(tmp_path, monkeypatch):
+def test_run_dry_run_model_filter_narrows_work_list(tmp_path, monkeypatch, write_corpus_episode):
     cli_runner = CliRunner()
     cfg_path = write_minimal_config(tmp_path)
     corpus_dir = tmp_path / "data" / "corpus"
     monkeypatch.chdir(tmp_path)
-    _make_corpus_episode(corpus_dir, "ep-a")
-    _make_corpus_episode(corpus_dir, "ep-b")
+    write_corpus_episode(corpus_dir, "ep-a")
+    write_corpus_episode(corpus_dir, "ep-b")
 
     result = cli_runner.invoke(cli.app, ["run", "--config", str(cfg_path), "--dry-run"])
     assert result.exit_code == 0
@@ -150,12 +148,12 @@ def test_run_dry_run_model_filter_narrows_work_list(tmp_path, monkeypatch):
     assert "5 calls would execute" in result.stdout  # filtered to 1 episode
 
 
-def test_run_unknown_model_filter_exits_2(tmp_path, monkeypatch):
+def test_run_unknown_model_filter_exits_2(tmp_path, monkeypatch, write_corpus_episode):
     cli_runner = CliRunner()
     cfg_path = write_minimal_config(tmp_path)
     corpus_dir = tmp_path / "data" / "corpus"
     monkeypatch.chdir(tmp_path)
-    _make_corpus_episode(corpus_dir, "ep-a")
+    write_corpus_episode(corpus_dir, "ep-a")
 
     result = cli_runner.invoke(
         cli.app, ["run", "--config", str(cfg_path), "--dry-run", "--model", "bogus-model"],
@@ -164,12 +162,12 @@ def test_run_unknown_model_filter_exits_2(tmp_path, monkeypatch):
     assert "bogus-model" in result.output
 
 
-def test_run_unknown_episode_filter_exits_2(tmp_path, monkeypatch):
+def test_run_unknown_episode_filter_exits_2(tmp_path, monkeypatch, write_corpus_episode):
     cli_runner = CliRunner()
     cfg_path = write_minimal_config(tmp_path)
     corpus_dir = tmp_path / "data" / "corpus"
     monkeypatch.chdir(tmp_path)
-    _make_corpus_episode(corpus_dir, "ep-a")
+    write_corpus_episode(corpus_dir, "ep-a")
 
     result = cli_runner.invoke(
         cli.app, ["run", "--config", str(cfg_path), "--dry-run", "--episode", "ep-bogus"],
@@ -180,12 +178,12 @@ def test_run_unknown_episode_filter_exits_2(tmp_path, monkeypatch):
 
 # --- CLI: segmentation + --snapshot rejected ---------------------------------
 
-def test_run_segmentation_with_snapshot_exits_2(tmp_path, monkeypatch):
+def test_run_segmentation_with_snapshot_exits_2(tmp_path, monkeypatch, write_corpus_episode):
     cli_runner = CliRunner()
     cfg_path = write_minimal_config(tmp_path)
     corpus_dir = tmp_path / "data" / "corpus"
     monkeypatch.chdir(tmp_path)
-    _make_corpus_episode(corpus_dir, "ep-a")
+    write_corpus_episode(corpus_dir, "ep-a")
     snapshot_path = tmp_path / "snap.txt"
     snapshot_path.write_text("frozen prompt")
 
@@ -331,12 +329,12 @@ def test_nondefault_cell_chart_links_point_at_own_assets_dir(
 
 # --- cli.report computes the suffixed paths for a non-default cell ----------
 
-def test_cli_report_computes_suffixed_paths_for_nondefault_cell(tmp_path, monkeypatch):
+def test_cli_report_computes_suffixed_paths_for_nondefault_cell(tmp_path, monkeypatch, write_corpus_episode):
     cli_runner = CliRunner()
     cfg_path = write_minimal_config(tmp_path)
     corpus_dir = tmp_path / "data" / "corpus"
     monkeypatch.chdir(tmp_path)
-    _make_corpus_episode(corpus_dir, "ep-a")
+    write_corpus_episode(corpus_dir, "ep-a")
 
     captured = {}
     monkeypatch.setattr(cli.report_mod, "render", lambda **kw: captured.update(kw))
@@ -354,21 +352,3 @@ def test_cli_report_computes_suffixed_paths_for_nondefault_cell(tmp_path, monkey
     assert captured["assets_dir"] == results_dir / "report_assets-segmentation-segment_ids"
     assert captured["prompt_variant"] == "segmentation"
     assert captured["addressing_mode"] == "segment_ids"
-
-
-def _make_corpus_episode(corpus_dir, ep_id):
-    segments = [
-        {"start": 0.0, "end": 5.0, "text": "This episode is brought to you by BetterHelp"},
-        {"start": 5.0, "end": 60.0, "text": "Welcome back everyone"},
-    ]
-    ep_dir = corpus_dir / ep_id
-    ep_dir.mkdir(parents=True)
-    (ep_dir / "segments.json").write_text(json.dumps(segments))
-    write_metadata(ep_dir, EpisodeMetadata(
-        ep_id=ep_id, podcast_slug="test-show", podcast_name="Test Show",
-        episode_id="abc123", title="Test Episode",
-        duration=float(segments[-1]["end"]), segments_hash=hash_segments(segments),
-    ))
-    (ep_dir / "truth.txt").write_text("start: 0\nend: 5\ntext: BetterHelp\n")
-    write_windows(ep_dir, compute_windows(segments))
-    return ep_dir

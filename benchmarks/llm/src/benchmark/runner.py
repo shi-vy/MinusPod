@@ -387,10 +387,8 @@ def derive_episode_results(cfg: BenchmarkConfig, episodes: list[Episode], *, pat
     for rec in read_jsonl(paths.calls_jsonl):
         if rec.get("error"):
             continue
-        key = (
-            rec["model"], rec["episode_id"], rec["trial"],
-            rec.get("addressing_mode", "timestamps"), rec.get("prompt_variant", "detection"),
-        )
+        prompt_variant, addressing_mode = variants.record_cell(rec)
+        key = (rec["model"], rec["episode_id"], rec["trial"], addressing_mode, prompt_variant)
         by_trial.setdefault(key, []).append(rec)
 
     episodes_by_id = {ep.ep_id: ep for ep in episodes}

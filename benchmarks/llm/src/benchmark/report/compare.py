@@ -13,23 +13,16 @@ from pathlib import Path
 from .. import pricing
 from ..corpus import Episode
 from ..storage import read_jsonl
-from ..variants import ADDRESSING_MODES, PROMPT_VARIANTS
+from ..variants import ADDRESSING_MODES, PROMPT_VARIANTS, record_cell
 from .aggregate import ModelStats, _aggregate, _dedup_last_write_wins, _paired_t_pvalue
 
 _BASELINE_CELL = ("detection", "timestamps")
 _CANDIDATE_CELL = ("segmentation", "segment_ids")
+_CELL_COLUMNS = ("F0.5", "precision", "recall", "F1", "cost/ep", "p50", "JSON compliance", "n episodes")
 
 
 def _cell_label(variant: str, mode: str) -> str:
     return f"{variant}/{mode}"
-
-
-def _filter_cell(calls: list[dict], variant: str, mode: str) -> list[dict]:
-    return [
-        r for r in calls
-        if r.get("prompt_variant", "detection") == variant
-        and r.get("addressing_mode", "timestamps") == mode
-    ]
 
 
 def _episode_cost_counts_per_model(calls: list[dict]) -> dict[str, int]:
@@ -51,13 +44,16 @@ def render(
     output_path: Path,
 ) -> None:
     all_calls = list(read_jsonl(calls_path))
+    calls_by_cell: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for r in all_calls:
+        calls_by_cell[record_cell(r)].append(r)
     deprecated_ids = {m.id for m in cfg.models if m.deprecated}
     cells: dict[tuple[str, str], dict[str, ModelStats]] = {}
     cell_episode_ids: dict[tuple[str, str], list[str]] = {}
     cell_cost_episode_counts: dict[tuple[str, str], dict[str, int]] = {}
     for variant in PROMPT_VARIANTS:
         for mode in ADDRESSING_MODES:
-            raw = _filter_cell(all_calls, variant, mode)
+            raw = calls_by_cell.get((variant, mode), [])
             if not raw:
                 continue
             calls = _dedup_last_write_wins(raw)
@@ -101,10 +97,7 @@ def render(
     header = ["Model"]
     for variant, mode in cell_order:
         label = _cell_label(variant, mode)
-        header += [
-            f"{label} F0.5", f"{label} precision", f"{label} recall", f"{label} F1",
-            f"{label} cost/ep", f"{label} p50", f"{label} JSON compliance", f"{label} n episodes",
-        ]
+        header += [f"{label} {col}" for col in _CELL_COLUMNS]
     header += ["delta F0.5 (segmentation/segment_ids - detection/timestamps)", "p-value"]
     lines.append("| " + " | ".join(header) + " |")
     lines.append("|" + "|".join("---" for _ in header) + "|")
@@ -114,7 +107,7 @@ def render(
         for variant, mode in cell_order:
             s = cells[(variant, mode)].get(model)
             if s is None:
-                row += ["-"] * 8
+                row += ["-"] * len(_CELL_COLUMNS)
                 continue
             n_cost_episodes = cell_cost_episode_counts[(variant, mode)].get(model, 0)
             cost_per_ep = s.total_episode_cost / n_cost_episodes if n_cost_episodes else 0.0

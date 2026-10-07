@@ -45,6 +45,16 @@ def _validate_prompt_variant(name: str) -> None:
         raise typer.Exit(2) from e
 
 
+def _require_known(values: list[str], known: set[str], flag: str) -> set[str]:
+    """Exit 2 with an "unknown value(s)" error if values has anything outside known."""
+    values_set = set(values)
+    unknown = sorted(values_set - known)
+    if unknown:
+        typer.echo(f"error: unknown {flag} value(s): {', '.join(unknown)}", err=True)
+        raise typer.Exit(2)
+    return values_set
+
+
 def _with_id_mode_section(system_prompt: str, addressing_mode: str) -> str:
     """Append SEGMENT_ID_SYSTEM_SECTION after the live/snapshot prompt is
     resolved, so a frozen snapshot file stays mode-agnostic."""
@@ -236,18 +246,12 @@ def run(
         raise typer.Exit(1)
 
     if model:
-        unknown_models = sorted(set(model) - {m.id for m in cfg.models})
-        if unknown_models:
-            typer.echo(f"error: unknown --model value(s): {', '.join(unknown_models)}", err=True)
-            raise typer.Exit(2)
-        cfg = dataclasses.replace(cfg, models=[m for m in cfg.models if m.id in model])
+        model_set = _require_known(model, {m.id for m in cfg.models}, "--model")
+        cfg = dataclasses.replace(cfg, models=[m for m in cfg.models if m.id in model_set])
 
     if episode:
-        unknown_episodes = sorted(set(episode) - {e.ep_id for e in episodes})
-        if unknown_episodes:
-            typer.echo(f"error: unknown --episode value(s): {', '.join(unknown_episodes)}", err=True)
-            raise typer.Exit(2)
-        episodes = [e for e in episodes if e.ep_id in episode]
+        episode_set = _require_known(episode, {e.ep_id for e in episodes}, "--episode")
+        episodes = [e for e in episodes if e.ep_id in episode_set]
 
     paths = runner_mod.RunPaths.for_root(_root() / "results")
     snapshots_dir = _root() / "data" / "pricing_snapshots"

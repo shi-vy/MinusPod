@@ -27,6 +27,12 @@ def validate_variant(name: str) -> None:
         raise ValueError(f"unknown prompt variant {name!r}; choose from {PROMPT_VARIANTS}")
 
 
+def record_cell(record: dict) -> tuple[str, str]:
+    """A call/episode-result record's (prompt_variant, addressing_mode) cell,
+    defaulting missing fields the way pre-A/B-test rows were written."""
+    return record.get("prompt_variant", DEFAULT_VARIANT), record.get("addressing_mode", "timestamps")
+
+
 def finalize_prompt(prompt: str) -> str:
     """Strip, drop trailing per-line whitespace, collapse 3+ newlines to 2."""
     prompt = prompt.strip() if prompt else ""

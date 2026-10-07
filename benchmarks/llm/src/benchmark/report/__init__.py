@@ -8,6 +8,7 @@ from pathlib import Path
 from .. import pricing
 from ..corpus import Episode
 from ..storage import read_jsonl
+from ..variants import record_cell
 from .aggregate import (
     _aggregate,
     _dedup_last_write_wins,
@@ -102,11 +103,7 @@ def render(
         title += " (" + ", ".join(title_suffixes) + ")"
 
     all_calls = list(read_jsonl(calls_path))
-    raw_calls = [
-        r for r in all_calls
-        if r.get("addressing_mode", "timestamps") == addressing_mode
-        and r.get("prompt_variant", "detection") == prompt_variant
-    ]
+    raw_calls = [r for r in all_calls if record_cell(r) == (prompt_variant, addressing_mode)]
     if not raw_calls:
         run_hint = "benchmark run"
         if prompt_variant != "detection":

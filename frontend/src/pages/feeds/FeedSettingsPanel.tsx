@@ -14,7 +14,6 @@ import ToggleSwitch from '../../components/ToggleSwitch';
 import TriStateSelect from '../../components/TriStateSelect';
 import SegmentedToggle from '../../components/SegmentedToggle';
 import SegmentActionToggle from '../../components/SegmentActionToggle';
-import Checkbox from '../../components/Checkbox';
 import {
   SEGMENT_CATEGORIES, SEGMENT_CATEGORY_LABELS, SEGMENT_CATEGORY_DESCRIPTIONS, DEFAULT_SEGMENT_ACTION,
   type SegmentCategory, type SegmentAction,
@@ -219,11 +218,6 @@ function FeedSettingsPanel({ feed, slug }: Props) {
     (settings?.lowAdYieldAction?.value as LowAdYieldAction | undefined) ?? 'nothing';
   const globalLowAdYieldLabel = LOW_AD_YIELD_ACTION_LABELS[globalLowAdYieldAction]
     ?? LOW_AD_YIELD_ACTION_LABELS.nothing;
-
-  const globalAdChapterCategories: Partial<Record<SegmentCategory, boolean>> =
-    settings?.adChapterCategories?.value ?? {};
-  const adChaptersOn = feed.adChaptersEnabled === 'on'
-    || (feed.adChaptersEnabled == null && settings?.adChaptersEnabled?.value === true);
 
   // Retention 0 turns run log storage off everywhere, so the global option
   // has to say which way it currently falls.
@@ -821,7 +815,7 @@ function FeedSettingsPanel({ feed, slug }: Props) {
                       processingMode: e.target.value as UpdateFeedPayload['processingMode'],
                     })}
                     disabled={updateMutation.isPending}
-                    className={`self-start min-w-0 max-w-full disabled:opacity-50 ${selectBase}`}
+                    className={`self-start min-w-0 max-w-full disabled:opacity-50 ${selectBase} pl-2`}
                   >
                     <option value="standard">Standard (detect and cut ads)</option>
                     <option value="keep_content">Keep content only (experimental)</option>
@@ -1122,54 +1116,6 @@ function FeedSettingsPanel({ feed, slug }: Props) {
                 feed, so apps show it without starting playback.
               </GlobalOverrideRow>
 
-              {/* Per-feed ad chapters override */}
-              <GlobalOverrideRow
-                label="Ad chapters"
-                ariaLabel="Ad chapters"
-                value={feed.adChaptersEnabled}
-                globalOn={!!settings?.adChaptersEnabled?.value}
-                disabled={updateMutation.isPending}
-                onChange={(adChaptersEnabled) => updateMutation.mutate({ adChaptersEnabled })}
-              >
-                Publish kept segments as chapters in this feed. Needs a chapters
-                mode other than Off.
-              </GlobalOverrideRow>
-
-              {adChaptersOn && (
-                <div className="flex flex-col sm:flex-row sm:items-start gap-2 sm:gap-3 text-sm">
-                  <span className="text-muted-foreground whitespace-nowrap sm:w-32 shrink-0 sm:pt-1.5">Chaptered categories:</span>
-                  <div className="flex flex-col gap-2 flex-1 min-w-0">
-                    <Checkbox
-                      checked={feed.adChapterCategories == null}
-                      // Copying the global map needs the settings query resolved.
-                      disabled={updateMutation.isPending || !settings}
-                      onChange={(checked) => updateMutation.mutate({
-                        adChapterCategories: checked ? null : { ...globalAdChapterCategories },
-                      })}
-                      label="Use global categories"
-                    />
-                    {feed.adChapterCategories != null && (
-                      <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-                        {SEGMENT_CATEGORIES.map((category) => (
-                          <Checkbox
-                            key={category}
-                            checked={feed.adChapterCategories?.[category]
-                              ?? globalAdChapterCategories[category] ?? false}
-                            disabled={updateMutation.isPending}
-                            onChange={(checked) => updateMutation.mutate({
-                              adChapterCategories: { ...feed.adChapterCategories, [category]: checked },
-                            })}
-                            label={SEGMENT_CATEGORY_LABELS[category]}
-                          />
-                        ))}
-                      </div>
-                    )}
-                    <p className="text-xs text-muted-foreground">
-                      Which kept categories get a chapter in this feed.
-                    </p>
-                  </div>
-                </div>
-              )}
             </div>
           </CollapsibleSection>
 
@@ -1350,7 +1296,7 @@ function FeedSettingsPanel({ feed, slug }: Props) {
             </div>
           </CollapsibleSection>
 
-          {/* Segment actions (issue #565): per-feed remove/beep/keep overrides,
+          {/* Segment actions (issue #565): per-feed remove/beep/keep/mark overrides,
               show-segment detection, and the bulk re-render trigger. */}
           <CollapsibleSection
             title="Segment actions"
@@ -1360,7 +1306,7 @@ function FeedSettingsPanel({ feed, slug }: Props) {
           >
             <div className="flex flex-col gap-3 pt-1">
               <p className="text-sm text-muted-foreground">
-                Choose what happens to each kind of detected segment. Remove cuts it out, Beep replaces it with a tone, Keep leaves it in.
+                Choose what happens to each kind of detected segment. Remove cuts it out, Beep replaces it with a tone, Keep leaves it in. Mark leaves it in and adds a chapter a player can skip.
               </p>
               <div className="space-y-2">
                 {SEGMENT_CATEGORIES.map((category) => {
@@ -1545,7 +1491,7 @@ function FeedSettingsPanel({ feed, slug }: Props) {
           {/* Advanced settings (collapsible; rarely-changed knobs) */}
           <CollapsibleSection
             title="Advanced"
-            subtitle="Cut snapping, ad review holds, and cross-fetch"
+            subtitle="Cut snapping, ad review holds, cross-fetch, and transcript diff"
             defaultOpen={false}
             storageKey={`feed-advanced-${slug}`}
           >
@@ -1753,6 +1699,32 @@ function FeedSettingsPanel({ feed, slug }: Props) {
                   <p className="text-xs text-warning">
                     Downloads each new episode twice and compares them; audio that differs was
                     inserted dynamically. Doubles this feed's download count.
+                  </p>
+                </div>
+              </div>
+              )}
+
+              {/* Local feeds have no publisher transcript to compare against. */}
+              {!isLocal && (
+              <div className="flex flex-col sm:flex-row sm:items-start gap-2 sm:gap-3 text-sm">
+                <span className="text-muted-foreground whitespace-nowrap sm:w-32 shrink-0 sm:pt-0.5">Transcript diff:</span>
+                <div className="flex flex-col gap-1 flex-1 min-w-0">
+                  <select
+                    value={feed.transcriptDifferential == null ? 'inherit' : feed.transcriptDifferential ? 'on' : 'off'}
+                    onChange={(e) => updateMutation.mutate({
+                      transcriptDifferential: e.target.value === 'inherit' ? null : e.target.value === 'on',
+                    })}
+                    disabled={updateMutation.isPending}
+                    className={`self-start min-w-0 disabled:opacity-50 ${selectBase}`}
+                    aria-label="Compare with the publisher transcript"
+                  >
+                    <option value="inherit">Inherit global ({settings?.transcriptDifferentialEnabled?.value === false ? 'Off' : 'On'})</option>
+                    <option value="on">On</option>
+                    <option value="off">Off</option>
+                  </select>
+                  <p className="text-xs text-muted-foreground">
+                    When an episode links the publisher's own transcript, speech missing from it is
+                    flagged as a likely ad. Gaps no other detector confirms are held for review.
                   </p>
                 </div>
               </div>

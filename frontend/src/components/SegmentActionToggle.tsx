@@ -17,7 +17,7 @@ const OPTIONS = SEGMENT_ACTIONS.map((action) => ({
   label: SEGMENT_ACTION_LABELS[action],
 }));
 
-// Three-way remove/beep/keep control shared by the global and per-feed
+// Remove/beep/keep/mark control shared by the global and per-feed
 // segment-action matrices.
 function SegmentActionToggle({ value, onChange, ariaLabel, disabled, muted }: SegmentActionToggleProps) {
   return (
@@ -28,6 +28,7 @@ function SegmentActionToggle({ value, onChange, ariaLabel, disabled, muted }: Se
       ariaLabel={ariaLabel}
       disabled={disabled}
       muted={muted}
+      mobileTouchTarget
     />
   );
 }

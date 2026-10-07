@@ -39,6 +39,9 @@ interface AdEditorProps {
   audioDuration: number;
   audioUrl?: string;
   onCorrection: (correction: AdCorrection) => void;
+  // Awaitable submission path, used only for a multi-span create so the
+  // panel can confirm or fail each run's save before moving to the next.
+  onCorrectionAsync?: (correction: AdCorrection) => Promise<void>;
   onClose?: () => void;
   selectedAdIndex?: number;
   onSelectedAdIndexChange?: (index: number) => void;
@@ -60,11 +63,12 @@ const ADD_BUTTON_BTN =
 const GHOST_BTN =
   `${btnGhost} transition-colors`;
 
-export function AdEditor({
+function AdEditor({
   detectedAds,
   audioDuration,
   audioUrl,
   onCorrection,
+  onCorrectionAsync,
   onClose,
   selectedAdIndex: externalSelectedAdIndex,
   onSelectedAdIndexChange,
@@ -197,8 +201,16 @@ export function AdEditor({
     advanceOrClose();
   };
 
-  const handleCreateSubmit = (s: AdCreateSubmit) => {
-    onCorrection({
+  // Exits create mode after a submission. Called synchronously from the
+  // single-run path below, and from onCreateDone once a multi-span batch's
+  // last run saves.
+  const finishCreate = () => {
+    setInternalCreateMode(false);
+    if (detectedAds.length === 0) onClose?.();
+  };
+
+  const handleCreateSubmit = (s: AdCreateSubmit, meta?: { silent?: boolean }): Promise<void> => {
+    const correction: AdCorrection = {
       type: 'create',
       start: s.start,
       end: s.end,
@@ -207,9 +219,17 @@ export function AdEditor({
       scope: s.scope,
       reason: s.reason,
       category: s.category,
-    });
-    setInternalCreateMode(false);
-    if (detectedAds.length === 0) onClose?.();
+    };
+    // Single-run keeps the original fire-and-forget onCorrection/mutate path;
+    // only a multi-span run (meta.silent) needs the awaitable path.
+    if (!meta?.silent) {
+      onCorrection(correction);
+      finishCreate();
+      return Promise.resolve();
+    }
+    return onCorrectionAsync
+      ? onCorrectionAsync(correction)
+      : Promise.resolve(onCorrection(correction));
   };
 
   const handleSkip = advanceOrClose;
@@ -242,6 +262,7 @@ export function AdEditor({
       onClose={handleClose}
       onSubmit={handleReviewSubmit}
       onCreate={handleCreateSubmit}
+      onCreateDone={finishCreate}
       onSkip={handleSkip}
       hasNext={safeIndex < detectedAds.length - 1}
       onAddNew={detectedAds.length > 0 && !internalCreateMode

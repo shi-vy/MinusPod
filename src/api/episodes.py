@@ -16,13 +16,13 @@ from api import (
     _resolve_original_audio,
 )
 from config import (
-    is_pending_review, normalize_segment_category, resolve_chapters_in_notes,
+    is_keep_like, is_pending_review, normalize_segment_category, resolve_chapters_in_notes,
     title_matches_skip_patterns,
     resolve_processing_mode, DEFAULT_SEGMENT_ACTION,
     PROCESSING_MODE_PASSTHROUGH, PROCESSING_MODE_SKIP_DETECTION, PROCESSING_MODE_CUE_ONLY,
 )
 from ad_chapters import (
-    merge_ad_chapters, public_chapters, resolve_ad_chapter_config,
+    merge_ad_chapters, public_chapters, refresh_keep_like_markers, resolve_ad_chapter_config,
 )
 from ad_validator import user_trimmed_keep_ranges
 from ad_yield import latest_completed_run, low_ad_yield
@@ -106,11 +106,11 @@ def _overlaps_any(marker, spans) -> bool:
 def _marker_wants_cut(marker, action, false_positives, confirmed) -> bool:
     """Whether the recorded decisions ask for this marker to leave the audio.
 
-    Conservative: anything not plainly kept, rejected, or awaiting review
-    counts as wanted, so an unclear marker costs a recut rather than a
-    silently dropped decision.
+    Conservative: anything not plainly kept/marked, rejected, or awaiting
+    review counts as wanted, so an unclear marker costs a recut rather than
+    a silently dropped decision.
     """
-    if action == 'keep':
+    if is_keep_like(action):
         return False
     if _overlaps_any(marker, false_positives):
         return False
@@ -157,9 +157,9 @@ def chapters_only_decisions(markers, applied_cuts, original_duration,
         if m.get('start') is not None and m.get('end') is not None
     ]
     resolved = [(m, DEFAULT_SEGMENT_ACTION
-                 if action == 'keep' and keep_override and keep_override(m) else action)
+                 if is_keep_like(action) and keep_override and keep_override(m) else action)
                 for m, action in resolved]
-    protected = [*(m for m, action in resolved if action == 'keep'),
+    protected = [*(m for m, action in resolved if is_keep_like(action)),
                  *user_trimmed_keep_ranges(list(confirmed))]
     wanted = AudioProcessor().compute_applied_cuts(
         [dict(m, beep=(action == 'beep')) for m, action in resolved
@@ -432,6 +432,20 @@ def _episode_base_json(ep, *, slug=None, is_local=False, storage=None,
     }
 
 
+def _upstream_transcript_to_api(payload):
+    """Shape the stored upstream transcript diff for the episode detail (or None)."""
+    if not isinstance(payload, dict):
+        return None
+    return {
+        'status': payload.get('status'),
+        'coverage': payload.get('coverage'),
+        'sourceType': payload.get('mime'),
+        'spans': [{'start': span.get('start'), 'end': span.get('end'),
+                   'offsetConfirmed': bool(span.get('offset_confirmed'))}
+                  for span in payload.get('spans') or () if isinstance(span, dict)],
+    }
+
+
 def _run_stats_to_api(stats):
     """Rename the pipeline's snake_case stats blob to API casing (or None)."""
     if not stats:
@@ -455,6 +469,7 @@ def _run_stats_to_api(stats):
             'textPattern': stage_hits.get('text_pattern', 0),
             'differential': stage_hits.get('differential', 0),
             'llm': stage_hits.get('llm', 0),
+            'transcriptDifferential': stage_hits.get('transcript_differential', 0),
         } if stage_hits else None,
         'detected': stats.get('detected'),
         'markers': {
@@ -469,6 +484,7 @@ def _run_stats_to_api(stats):
         'timings': {
             'downloadSeconds': timings.get('download'),
             'transcriptionSeconds': timings.get('transcription'),
+            'transcriptDiffSeconds': timings.get('transcript_diff'),
             'differentialSeconds': timings.get('differential'),
             'audioAnalysisSeconds': timings.get('audio_analysis'),
             'detectionSeconds': timings.get('detection'),
@@ -494,6 +510,13 @@ def _run_stats_to_api(stats):
             'model': transcription.get('model'),
             'error': transcription.get('error'),
         }
+    transcript_diff = stats.get('transcript_diff')
+    if isinstance(transcript_diff, dict):
+        result['transcriptDiff'] = {
+            'status': transcript_diff.get('status'),
+            'coverage': transcript_diff.get('coverage'),
+            'spans': transcript_diff.get('spans', 0),
+        }
     notices = stats.get('thinking_notices')
     if notices:
         result['thinkingNotices'] = [{
@@ -509,6 +532,14 @@ def _run_stats_to_api(stats):
                     notice.get('fallback') or {}).get('reasoning_effort'),
             },
         } for notice in notices]
+    failover_usage = stats.get('failover')
+    if isinstance(failover_usage, dict):
+        slot_names = {'primary': 'llm-a', 'secondary': 'llm-b'}
+        result['failover'] = {
+            'llm': [slot_names[slot] for slot in failover_usage.get('llm') or ()
+                    if slot in slot_names],
+            'whisper': bool(failover_usage.get('whisper')),
+        }
     return result
 
 
@@ -656,9 +687,8 @@ def get_episode(slug, episode_id):
 
     # Parse ad markers if present, separating into four buckets:
     #   pendingReviewMarkers: held_for_review=True and not was_cut (checked FIRST)
-    #   keptMarkers:          action_applied == 'keep' and not held (deliberate
-    #                         per-category keep; keep resolution clears holds
-    #                         upstream, so this never overlaps pendingReviewMarkers)
+    #   keptMarkers:          action_applied keep-like and not held;
+    #                         actionApplied tells keep from mark.
     #   rejectedAdMarkers:    REJECT decision or not was_cut (and not held/kept)
     #   adMarkers:            everything else (accepted cuts)
     ad_markers = []
@@ -668,6 +698,10 @@ def get_episode(slug, episode_id):
     if episode.get('ad_markers_json'):
         try:
             all_markers = parse_ad_markers(episode['ad_markers_json']) or []
+            # Not persisted: a Keep<->Mark switch since these markers were
+            # stamped shows up in actionApplied/the bucket here without a recut.
+            all_markers = refresh_keep_like_markers(
+                all_markers, db.resolve_segment_actions(slug, podcast))
             for marker in all_markers:
                 decision = marker.get('validation', {}).get('decision', 'ACCEPT')
                 # Markers persisted by a failed run were never cut.
@@ -680,7 +714,7 @@ def get_episode(slug, episode_id):
                 marker['actionApplied'] = marker.get('action_applied')
                 if is_pending_review(marker):
                     pending_review_markers.append(marker)
-                elif marker.get('action_applied') == 'keep':
+                elif is_keep_like(marker.get('action_applied')):
                     kept_markers.append(marker)
                 elif decision == 'REJECT' or not was_cut:
                     rejected_ad_markers.append(marker)
@@ -697,6 +731,9 @@ def get_episode(slug, episode_id):
             dai_differential = json.loads(episode['dai_differential_json'])
         except (json.JSONDecodeError, TypeError):
             dai_differential = None
+
+    upstream_transcript = _upstream_transcript_to_api(
+        db.get_episode_upstream_transcript(slug, episode_id))
 
     splice_calibration = db.get_episode_splice_calibration(slug, episode_id)
 
@@ -769,6 +806,7 @@ def get_episode(slug, episode_id):
         'partialDetection': _partial_detection(episode, processing_runs),
         'incompleteCoverage': _incomplete_coverage(processing_runs),
         'daiDifferential': dai_differential,
+        'upstreamTranscript': upstream_transcript,
         'spliceCalibration': splice_calibration,
         'transcript': episode.get('transcript_text'),
         'transcriptAvailable': bool(episode.get('transcript_text')),
@@ -1365,9 +1403,13 @@ def _regenerate_chapters(db, storage, slug, episode_id, episode, podcast, podcas
             logger.info(f"[{slug}:{episode_id}] No authoritative applied cuts "
                         f"persisted; skipping ad chapters")
         else:
-            ad_config = resolve_ad_chapter_config(db, podcast, slug=slug)
+            ad_config = resolve_ad_chapter_config(db, podcast)
             topic = (chapters or {}).get('chapters') or []
-            merged = merge_ad_chapters(topic, current_markers, current_cuts,
+            # Not persisted: a Keep<->Mark switch since this marker was stamped
+            # takes effect in this rebuild's chapters only, not in ad_markers_json.
+            refreshed_markers = (refresh_keep_like_markers(current_markers, ad_config.actions)
+                                 if ad_config else current_markers)
+            merged = merge_ad_chapters(topic, refreshed_markers, current_cuts,
                                        segments[-1].get('end') if segments else None,
                                        get_replacement_duration(), ad_config)
             if merged:

@@ -17,7 +17,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
 
 from config import (
     SEGMENT_CATEGORIES, DEFAULT_SEGMENT_ACTION,
-    DEFAULT_AD_CHAPTER_CATEGORIES_JSON,
     DEFAULT_COMMUNITY_SYNC_CATEGORIES_JSON,
 )
 from database import Database
@@ -51,14 +50,13 @@ SEED_SNAPSHOT = {
     '_review_prompt_migrated': 'true',
     'audio_bitrate': '128k',
     'chapter_prompt': ('sha256', 'ba78ae10ed245f1b215407d2980358cdf6aff6b5f64dfc1662c6f6848cb418b4'),
+    'pattern_cleanup_prompt': ('sha256', '485b57bb6dfb67b3fe00eae7939f4fb6f9a112afbbd10691c5b7cbc9e04ddd32'),
     'audio_normalize_enabled': 'false',
     'audio_normalize_intensity': 'normal',
     'auto_process_enabled': 'true',
     'chapters_enabled': 'true',
     'chapters_mode': 'auto',
     'chapters_in_notes': 'false',
-    'ad_chapters_enabled': 'false',
-    'ad_chapter_categories': DEFAULT_AD_CHAPTER_CATEGORIES_JSON,
     'ad_chapters_include_held': 'false',
     'ad_chapter_title_format': 'Ad: {label}',
     'ad_chapter_held_title_format': 'Possible ad: {label}',
@@ -80,6 +78,7 @@ SEED_SNAPSHOT = {
     'differential_measured_corr_max': '0.60',
     'differential_fetch_mode': 'auto',
     'skip_second_pass': 'false',
+    'transcript_differential_enabled': 'true',
     'enable_ad_review': 'false',
     'keep_original_audio': 'true',
     'learning_min_confidence': '0.85',
@@ -139,16 +138,35 @@ SEED_SNAPSHOT = {
     'vtt_transcripts_enabled': 'true',
     'whisper_language': 'en',
     'whisper_model': 'small',
+    # Provider failover (#806).
+    'failover_llm_enabled': 'false',
+    'failover_llm_base_url': 'http://localhost:8000/v1',
+    'failover_llm_detection_model': '',
+    'failover_llm_review_model': '',
+    'failover_llm_verification_model': '',
+    'failover_llm_chapters_model': '',
+    'failover_whisper_enabled': 'false',
+    'failover_whisper_backend': 'openai-api',
+    'failover_whisper_model': '',
+    'failover_whisper_api_base_url': '',
+    'failover_whisper_api_model': 'whisper-1',
+    'failover_whisper_api_timeout_seconds': '600',
+    'failover_whisper_language': '',
+    'failover_probe_interval_minutes': '5',
+    'failover_recovery_probes': '3',
+    'whisper_max_attempts': '2',
 }
 
 # The pre-registry bulk reset endpoint reset exactly these keys
 # (62 hand-enumerated + 23 stage tunables via STAGE_TUNABLE_PAYLOAD_KEYS).
+# ad_chapters_enabled and ad_chapter_categories dropped out of the registry
+# with the retired settings (62 -> 60; 2.98.0, mark_action_from_ad_chapters_v1).
 EXPECTED_AD_RESET_KEYS = {
     'system_prompt', 'verification_prompt', 'claude_model',
     'verification_model', 'whisper_model', 'vtt_transcripts_enabled',
     'chapters_enabled', 'chapters_mode', 'chapters_in_notes', 'chapters_model',
     'skip_second_pass', 'differential_fetch_mode',
-    'ad_chapters_enabled', 'ad_chapter_categories',
+    'transcript_differential_enabled',
     'ad_chapters_include_held', 'ad_chapter_title_format',
     'ad_chapter_held_title_format', 'ad_chapter_resume_title',
     'ad_chapter_min_confidence',
@@ -200,6 +218,8 @@ EXPECTED_AD_RESET_KEYS = {
     'differential_measured_corr_max', 'differential_hold_min_seconds',
     'dai_differential_overrides_keep', 'splice_veto_enabled',
     'ad_detection_exclude_start_seconds',
+    # Provider failover (#806).
+    'whisper_max_attempts',
 }
 
 # Keys reset_setting() must refuse (return False). Membership captured from
@@ -221,6 +241,7 @@ NON_RESETTABLE_KEYS = (
     'system_prompt_override', 'verification_prompt_override',
     'review_prompt_override', 'resurrect_prompt_override',
     'chapter_prompt_override',
+    'pattern_cleanup_schedule_anchor',
     'transition_threshold_db', 'volume_threshold_db',
     'nonexistent_key_xyz',
 )
@@ -494,12 +515,17 @@ class TestGetDefaults:
         # request-rate limit keys (#747), primary and secondary (121 -> 125),
         # then the two tokens-per-minute keys, primary and secondary (125 -> 127).
         # adDetectionExcludeStartSeconds added after that (127 -> 128).
-        # spliceVetoEnabled added after that (131 -> 132).
+        # Failover and per-slot overrides add the latest settings.
+        # transcriptDifferentialEnabled added after that (156 -> 157).
+        # Six patternCleanup* settings plus patternCleanupPrompt (157 -> 164).
+        # adChaptersEnabled and adChapterCategories retired with the settings
+        # they came from (164 -> 162; 2.98.0, mark_action_from_ad_chapters_v1).
         payload_keys = {
             spec.payload_key for spec in SETTINGS_REGISTRY.values()
             if spec.payload_key
         }
-        assert len(payload_keys) == 132
+        assert len(payload_keys) == 162
+        assert 'failoverWhisperMaxAttempts' in payload_keys
         assert 'audioCuePairOrientWindowSeconds' not in payload_keys
         assert 'audioCuePairMaxBreakFraction' in payload_keys
 
@@ -562,7 +588,8 @@ class TestShippedPromptsTrackTheDefault:
     def test_the_prompts_are_marked_refreshable(self):
         from database.settings import SETTINGS_REGISTRY
         for key in ('system_prompt', 'verification_prompt',
-                    'review_prompt', 'resurrect_prompt', 'chapter_prompt'):
+                    'review_prompt', 'resurrect_prompt', 'chapter_prompt',
+                    'pattern_cleanup_prompt'):
             assert SETTINGS_REGISTRY[key].refresh_default, key
 
     def test_nothing_else_is_refreshable(self):
@@ -571,7 +598,7 @@ class TestShippedPromptsTrackTheDefault:
         refreshable = {k for k, s in SETTINGS_REGISTRY.items() if s.refresh_default}
         assert refreshable == {'system_prompt', 'verification_prompt',
                                'review_prompt', 'resurrect_prompt',
-                               'chapter_prompt'}
+                               'chapter_prompt', 'pattern_cleanup_prompt'}
 
     def test_refreshable_defaults_report_current_text(self):
         from database.settings import iter_refreshable_defaults

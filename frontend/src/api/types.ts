@@ -1,6 +1,7 @@
 import type { DetectionStage } from '../utils/detectionStage';
 import type { CorroborationSource } from '../utils/corroboration';
 import type { SegmentCategory, SegmentAction } from '../utils/segmentCategory';
+import type { FailoverOverview } from './failover';
 
 // Per-feed episode status counts (#466). Keys use the API status aliases
 // (DB 'processed' arrives as 'completed'); 'deferred' is the offline queue.
@@ -82,11 +83,6 @@ export interface Feed {
   differentialFetchMode?: 'inherit' | 'auto' | 'on' | 'off' | null;
   // Chapter list in served descriptions (#720): null follows the global setting.
   chaptersInNotes?: 'on' | 'off' | null;
-  // Ad chapters: null follows the global setting.
-  adChaptersEnabled?: 'on' | 'off' | null;
-  // Null follows the global category map; a partial map overrides only the
-  // categories it names.
-  adChapterCategories?: Partial<Record<SegmentCategory, boolean>> | null;
   // Per-feed auto-process queue priority (#625). Server always resolves to
   // one of the three values; null/absent reads as 'normal'.
   queuePriority?: 'high' | 'normal' | 'low' | null;
@@ -155,6 +151,8 @@ export interface Feed {
   ownEpisodeGuids?: boolean | null;
   // Skip the pass-2 verification scan (#599). Null/false run it.
   skipSecondPass?: boolean | null;
+  // Diff against the publisher's podcast:transcript. Null inherits the global toggle.
+  transcriptDifferential?: boolean | null;
   // Bounded per-feed episode projection (grouped dashboard view), present
   // only when the /feeds request opted in via includeLatestEpisodes.
   latestEpisodes?: EpisodeSummary[];
@@ -260,6 +258,16 @@ export interface DaiDifferential {
   error?: string | null;
 }
 
+export type UpstreamTranscriptStatus = 'ok' | 'none' | 'unreliable' | 'empty' | 'error';
+
+// Spans of Whisper audio the publisher's transcript omits.
+export interface UpstreamTranscript {
+  status: UpstreamTranscriptStatus;
+  coverage: number | null;
+  sourceType: string | null;
+  spans: { start: number; end: number; offsetConfirmed: boolean }[];
+}
+
 // Windows the latest run lost in one pass, and what they were lost to
 // (rate_limit, server_error, connectivity, reasoning_exhausted,
 // output_truncated, empty_completion, other).
@@ -316,6 +324,7 @@ export interface EpisodeDetail extends Episode {
   outputTokens?: number;
   llmCost?: number;
   daiDifferential?: DaiDifferential;
+  upstreamTranscript?: UpstreamTranscript | null;
   // Feed-declared duration (itunes:duration) in seconds; null when the feed
   // does not declare one or the episode was discovered before 2.53.0.
   rssDuration?: number | null;
@@ -418,6 +427,8 @@ export interface ProcessingRunStats {
     fingerprint: number;
     textPattern: number;
     differential: number;
+    // Absent on runs recorded before the transcript diff stage existed.
+    transcriptDifferential?: number;
     llm: number;
   } | null;
   detected?: number;
@@ -428,9 +439,12 @@ export interface ProcessingRunStats {
   sourceSecondsRemoved?: number | null;
   replacementSecondsAdded?: number | null;
   timings?: ProcessingRunTimings | null;
+  transcriptDiff?: { status: UpstreamTranscriptStatus; coverage: number | null; spans: number };
   // Present only when this run retried a rejected thinking setting with
   // pass defaults. The backend deliberately excludes the provider error.
   thinkingNotices?: ThinkingCompatibilityNotice[];
+  // Present only when the run actually sent requests to a failover configuration.
+  failover?: { llm: ('llm-a' | 'llm-b')[]; whisper: boolean };
 }
 
 export interface ProcessingRunTimings {
@@ -438,6 +452,7 @@ export interface ProcessingRunTimings {
   // FFmpeg tasks in the run, including retries. Finalize ends before history.
   downloadSeconds?: number | null;
   transcriptionSeconds?: number | null;
+  transcriptDiffSeconds?: number | null;
   differentialSeconds?: number | null;
   audioAnalysisSeconds?: number | null;
   detectionSeconds?: number | null;
@@ -594,7 +609,8 @@ export interface AdSegment {
     | 'large_vad_gap_extension'
     | 'cue_template_unproven'
     | 'cue_low_confidence'
-    | 'no_transcript_evidence';
+    | 'no_transcript_evidence'
+    | 'transcript_differential_unreviewed';
   // Detected span this fragment was carved from when the render removed only part of it.
   carved_from?: { start: number; end: number };
   // Set when a confirm correction matched this held marker (issue #509);
@@ -624,6 +640,13 @@ export interface SettingValueBoolean {
 
 export interface SettingValueNumber {
   value: number;
+  isDefault: boolean;
+}
+
+// Int-or-blank settings (failover/per-provider timeout and retry overrides):
+// null means "use the provider type's default", not an unset field.
+export interface SettingValueNumberOrNull {
+  value: number | null;
   isDefault: boolean;
 }
 
@@ -724,6 +747,14 @@ export const SLOT_SECONDARY = 'secondary';
 export const SAME_AS_DETECTION = 'same_as_detection';
 export type ProviderSlot = typeof SLOT_PRIMARY | typeof SLOT_SECONDARY;
 
+// Display names for the credential slots; API and stored settings keep the
+// primary/secondary values (see llm_route.py). 'failover' is the shared failover account.
+export const SLOT_LABELS: Record<ProviderSlot | 'failover', string> = {
+  primary: 'Provider A',
+  secondary: 'Provider B',
+  failover: 'Failover',
+};
+
 export const WHISPER_BACKENDS = {
   LOCAL: 'local' as const,
   OPENAI_API: 'openai-api' as const,
@@ -735,6 +766,7 @@ export interface Settings {
   reviewPrompt: SettingValue;
   resurrectPrompt: SettingValue;
   chapterPrompt: SettingValue;
+  patternCleanupPrompt: SettingValue;
   systemPromptOverride: SettingValue;
   verificationPromptOverride: SettingValue;
   reviewPromptOverride: SettingValue;
@@ -842,9 +874,8 @@ export interface Settings {
   chaptersMode: SettingValue;
   chaptersInNotes: SettingValueBoolean;
   skipSecondPass: SettingValueBoolean;
+  transcriptDifferentialEnabled: SettingValueBoolean;
   differentialFetchMode: SettingValue;
-  adChaptersEnabled: SettingValueBoolean;
-  adChapterCategories: { value: Record<SegmentCategory, boolean>; isDefault: boolean };
   adChaptersIncludeHeld: SettingValueBoolean;
   adChapterTitleFormat: SettingValue;
   adChapterHeldTitleFormat: SettingValue;
@@ -875,6 +906,36 @@ export interface Settings {
   secondaryProviderRequestsPerDay: SettingValueNumber;
   providerTokensPerMin: SettingValueNumber;
   secondaryProviderTokensPerMin: SettingValueNumber;
+  // Provider failover (#806): a dedicated LLM/Whisper account traffic moves
+  // to when the primary is down, distinct from the secondary slot above.
+  failoverLlmEnabled: SettingValueBoolean;
+  failoverLlmProvider: SettingValue;
+  failoverLlmBaseUrl: SettingValue;
+  failoverLlmTimeoutSeconds: SettingValueNumberOrNull;
+  failoverLlmMaxRetries: SettingValueNumberOrNull;
+  failoverLlmDetectionModel: SettingValue;
+  failoverLlmReviewModel: SettingValue;
+  failoverLlmVerificationModel: SettingValue;
+  failoverLlmChaptersModel: SettingValue;
+  failoverLlmApiKeyConfigured: boolean;
+  failoverWhisperEnabled: SettingValueBoolean;
+  failoverWhisperBackend: SettingValue;
+  failoverWhisperModel: SettingValue;
+  failoverWhisperApiBaseUrl: SettingValue;
+  failoverWhisperApiModel: SettingValue;
+  failoverWhisperApiTimeoutSeconds: SettingValueNumber;
+  failoverWhisperMaxAttempts: SettingValueNumberOrNull;
+  failoverWhisperLanguage: SettingValue;
+  failoverWhisperApiKeyConfigured: boolean;
+  failoverProbeIntervalMinutes: SettingValueNumber;
+  failoverRecoveryProbes: SettingValueNumber;
+  // Blank per-provider overrides fall back to the provider type's default
+  // (see providerDefaults() in LLMProviderSection.tsx).
+  providerATimeoutSeconds: SettingValueNumberOrNull;
+  providerAMaxRetries: SettingValueNumberOrNull;
+  providerBTimeoutSeconds: SettingValueNumberOrNull;
+  providerBMaxRetries: SettingValueNumberOrNull;
+  whisperMaxAttempts: SettingValueNumber;
   pricingSourceMode: SettingValue;
   modelPricingOverrides: { value: ModelPricingOverrides; isDefault: boolean };
   apiKeyConfigured: boolean;
@@ -920,10 +981,9 @@ export interface Settings {
     vttTranscriptsEnabled: boolean;
     chaptersEnabled: boolean;
     chaptersMode: string;
-    adChaptersEnabled: boolean;
     skipSecondPass: boolean;
+    transcriptDifferentialEnabled: boolean;
     differentialFetchMode: string;
-    adChapterCategories: Record<SegmentCategory, boolean>;
     adChaptersIncludeHeld: boolean;
     adChapterTitleFormat: string;
     adChapterHeldTitleFormat: string;
@@ -961,9 +1021,14 @@ export interface Settings {
     transcribeConcurrentChunks: number;
     transcribeChunkOverlapSeconds: number;
     whisperApiTimeoutSeconds: number;
+    whisperMaxAttempts: number;
     whisperPoolEnabled: boolean;
     whisperPoolMaxRequests: number;
     whisperPoolMaxEpisodes: number;
+    failoverWhisperBackend: WhisperBackend;
+    failoverWhisperApiModel: string;
+    failoverProbeIntervalMinutes: number;
+    failoverRecoveryProbes: number;
     audioCueDetectionEnabled: boolean;
     audioCueFreqMinHz: number;
     audioCueFreqMaxHz: number;
@@ -1017,6 +1082,7 @@ export interface UpdateSettingsPayload {
   reviewPrompt?: string;
   resurrectPrompt?: string;
   chapterPrompt?: string;
+  patternCleanupPrompt?: string;
   systemPromptOverride?: string;
   verificationPromptOverride?: string;
   reviewPromptOverride?: string;
@@ -1119,10 +1185,8 @@ export interface UpdateSettingsPayload {
   chaptersMode?: 'auto' | 'generate' | 'off';
   chaptersInNotes?: boolean;
   skipSecondPass?: boolean;
+  transcriptDifferentialEnabled?: boolean;
   differentialFetchMode?: 'auto' | 'on' | 'off';
-  adChaptersEnabled?: boolean;
-  // Partial map, merged over the stored global map by the backend.
-  adChapterCategories?: Partial<Record<SegmentCategory, boolean>>;
   adChaptersIncludeHeld?: boolean;
   adChapterTitleFormat?: string;
   adChapterHeldTitleFormat?: string;
@@ -1143,6 +1207,33 @@ export interface UpdateSettingsPayload {
   secondaryProviderRequestsPerDay?: number;
   providerTokensPerMin?: number;
   secondaryProviderTokensPerMin?: number;
+  // Provider failover (#806).
+  failoverLlmEnabled?: boolean;
+  failoverLlmProvider?: LlmProvider | '';
+  failoverLlmBaseUrl?: string;
+  failoverLlmTimeoutSeconds?: number | null;
+  failoverLlmMaxRetries?: number | null;
+  failoverLlmDetectionModel?: string;
+  failoverLlmReviewModel?: string;
+  failoverLlmVerificationModel?: string;
+  failoverLlmChaptersModel?: string;
+  failoverLlmApiKey?: string;
+  failoverWhisperEnabled?: boolean;
+  failoverWhisperBackend?: WhisperBackend;
+  failoverWhisperModel?: string;
+  failoverWhisperApiBaseUrl?: string;
+  failoverWhisperApiKey?: string;
+  failoverWhisperApiModel?: string;
+  failoverWhisperApiTimeoutSeconds?: number;
+  failoverWhisperMaxAttempts?: number | null;
+  failoverWhisperLanguage?: string;
+  failoverProbeIntervalMinutes?: number;
+  failoverRecoveryProbes?: number;
+  providerATimeoutSeconds?: number | null;
+  providerAMaxRetries?: number | null;
+  providerBTimeoutSeconds?: number | null;
+  providerBMaxRetries?: number | null;
+  whisperMaxAttempts?: number;
   pricingSourceMode?: string;
   modelPricingOverrides?: Record<string, ModelPricingOverride | null>;
   whisperBackend?: WhisperBackend;
@@ -1317,6 +1408,7 @@ export interface SystemStatus {
     lastSuccessfulRefreshAt: string | null;
     nextRetryAt: string | null;
   };
+  failover?: Pick<FailoverOverview, 'targets' | 'probes'>;
   security?: {
     cryptoReady: boolean;
     plaintextSecretsCount: number;

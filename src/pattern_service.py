@@ -9,7 +9,6 @@ Handles:
 """
 import logging
 import json
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from config import (
@@ -42,7 +41,6 @@ from community_export import (
 # test names. New code should import the LEARNING_* names directly.
 VERIFICATION_MIN_CONFIDENCE = LEARNING_MIN_CONFIDENCE
 VERIFICATION_MIN_CONFIDENCE_LONG = LEARNING_MIN_CONFIDENCE_LONG
-VERIFICATION_LONG_DURATION_THRESHOLD = LEARNING_LONG_DURATION_THRESHOLD
 
 logger = logging.getLogger('podcast.patterns')
 
@@ -167,16 +165,6 @@ KNOWN_NETWORKS = {
     'slate': ['slate.com', 'slate podcasts'],
     'iheart': ['iheart.com', 'iheartradio', 'iheartpodcast'],
 }
-
-
-@dataclass
-class PatternMatch:
-    """Represents a pattern match result."""
-    pattern_id: int
-    scope: str
-    confidence: float
-    sponsor: str | None
-    text_similarity: float
 
 
 class PatternService:
@@ -687,11 +675,21 @@ class PatternService:
         # Update podcast in database
         if self.db and (dai_platform or network_id):
             try:
-                self.db.update_podcast(
-                    podcast_id,
-                    dai_platform=dai_platform,
-                    network_id=network_id
-                )
+                # Same transaction: a failed retag must not leave the
+                # podcast on the new network with stranded templates.
+                with self.db.transaction(immediate=True) as conn:
+                    self.db.update_podcast(
+                        podcast_id, conn=conn,
+                        dai_platform=dai_platform,
+                        network_id=network_id
+                    )
+                    row = self.db.get_podcast_by_slug(podcast_id)
+                    if row:
+                        effective_network = (
+                            (row.get('network_id_override') or '').strip()
+                            or row.get('network_id') or None)
+                        self.db.retag_network_cue_templates(
+                            row['id'], effective_network, conn=conn)
                 logger.debug(
                     f"Updated podcast {podcast_id}: "
                     f"platform={dai_platform}, network={network_id}"

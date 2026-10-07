@@ -370,6 +370,7 @@ def refresh_rss_feed(slug: str, feed_url: str, force: bool = False,
             db.clear_parse_failure_state(slug)
         except Exception:
             refresh_logger.exception(f"[{slug}] Failed to clear parse failure state")
+        channel_elem = None
         if parsed_feed and parsed_feed.feed:
             # feedparser flattens <podcast:liveItem> into the channel dict,
             # so read the raw children and fall back per field (#596).
@@ -483,7 +484,7 @@ def refresh_rss_feed(slug: str, feed_url: str, force: bool = False,
         # Pass parsed_feed so extract_episodes does not re-parse the same
         # XML we already parsed above.
         all_episodes = rss_parser.extract_episodes(
-            feed_content, parsed_feed=parsed_feed, source=slug)
+            feed_content, parsed_feed=parsed_feed, source=slug, channel=channel_elem)
         discovery = db.bulk_upsert_discovered_episodes(
             slug, all_episodes, return_state=True)
         if isinstance(discovery, tuple):
@@ -741,6 +742,10 @@ def _build_and_save_served_rss(slug, feed_content, parsed_feed, podcast):
     """
     feed_cap = db.get_max_episodes_for_podcast(slug, podcast=podcast)
     extra_episodes = db.get_processed_episodes_for_feed(podcast['id'])
+    # Backfill the enclosure length for rows finalized before the
+    # processed_size_bytes column existed; a one-time stat per episode.
+    for ep in extra_episodes:
+        rss_parser.backfill_processed_size(db, storage, slug, ep)
 
     # When the resolved value is True, hide upstream entries that have not
     # finished processing so auto-downloading clients don't hit 503.

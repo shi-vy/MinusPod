@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Play, Pause, SkipBack, SkipForward, Search, ChevronUp, ChevronDown } from 'lucide-react';
 import {
   getOriginalSegments,
@@ -6,9 +6,16 @@ import {
   type TranscriptWord,
 } from '../../api/feeds';
 import { formatTime } from '../../utils/adReviewHelpers';
-import { btnGhost } from '../buttonStyles';
-import { selectBase } from '../../components/fieldStyles';
+import { btnGhost, touchTarget } from '../buttonStyles';
+import { badgeBase } from '../badgeStyles';
 import { focusRing } from '../../components/fieldStyles';
+import SpeedMenu from './SpeedMenu';
+
+export interface TextRun {
+  start: number;
+  end: number;
+  text: string;
+}
 
 interface Props {
   slug: string;
@@ -20,16 +27,63 @@ interface Props {
   adStart: number;
   adEnd: number;
   onSelectionChange: (start: number, end: number, text: string) => void;
+  // Frozen runs plus the current (unfrozen) one, in whatever order they were
+  // committed. The host sorts and counts; this panel only tracks the list.
+  onRunsChange: (runs: TextRun[]) => void;
   // Playback rate is owned by the parent (same audio element drives both modes).
   playbackRate: number;
   setPlaybackRate: (r: number) => void;
+  disabled?: boolean;
+  // Keys (via runKey) of runs the host has already saved. Fixed in the merge
+  // step so a retry can't re-cover a saved range.
+  savedKeys?: Set<string>;
 }
+
+const EMPTY_SAVED_KEYS = new Set<string>();
 
 interface FlatWord extends TranscriptWord {
   globalIndex: number; // position across all segments, for selection math
 }
 
-const PLAYBACK_RATES = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2] as const;
+// Runs this close in time collapse into one on freeze.
+const MERGE_GAP_SECONDS = 1;
+const chipClass = `${badgeBase} inline-flex items-center gap-1.5 border border-border bg-background text-foreground`;
+
+// Shared with AdReviewModal so saved-run lookups use an identical key.
+export function runKey(run: TextRun): string {
+  return JSON.stringify([run.start, run.end, run.text]);
+}
+
+function textForRange(words: FlatWord[], start: number, end: number): string {
+  return words
+    .filter((w) => w.start >= start - 0.001 && w.end <= end + 0.001)
+    .map((w) => w.word.trim())
+    .filter(Boolean)
+    .join(' ');
+}
+
+// Re-derive merged text from the transcript so overlaps do not duplicate words.
+// A saved run is fixed: it neither absorbs nor joins a neighbor, so a retry
+// after a partial failure cannot re-cover an already-saved range.
+function mergeRuns(runs: TextRun[], words: FlatWord[], savedKeys: Set<string>): TextRun[] {
+  const sorted = [...runs].sort((a, b) => a.start - b.start);
+  const merged: TextRun[] = [];
+  for (const run of sorted) {
+    const last = merged[merged.length - 1];
+    const canMerge =
+      last &&
+      !savedKeys.has(runKey(last)) &&
+      !savedKeys.has(runKey(run)) &&
+      run.start <= last.end + MERGE_GAP_SECONDS;
+    if (canMerge) {
+      last.end = Math.max(last.end, run.end);
+      last.text = textForRange(words, last.start, last.end);
+    } else {
+      merged.push({ ...run });
+    }
+  }
+  return merged;
+}
 
 function flatten(segments: OriginalSegment[]): FlatWord[] {
   const out: FlatWord[] = [];
@@ -51,9 +105,26 @@ function TextSelectionPanel({
   adStart,
   adEnd,
   onSelectionChange,
+  onRunsChange,
   playbackRate,
   setPlaybackRate,
+  disabled = false,
+  savedKeys = EMPTY_SAVED_KEYS,
 }: Props) {
+  const [frozenRuns, setFrozenRuns] = useState<TextRun[]>([]);
+  const [currentText, setCurrentText] = useState('');
+  // The mouseup listener reads frozenRuns/onRunsChange through refs to avoid
+  // stale closures; frozenRunsRef is set by every setter below, not a
+  // useEffect, which would lag a mouseup's own setTimeout(0).
+  const frozenRunsRef = useRef(frozenRuns);
+  const setFrozenRunsSynced = (next: TextRun[]) => {
+    frozenRunsRef.current = next;
+    setFrozenRuns(next);
+  };
+  const onRunsChangeRef = useRef(onRunsChange);
+  useEffect(() => {
+    onRunsChangeRef.current = onRunsChange;
+  }, [onRunsChange]);
   // Fetch state collapsed into a single object so each useEffect outcome is
   // one setState call, not a setLoadError(null) at the top of the effect plus
   // setSegments later (the latter shape triggers react-hooks/set-state-in-effect).
@@ -75,6 +146,14 @@ function TextSelectionPanel({
   const [isPlaying, setIsPlaying] = useState(false);
 
   const transcriptRef = useRef<HTMLDivElement>(null);
+  // Set synchronously alongside the fetch, not read from the flatWords
+  // closure: a mouseup landing before the listener effect rebinds would
+  // otherwise see an empty list and silently no-op.
+  const flatWordsRef = useRef<FlatWord[]>([]);
+  const disabledRef = useRef(disabled);
+  useLayoutEffect(() => {
+    disabledRef.current = disabled;
+  }, [disabled]);
 
   // Fetch once. The episode's words live in episode_details.original_segments_json
   // and never change after transcription, so no refetch on selection edits.
@@ -84,6 +163,7 @@ function TextSelectionPanel({
       .then((res) => {
         if (cancelled) return;
         const hasWords = res.segments.some((s) => s.words && s.words.length > 0);
+        flatWordsRef.current = hasWords ? flatten(res.segments) : [];
         setFetchState({
           segments: res.segments,
           error: hasWords
@@ -181,24 +261,35 @@ function TextSelectionPanel({
     return { startIdx: Math.min(a, b), endIdx: Math.max(a, b) };
   };
 
-  const commitSelection = () => {
+  // Resolves the live selection before the deferred mouseup state update.
+  const resolveCurrentSelection = (): TextRun | null => {
     const resolved = resolveSelection();
-    if (!resolved) return;
-    const first = flatWords[resolved.startIdx];
-    const last = flatWords[resolved.endIdx];
-    if (!first || !last) return;
-    const text = flatWords
+    if (!resolved) return null;
+    const words = flatWordsRef.current;
+    const first = words[resolved.startIdx];
+    const last = words[resolved.endIdx];
+    if (!first || !last) return null;
+    const text = words
       .slice(resolved.startIdx, resolved.endIdx + 1)
       .map((w) => w.word.trim())
       .filter(Boolean)
       .join(' ');
-    onSelectionChange(first.start, last.end, text);
+    return { start: first.start, end: last.end, text };
   };
 
-  // Commit on mouseup/touchend so drag doesn't thrash parent state. Listener
-  // is scoped to the transcript root, not document, so unrelated mouseups in
-  // the modal (sponsor input, etc.) don't fire commitSelection.
-  useEffect(() => {
+  const commitSelection = () => {
+    if (disabledRef.current) return;
+    const current = resolveCurrentSelection();
+    if (!current) return;
+    setCurrentText(current.text);
+    onSelectionChange(current.start, current.end, current.text);
+    onRunsChangeRef.current([...frozenRunsRef.current, current]);
+  };
+
+  // Commit on mouseup/touchend, scoped to the transcript root so unrelated
+  // mouseups elsewhere don't fire it. useLayoutEffect, not useEffect: a
+  // passive effect would leave a mouseup with no listener right as segments load.
+  useLayoutEffect(() => {
     const root = transcriptRef.current;
     if (!root) return;
     const handler = () => {
@@ -256,6 +347,52 @@ function TextSelectionPanel({
   const selectionDuration = Math.max(0, adEnd - adStart);
   const hasSelection = selectionDuration > 0.001;
 
+  // Freezes the current (unfrozen) run into the list and clears the
+  // selection so the next drag starts a fresh one. Runs within
+  // MERGE_GAP_SECONDS of each other collapse into one at this point.
+  const freezeCurrentRun = () => {
+    // Resolve before the deferred mouseup commit, then fall back to the
+    // committed state if the browser no longer exposes a live selection.
+    const current = resolveCurrentSelection()
+      ?? (hasSelection ? { start: adStart, end: adEnd, text: currentText } : null);
+    if (!current) return;
+    const merged = mergeRuns(
+      [...frozenRunsRef.current, current],
+      flatWords,
+      savedKeys,
+    );
+    setFrozenRunsSynced(merged);
+    if (merged.length === 1) {
+      // Nothing else to merge with: zeroing the selection here would
+      // disable Save on this one valid span. Mirror it as the current
+      // selection instead, so it stays directly saveable.
+      const [only] = merged;
+      setCurrentText(only.text);
+      onSelectionChange(only.start, only.end, only.text);
+    } else {
+      setCurrentText('');
+      onSelectionChange(0, 0, '');
+    }
+    onRunsChange(merged);
+  };
+
+  const removeRun = (index: number) => {
+    const next = frozenRunsRef.current.filter((_, i) => i !== index);
+    // One run left with no active selection would zero the single-run form
+    // and disable Save: promote it back to the current selection instead.
+    if (next.length === 1 && !hasSelection) {
+      const [restored] = next;
+      setFrozenRunsSynced([]);
+      setCurrentText(restored.text);
+      onSelectionChange(restored.start, restored.end, restored.text);
+      onRunsChange([restored]);
+      return;
+    }
+    setFrozenRunsSynced(next);
+    const current = hasSelection ? [{ start: adStart, end: adEnd, text: currentText }] : [];
+    onRunsChange([...next, ...current]);
+  };
+
   if (loadError) {
     return (
       <div className="px-6 py-4">
@@ -286,7 +423,8 @@ function TextSelectionPanel({
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
             placeholder="Search the transcript"
-            className="w-full pl-8 pr-3 py-1.5 rounded-md border border-input bg-background text-foreground text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+            disabled={disabled}
+            className="w-full pl-8 pr-3 py-1.5 rounded-md border border-input bg-background text-foreground text-sm focus:outline-hidden focus:ring-2 focus:ring-ring max-sm:min-h-11"
           />
         </div>
         {matchIndices.length > 0 && (
@@ -296,18 +434,20 @@ function TextSelectionPanel({
             </span>
             <button
               type="button"
+              disabled={disabled}
               onClick={() =>
                 setCurrentMatch((m) => (m - 1 + matchIndices.length) % matchIndices.length)
               }
-              className={`p-1 rounded ${btnGhost} ${focusRing}`}
+              className={`p-1 rounded ${btnGhost} ${focusRing} ${touchTarget}`}
               aria-label="Previous match"
             >
               <ChevronUp className="w-4 h-4" />
             </button>
             <button
               type="button"
+              disabled={disabled}
               onClick={() => setCurrentMatch((m) => (m + 1) % matchIndices.length)}
-              className={`p-1 rounded ${btnGhost} ${focusRing}`}
+              className={`p-1 rounded ${btnGhost} ${focusRing} ${touchTarget}`}
               aria-label="Next match"
             >
               <ChevronDown className="w-4 h-4" />
@@ -331,13 +471,41 @@ function TextSelectionPanel({
         </span>
       </div>
 
+      {/* Spans: each frozen run is a chip with its time range and a remove
+          control; "Add another span" freezes the current selection and
+          starts a new one. */}
+      <div className="flex items-center gap-2 flex-wrap">
+        {frozenRuns.map((run, i) => (
+          <span key={`${run.start.toFixed(3)}-${run.end.toFixed(3)}`} className={chipClass}>
+            {formatTime(run.start)} - {formatTime(run.end)}
+            <button
+              type="button"
+              onClick={() => removeRun(i)}
+              disabled={disabled}
+              aria-label={`Remove span ${formatTime(run.start)} to ${formatTime(run.end)}`}
+              className={`${touchTarget} max-sm:-mx-2.5 max-sm:-my-2.5 rounded text-muted-foreground hover:text-destructive disabled:opacity-40 ${focusRing}`}
+            >
+              &times;
+            </button>
+          </span>
+        ))}
+        <button
+          type="button"
+          onClick={freezeCurrentRun}
+          disabled={!hasSelection || disabled}
+          className={`px-2 py-1 rounded text-xs ${btnGhost} disabled:opacity-40 disabled:cursor-not-allowed ${focusRing} max-sm:min-h-11`}
+        >
+          Add another span
+        </button>
+      </div>
+
       {/* Transcript. selection:bg-primary/40 keeps the active drag visible
           on mobile (default selection color is near-invisible in dark mode);
           per-word bg-primary/30 highlight below persists after the browser
           Selection clears (e.g., when focus moves to the textarea). */}
       <div
         ref={transcriptRef}
-        className="bg-secondary/40 rounded-lg p-3 max-h-[40vh] overflow-y-auto text-sm leading-relaxed select-text selection:bg-primary/50 selection:text-primary-foreground"
+        className={`bg-secondary/40 rounded-lg p-3 max-h-[40vh] overflow-y-auto text-sm leading-relaxed select-text selection:bg-primary/50 selection:text-primary-foreground ${disabled ? 'pointer-events-none select-none' : ''}`}
       >
         {flatWords.length === 0 ? (
           <p className="text-muted-foreground">Transcript is empty.</p>
@@ -376,8 +544,8 @@ function TextSelectionPanel({
         <button
           type="button"
           onClick={() => snapTo(adStart)}
-          disabled={!hasSelection}
-          className={`p-1.5 rounded ${btnGhost} disabled:opacity-40 disabled:cursor-not-allowed ${focusRing}`}
+          disabled={!hasSelection || disabled}
+          className={`p-1.5 rounded ${btnGhost} disabled:opacity-40 disabled:cursor-not-allowed ${focusRing} ${touchTarget}`}
           aria-label="Snap to selection start"
           title="Snap to selection start"
         >
@@ -386,8 +554,8 @@ function TextSelectionPanel({
         <button
           type="button"
           onClick={togglePlay}
-          disabled={!hasSelection}
-          className={`p-1.5 rounded ${btnGhost} disabled:opacity-40 disabled:cursor-not-allowed ${focusRing}`}
+          disabled={!hasSelection || disabled}
+          className={`p-1.5 rounded ${btnGhost} disabled:opacity-40 disabled:cursor-not-allowed ${focusRing} ${touchTarget}`}
           aria-label={isPlaying ? 'Pause' : 'Play selection'}
         >
           {isPlaying ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
@@ -395,25 +563,14 @@ function TextSelectionPanel({
         <button
           type="button"
           onClick={() => snapTo(adEnd)}
-          disabled={!hasSelection}
-          className={`p-1.5 rounded ${btnGhost} disabled:opacity-40 disabled:cursor-not-allowed ${focusRing}`}
+          disabled={!hasSelection || disabled}
+          className={`p-1.5 rounded ${btnGhost} disabled:opacity-40 disabled:cursor-not-allowed ${focusRing} ${touchTarget}`}
           aria-label="Snap to selection end"
           title="Snap to selection end"
         >
           <SkipForward className="w-4 h-4" />
         </button>
-        <select
-          value={playbackRate}
-          onChange={(e) => setPlaybackRate(Number(e.target.value))}
-          className={`appearance-none ${selectBase}`}
-          aria-label="Playback speed"
-        >
-          {PLAYBACK_RATES.map((r) => (
-            <option key={r} value={r}>
-              {r}x
-            </option>
-          ))}
-        </select>
+        <SpeedMenu playbackRate={playbackRate} onChange={setPlaybackRate} disabled={disabled} />
         <span className="text-xs text-muted-foreground">
           Plays the selected span only. Selection snaps to word boundaries.
         </span>

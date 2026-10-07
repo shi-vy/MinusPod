@@ -16,6 +16,7 @@ from config import (
     DEFAULT_OPENAI_BASE_URL,
     PROVIDER_ANTHROPIC, PROVIDER_OPENROUTER, PROVIDER_OPENAI_COMPATIBLE,
     PROVIDER_OLLAMA,
+    WHISPER_BACKEND_LOCAL, WHISPER_BACKEND_API,
     WHISPER_COMPUTE_TYPE_DEFAULT,
     AD_DETECTION_PARALLEL_WINDOWS_DEFAULT,
     AD_REVIEWER_PARALLEL_ADS_DEFAULT,
@@ -37,7 +38,6 @@ from config import (
     SILENCE_SNAP_NOISE_DB, SILENCE_SNAP_MIN_DURATION_SECONDS,
     SILENCE_SNAP_MAX_DISTANCE_SECONDS,
     resolve_segment_category_actions_map,
-    DEFAULT_AD_CHAPTER_CATEGORIES_JSON, resolve_ad_chapter_categories_map,
     valid_ad_chapter_title_format,
     resolve_community_sync_categories, DEFAULT_COMMUNITY_SYNC_CATEGORIES_JSON,
     resolve_jit_blocked_user_agents,
@@ -150,6 +150,11 @@ def _default_chapter_prompt() -> str:
     return DEFAULT_CHAPTER_PROMPT
 
 
+def _default_pattern_cleanup_prompt() -> str:
+    from database import DEFAULT_PATTERN_CLEANUP_PROMPT
+    return DEFAULT_PATTERN_CLEANUP_PROMPT
+
+
 def _seed_env_openai_model() -> str | None:
     """OPENAI_MODEL when the operator has set it; no shipped fallback."""
     return os.environ.get('OPENAI_MODEL')
@@ -173,10 +178,6 @@ def _payload_max_audio_download_mb() -> int:
 def _payload_segment_category_actions() -> dict[str, str]:
     return resolve_segment_category_actions_map(
         registry_default('segment_category_actions'))
-
-
-def _payload_ad_chapter_categories() -> dict[str, bool]:
-    return resolve_ad_chapter_categories_map(registry_default('ad_chapter_categories'))
 
 
 def _payload_community_sync_categories() -> list[str]:
@@ -264,6 +265,9 @@ SETTINGS_REGISTRY: dict[str, SettingSpec] = {
     'chapter_prompt': SettingSpec(
         factory=_default_chapter_prompt, seeded=True, refresh_default=True,
         payload_key='chapterPrompt'),
+    'pattern_cleanup_prompt': SettingSpec(
+        factory=_default_pattern_cleanup_prompt, seeded=True, refresh_default=True,
+        payload_key='patternCleanupPrompt'),
     # Per-pass prompt overrides: intentionally NOT resettable via
     # reset_setting (reset_prompts_only clears them explicitly; empty string
     # is the no-override default state, not a registry default).
@@ -308,6 +312,89 @@ SETTINGS_REGISTRY: dict[str, SettingSpec] = {
     'secondary_provider_base_url': SettingSpec(
         default=DEFAULT_OPENAI_BASE_URL, seeded=True, in_ad_reset=True,
         payload_key='secondaryProviderBaseUrl'),
+
+    # Provider failover settings.
+    'failover_llm_enabled': SettingSpec(
+        default='false', seeded=True, resettable=False,
+        payload_key='failoverLlmEnabled', payload_kind='bool'),
+    'failover_llm_provider': SettingSpec(
+        default=None, seeded=True,
+        payload_key='failoverLlmProvider',
+        validator=_one_of(PROVIDER_ANTHROPIC, PROVIDER_OPENROUTER,
+                           PROVIDER_OPENAI_COMPATIBLE, PROVIDER_OLLAMA)),
+    'failover_llm_base_url': SettingSpec(
+        default=DEFAULT_OPENAI_BASE_URL, seeded=True,
+        payload_key='failoverLlmBaseUrl'),
+    'failover_llm_timeout_seconds': SettingSpec(
+        default=None, seeded=True, payload_key='failoverLlmTimeoutSeconds',
+        payload_kind='int'),
+    'failover_llm_max_retries': SettingSpec(
+        default=None, seeded=True, payload_key='failoverLlmMaxRetries',
+        payload_kind='int'),
+    'failover_llm_detection_model': SettingSpec(
+        default='', seeded=True, payload_key='failoverLlmDetectionModel'),
+    'failover_llm_review_model': SettingSpec(
+        default='', seeded=True, payload_key='failoverLlmReviewModel'),
+    'failover_llm_verification_model': SettingSpec(
+        default='', seeded=True, payload_key='failoverLlmVerificationModel'),
+    'failover_llm_chapters_model': SettingSpec(
+        default='', seeded=True, payload_key='failoverLlmChaptersModel'),
+    # Pattern cleanup (Experiments): DB-only. Blank provider/model inherit detection.
+    'pattern_cleanup_enabled': SettingSpec(
+        default='false', payload_key='patternCleanupEnabled', payload_kind='bool'),
+    'pattern_cleanup_cron': SettingSpec(
+        default='0 4 * * 0', payload_key='patternCleanupCron'),
+    'pattern_cleanup_batch_size': SettingSpec(
+        default='25', payload_key='patternCleanupBatchSize', payload_kind='int'),
+    'pattern_cleanup_unused_days': SettingSpec(
+        default='90', payload_key='patternCleanupUnusedDays', payload_kind='int'),
+    'pattern_cleanup_provider': SettingSpec(default=None, payload_key='patternCleanupProvider'),
+    'pattern_cleanup_model': SettingSpec(default=None, payload_key='patternCleanupModel'),
+    # Set when scheduling turns on so the next run waits for a cron slot after it.
+    'pattern_cleanup_schedule_anchor': SettingSpec(resettable=False),
+    'failover_whisper_enabled': SettingSpec(
+        default='false', seeded=True, resettable=False,
+        payload_key='failoverWhisperEnabled', payload_kind='bool'),
+    'failover_whisper_backend': SettingSpec(
+        default='openai-api', seeded=True, payload_key='failoverWhisperBackend',
+        validator=_one_of(WHISPER_BACKEND_LOCAL, WHISPER_BACKEND_API)),
+    'failover_whisper_model': SettingSpec(
+        default='', seeded=True, payload_key='failoverWhisperModel'),
+    'failover_whisper_api_base_url': SettingSpec(
+        default='', seeded=True, payload_key='failoverWhisperApiBaseUrl'),
+    'failover_whisper_api_model': SettingSpec(
+        default='whisper-1', seeded=True, payload_key='failoverWhisperApiModel'),
+    'failover_whisper_api_timeout_seconds': SettingSpec(
+        default='600', seeded=True, payload_key='failoverWhisperApiTimeoutSeconds',
+        payload_kind='int'),
+    'failover_whisper_max_attempts': SettingSpec(
+        default=None, seeded=True, payload_key='failoverWhisperMaxAttempts',
+        payload_kind='int', validator=_int_in_range((1, 10))),
+    'failover_whisper_language': SettingSpec(
+        default='', seeded=True, payload_key='failoverWhisperLanguage'),
+    'failover_probe_interval_minutes': SettingSpec(
+        default='5', seeded=True, validator=_int_in_range((1, 60)),
+        payload_key='failoverProbeIntervalMinutes', payload_kind='int'),
+    'failover_recovery_probes': SettingSpec(
+        default='3', seeded=True, validator=_int_in_range((1, 10)),
+        payload_key='failoverRecoveryProbes', payload_kind='int'),
+    # Blank per-slot LLM overrides use the provider-type default.
+    'llm_timeout_seconds': SettingSpec(
+        default=None, seeded=True, payload_key='providerATimeoutSeconds',
+        payload_kind='int'),
+    'llm_max_retries': SettingSpec(
+        default=None, seeded=True, payload_key='providerAMaxRetries',
+        payload_kind='int'),
+    'secondary_llm_timeout_seconds': SettingSpec(
+        default=None, seeded=True, payload_key='providerBTimeoutSeconds',
+        payload_kind='int'),
+    'secondary_llm_max_retries': SettingSpec(
+        default=None, seeded=True, payload_key='providerBMaxRetries',
+        payload_kind='int'),
+    'whisper_max_attempts': SettingSpec(
+        default='2', seeded=True, in_ad_reset=True,
+        validator=_int_in_range((1, 10)),
+        payload_key='whisperMaxAttempts', payload_kind='int'),
 
     # -- Ad reviewer (seeded; only the prompts are resettable) --
     'enable_ad_review': SettingSpec(
@@ -478,18 +565,15 @@ SETTINGS_REGISTRY: dict[str, SettingSpec] = {
     'skip_second_pass': SettingSpec(
         default='false', seeded=True, in_ad_reset=True,
         payload_key='skipSecondPass', payload_kind='bool'),
+    'transcript_differential_enabled': SettingSpec(
+        default='true', seeded=True, in_ad_reset=True,
+        payload_key='transcriptDifferentialEnabled', payload_kind='bool'),
     'differential_fetch_mode': SettingSpec(
         default='auto', seeded=True, in_ad_reset=True,
         payload_key='differentialFetchMode',
         validator=_one_of('auto', 'on', 'off')),
-    # Ad chapters: publish kept or held segments as skippable chapters.
-    'ad_chapters_enabled': SettingSpec(
-        default='false', seeded=True, in_ad_reset=True,
-        payload_key='adChaptersEnabled', payload_kind='bool'),
-    'ad_chapter_categories': SettingSpec(
-        default=DEFAULT_AD_CHAPTER_CATEGORIES_JSON, seeded=True, in_ad_reset=True,
-        payload_key='adChapterCategories',
-        payload_factory=_payload_ad_chapter_categories),
+    # Ad chapters: publish marked segments as skippable chapters. The enable
+    # toggle/category list are retired (mark_action_from_ad_chapters_v1, 2.98.0).
     'ad_chapters_include_held': SettingSpec(
         default='false', seeded=True, in_ad_reset=True,
         payload_key='adChaptersIncludeHeld', payload_kind='bool'),
@@ -920,6 +1004,8 @@ def registry_get_default(key: str) -> Any:
     if spec.payload_factory is not None:
         return spec.payload_factory()
     raw = registry_default(key)
+    if raw is None:
+        return None
     if spec.payload_kind == 'bool':
         return coerce_bool_setting(raw)
     if spec.payload_kind == 'int':

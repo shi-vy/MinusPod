@@ -8,7 +8,7 @@ Kept free of Flask and DB imports so it can be unit tested directly.
 """
 import math
 
-from config import SEGMENT_CATEGORIES, is_pending_review
+from config import SEGMENT_CATEGORIES, is_keep_like, is_pending_review, refreshed_keep_like_action
 from utils.markers import parse_ad_markers, spans_match
 
 # Filter value and summary key for markers no stage classified. Not a member of
@@ -49,7 +49,8 @@ def _reviewer_moved_from_marker(marker: dict) -> bool:
             and marker.get('reviewer_original_end') is not None)
 
 
-def flatten_detections(rows: list[dict], corrections: list[dict]) -> list[dict]:
+def flatten_detections(rows: list[dict], corrections: list[dict],
+                       actions_by_feed: dict[str, dict[str, str]] | None = None) -> list[dict]:
     by_episode: dict[tuple[object, str], list[dict]] = {}
     for c in corrections:
         if c.get('podcast_id') is not None:
@@ -61,6 +62,7 @@ def flatten_detections(rows: list[dict], corrections: list[dict]) -> list[dict]:
         if markers is None:
             continue
         episode_corrections = by_episode.get((row.get('podcast_id'), row['episode_id']), [])
+        feed_actions = (actions_by_feed or {}).get(row['feed_slug'])
         for marker in markers:
             if not isinstance(marker, dict):
                 continue
@@ -88,7 +90,7 @@ def flatten_detections(rows: list[dict], corrections: list[dict]) -> list[dict]:
                 'patternId': marker.get('pattern_id'),
                 'detectionStage': marker.get('detection_stage'),
                 'category': marker.get('category'),
-                'actionApplied': marker.get('action_applied'),
+                'actionApplied': refreshed_keep_like_action(marker, feed_actions),
                 'reviewerVerdict': marker.get('reviewer_verdict'),
                 'reviewerOriginalStart': marker.get('reviewer_original_start'),
                 'reviewerOriginalEnd': marker.get('reviewer_original_end'),
@@ -155,12 +157,13 @@ def summarize_cut_detections(items: list[dict]) -> dict:
 def awaits_decision(item: dict) -> bool:
     """True when a person still has a decision to make about this detection.
 
-    A keep marker is settled by feed policy and the corrections endpoint
-    refuses a verdict on it, so listing it would offer an impossible decision.
+    A keep or mark marker is settled by feed policy and the corrections
+    endpoint refuses a verdict on it, so listing it would offer an
+    impossible decision.
     """
     return (item['status'] in ('pending', 'rejected')
             and item['resolution'] == 'unresolved'
-            and item.get('actionApplied') != 'keep')
+            and not is_keep_like(item.get('actionApplied')))
 
 
 def reviewer_moved(item: dict) -> bool:

@@ -100,9 +100,10 @@ returns 503 with a JIT-triggered processing job behind it.
 
 | Tag | Why it is regenerated |
 |---|---|
-| [`podcast:transcript`](https://podcasting2.org/docs/podcast-namespace/tags/transcript) | MinusPod generates a transcript aligned to the processed audio. An upstream transcript would be offset by the length of every removed ad, and would also point subscribers at the publisher's CDN. |
+| [`podcast:transcript`](https://podcasting2.org/docs/podcast-namespace/tags/transcript) | MinusPod generates a transcript aligned to the processed audio. An upstream transcript would be offset by the length of every removed ad, and would also point subscribers at the publisher's CDN. The upstream tag is still read internally, never served, to diff against MinusPod's own transcript for ad evidence; see [Upstream Transcript Differential](transcript-differential.md). |
 | [`podcast:chapters`](https://podcasting2.org/docs/podcast-namespace/tags/chapters) | MinusPod serves its own chapters JSON because upstream timestamps point into the original, uncut audio. Its contents depend on the effective chapter mode; see "Chapter modes" below. |
 | `itunes:duration` | Recomputed from the processed file's actual length. |
+| `enclosure length` | The processed file's byte size. An unprocessed episode passes through upstream's `length` when declared, omitting the attribute otherwise. |
 
 ### Chapter modes
 
@@ -165,28 +166,45 @@ or unset to follow the global setting).
 ### Ad chapters
 
 A segment kept in the audio by its category action still sits in the file.
-**Ad chapters** (Settings > Transcripts & Chapters, `adChaptersEnabled`, off by
-default) adds a chapter at the start of each kept break and a resume chapter
-at its end. An app that skips by chapter can then jump past the break.
-Chapters have no end time, which is why the resume chapter exists. When
-a generated chapter already starts within two seconds of the end, that chapter
-is the resume point instead.
+Set a category's segment action to **Mark** (Settings > Segment actions, or
+a feed's own override; see [Configuration > Segment
+categories](configuration.md#segment-categories)) and MinusPod adds a
+chapter at the start of each marked break and a resume chapter at its end,
+so an app that skips by chapter can jump past it. **Keep** leaves the
+segment in the audio but publishes no chapter for it. Chapters have no end
+time, which is why the resume chapter exists. When a generated chapter
+already starts within two seconds of the end, that chapter is the resume
+point instead. A feed whose chapters mode is Off still gets no chapters,
+Mark or not.
 
-Only categories checked under **Chapter these categories** qualify (sponsor and
-cross-promo by default), and a kept segment needs a detection confidence of at
-least **Minimum confidence** (0.9 by default). Turn on **Include segments
-waiting for review** to chapter held segments too. They use the
-waiting-for-review title format, and rejecting one removes its chapter without
-a recut. Confirming one queues a recut, which rebuilds the chapter list when
-it runs.
+A marked segment needs a detection confidence of at least **Minimum
+confidence** (Settings > Transcripts & Chapters, 0.9 by default). Turn on
+**Include segments waiting for review** to chapter held segments too, when
+the category they are held under resolves to Mark on that feed. They use
+the waiting-for-review title format, and rejecting one removes its chapter
+without a recut. Confirming one queues a recut, which rebuilds the chapter
+list when it runs.
 
-Titles come from **Chapter title** (`Ad: {label}` by default), **Title while
-waiting for review** (`Possible ad: {label}`), and **Resume title** (`Show`).
-`{label}` is the category name, such as Sponsor. `{category}` is its id, such
-as `sponsor`, for players that match chapter titles by keyword. Each feed can
-turn ad chapters on or off and pick its own category list from Feed Settings;
-a feed whose chapters mode is Off gets none. Existing episodes are not
-backfilled: use Regenerate Chapters on an episode to add them.
+Titles come from **Chapter title** (`Ad: {label}` by default), **Title
+while waiting for review** (`Possible ad: {label}`), and **Resume title**
+(`Show`). `{label}` is the category name, such as Sponsor. `{category}` is
+its id, such as `sponsor`, for players that match chapter titles by
+keyword. Switching a category between Keep and Mark, globally or on one
+feed, takes effect the next time that feed's chapters are rebuilt:
+Regenerate Chapters on an episode, or Re-render episodes with current
+segment actions on the feed. Existing episodes are not backfilled
+automatically.
+
+The old global ad chapters toggle and the per-category chapter checklist
+are retired; a category's segment action is now the only switch. The
+`adChaptersEnabled` and `adChapterCategories` fields still work on the
+settings and feed APIs, deprecated and translated against the segment
+action map: `adChaptersEnabled` reads true when any category resolves to
+Mark; a `true` entry in `adChapterCategories` sets that category to Mark
+(from Keep or Mark), a `false` entry sets it back to Keep, and setting
+`adChaptersEnabled` to `false` demotes every Mark to Keep (`true` is
+accepted and has no effect). New integrations should set
+`segmentCategoryActions` to `mark` directly.
 
 ### Deliberately stripped
 
@@ -343,6 +361,14 @@ does not understand a tag ignores it; the standard RSS and `itunes:`
 elements it relies on are untouched. A basic podcast app sees a normal
 feed and plays the audio. Podcasting 2.0 apps see the additional tags.
 Nothing about this support breaks older clients.
+
+## Example served feed
+
+[docs/examples/served-feed.xml](examples/served-feed.xml) is a sanitized
+excerpt of a real feed served by a MinusPod instance, with the host,
+feed key, and episode identifiers replaced by placeholders. It shows the
+`podcast:guid`, `podcast:locked`, `podcast:funding`, `podcast:txt`,
+`podcast:transcript`, and `podcast:chapters` tags as MinusPod emits them.
 
 ## References
 

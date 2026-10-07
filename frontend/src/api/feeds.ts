@@ -423,8 +423,6 @@ export interface UpdateFeedPayload {
   chaptersMode?: 'auto' | 'generate' | 'off' | null;
   differentialFetchMode?: 'inherit' | 'auto' | 'on' | 'off' | null;
   chaptersInNotes?: 'on' | 'off' | null;
-  adChaptersEnabled?: 'on' | 'off' | null;
-  adChapterCategories?: Partial<Record<SegmentCategory, boolean>> | null;
   queuePriority?: 'high' | 'normal' | 'low' | null;
   lowAdYieldAction?: LowAdYieldAction | null;
   episodeLogs?: EpisodeLogsOverride | null;
@@ -465,6 +463,7 @@ export interface UpdateFeedPayload {
   detectShowSegments?: boolean | null;
   ownEpisodeGuids?: boolean | null;
   skipSecondPass?: boolean | null;
+  transcriptDifferential?: boolean | null;
 }
 
 export interface Network {
@@ -633,25 +632,6 @@ export async function updateLocalEpisode(
     method: 'PATCH',
     body: payload,
   });
-}
-
-export interface BulkLocalEpisodeEdit extends LocalEpisodePatch {
-  episodeId: string;
-}
-
-export async function bulkUpdateLocalEpisodes(
-  slug: string, entries: BulkLocalEpisodeEdit[],
-): Promise<{ updated: number }> {
-  return apiRequest<{ updated: number }>(`/feeds/${slug}/episodes`, {
-    method: 'PATCH',
-    body: entries,
-  });
-}
-
-export async function deleteLocalEpisode(
-  slug: string, episodeId: string,
-): Promise<{ deleted: number; episodeId: string }> {
-  return apiRequest(`/feeds/${slug}/episodes/${episodeId}`, { method: 'DELETE' });
 }
 
 export async function uploadLocalEpisodeArtwork(

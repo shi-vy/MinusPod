@@ -21,6 +21,7 @@ const RSS_DELTA_NOTE_SECONDS = 120;
 const TIMING_STAGES = [
   ['downloadSeconds', 'Download'],
   ['transcriptionSeconds', 'Transcription'],
+  ['transcriptDiffSeconds', 'Transcript diff'],
   ['differentialSeconds', 'Differential'],
   ['audioAnalysisSeconds', 'Audio analysis'],
   ['detectionSeconds', 'Detection'],
@@ -84,6 +85,18 @@ function RunResult({ run }: { run: EpisodeProcessingRun }) {
   );
 }
 
+function transcriptDiffSummary(run: EpisodeProcessingRun): string {
+  const diff = run.stats?.transcriptDiff;
+  const match = diff?.coverage != null ? ` (${Math.round(diff.coverage * 100)}% match)` : '';
+  switch (diff?.status) {
+    case 'ok': return `${diff.spans} ${diff.spans === 1 ? 'gap' : 'gaps'}${match}`;
+    case 'unreliable': return `unreliable${match}`;
+    case 'empty': return 'empty transcript';
+    case 'error': return 'failed';
+    default: return '-';
+  }
+}
+
 function timingValue(run: EpisodeProcessingRun, key: typeof TIMING_STAGES[number][0]): string {
   const timings = run.stats?.timings;
   if (key === 'transcriptionSeconds' && run.stats?.transcriptionSkipped) return 'Skipped';
@@ -123,6 +136,16 @@ function TimingBreakdown({ run }: { run: EpisodeProcessingRun }) {
   );
 }
 
+const FAILOVER_SLOT_LABELS = { 'llm-a': 'Provider A', 'llm-b': 'Provider B' } as const;
+
+function failoverNote(run: EpisodeProcessingRun): string | null {
+  const used = run.stats?.failover;
+  if (!used) return null;
+  const parts: string[] = used.llm.map((slot) => FAILOVER_SLOT_LABELS[slot]);
+  if (used.whisper) parts.push('transcriber');
+  return parts.length ? `ran on failover: ${parts.join(', ')}` : null;
+}
+
 const HEADER_CLASS = 'py-2 pr-4 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider';
 
 interface Column {
@@ -148,6 +171,7 @@ const COLUMNS: Column[] = [
         s?.verificationSkipped ? 'no verification' : null,
         s?.cueOnly ? 'cue-only' : null,
         s?.transcriptionSkipped ? 'no transcript' : null,
+        failoverNote(run),
       ].filter(Boolean);
       return (
         <>
@@ -188,10 +212,16 @@ const COLUMNS: Column[] = [
     lowPriority: true,
     render: (run) => {
       const h = run.stats?.stageHits;
-      return h
-        ? `${h.fingerprint} fingerprint / ${h.textPattern} text / ${h.differential} cross-fetch / ${h.llm} LLM`
-        : '-';
+      if (!h) return '-';
+      const transcript = h.transcriptDifferential != null ? ` / ${h.transcriptDifferential} transcript` : '';
+      return `${h.fingerprint} fingerprint / ${h.textPattern} text / ${h.differential} cross-fetch${transcript} / ${h.llm} LLM`;
     },
+  },
+  {
+    label: 'Transcript diff',
+    title: "Audio the publisher's transcript leaves out, and how much of the episode it matched",
+    lowPriority: true,
+    render: transcriptDiffSummary,
   },
   {
     label: 'Ads',

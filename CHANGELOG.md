@@ -9,6 +9,126 @@ Alongside the standard sections, a "Breaking" section marks changes
 that require operator action; these are surfaced at the top of stable
 release notes.
 
+## [2.98.2] - 2026-10-07
+
+### Fixed
+- Discovering episodes on a large back-catalog feed no longer holds the database write lock for seconds at a time, which was starving other writers on every refresh.
+
+## [2.98.1] - 2026-10-07
+
+### Added
+- Dashboard episode rows have an Actions menu with a confirmed Delete for downloaded audio; episode records and processing history remain, and original audio uploaded to local feeds is kept. (#822)
+
+### Fixed
+- In the ad editor's text mode, adding a second span right after selecting the first no longer drops the first span's text, so multi-span mark ad can save.
+- Feed panels restore their saved expansion state when navigating between feeds.
+- Static UI assets are exempt from the app-wide rate limiter, so reloads do not blank the interface.
+- Currency lookup failures now show a retry action without resetting saved choices. Currency list requests no longer go through two automatic retry layers, and errors are logged without exposing upstream details.
+- Search-index statistics use indexed content-type counts instead of scanning stored documents.
+- Pattern, sponsor, and normalization APIs return boolean active flags. OpenAPI nullability and detection stages now match the response formats.
+
+## [2.98.0] - 2026-10-06
+
+### Added
+- The failover transcriber has its own upload-attempt limit, including when the active transcriber runs locally. Leaving it blank preserves inheritance.
+- Visiting the server root redirects to the web UI. (#808)
+- Export selected feeds as OPML from the Feeds page. (#810)
+- Choose Podcasts or Episodes from an icon menu in the mobile dashboard toolbar.
+- Provider failover for LLM and transcription: a standby provider with its own key, endpoint, timeout, retries, and per-stage models takes over when the active one is unreachable, times out, returns a 5xx, or rejects the key, model, or billing. A failing call or transcription chunk moves onto it mid-run; health probes run on a configurable interval and switch back after a configurable number of healthy probes; failover can also be triggered and cancelled by hand from Settings or the API. (#806)
+- Per-provider LLM request timeout and max retries for Provider A, Provider B, and the failover provider, and a max upload attempts setting for the transcription API.
+- Webhook and email events for failover triggered and cancelled.
+- Upstream transcript differential: when a feed's `podcast:transcript` tag points at a transcript made before the ad reads were spliced in, MinusPod diffs its own Whisper transcript against it. A gap releases its own hold when another stage's detection covers at least half of it. It also raises the confidence of a detection it covers for at least half of that detection's length. Otherwise it holds for review on its own and never cuts by itself. An oversized or malformed publisher transcript is skipped without stalling the run. On by default, with a global toggle and a per-feed override. See [docs/transcript-differential.md](docs/transcript-differential.md).
+- Pattern Cleanup (Experiments): a scheduled LLM review of learned ad patterns that suggests trims, splits, sponsor renames, and retirements. It also flags patterns with many false positives or copy mixed with show content. Suggestions are reviewed on the Patterns page and change nothing until approved, and an approved change can be undone. Off by default. See [Pattern Cleanup](docs/pattern-cleanup.md).
+- A fourth segment action, Mark, keeps a category's audio in place and also publishes it as a skippable chapter with a resume chapter at its end. See [Podcasting 2.0 > Ad chapters](docs/podcasting-2.0.md#ad-chapters).
+- The ad editor's "By text" mode can mark several separate transcript runs as one missed ad: "Add another span" freezes the current selection as a removable chip, and Save submits one correction per span in time order.
+
+### Fixed
+- Multi-span ad saves retain successful spans across retries and selection changes, lock edits during submission, and remove the unused multi-span template editor.
+- The episode ad editor preserves detected categories, and its controls and segment-action toggles meet the mobile touch-target size.
+- Documented Mark and multi-span editing in the glossary, cursor pagination for cleanup reviews, and the current segment-action API contracts.
+- Forced cleanup rechecks continue across bounded batches. Statistics checks run independently of model reviews, preserve dismissed evidence while unchanged, and retain source context without overwriting later decisions.
+- Expanded feature guides, glossary entries, and API contracts for pattern cleanup, failover, transcript differential, and OPML export. Cleanup API snapshots now use booleans for active state.
+- Cleanup records evidence for reviewed patterns and resets the active review backlog atomically while preserving decision history.
+- Cleanup action buttons keep their disabled appearance while work is pending.
+- Cleanup reviews follow live failover changes, reject invalid confidence values, preserve contamination warnings, and apply text and sponsor corrections together.
+- Pattern cleanup now shows original text and source context, displays combined text and sponsor edits, loads older decisions for undo, fits narrow screens, and requires saving changes before running.
+- Pattern cleanup decisions preserve later manual edits, reject stale reviews, and keep approved split patterns marked reviewed after sponsor normalization.
+- Pattern cleanup rejects malformed requests and invalid setting types before starting a run or saving changes.
+- A stale pre-fix published date could make an upstream GUID change look like a new episode, duplicating it in the feed. Matching now tolerates that drift, a one-time cleanup removes existing duplicates, and the renderer drops any repeat too.
+- Episode run details show which targets ran on failover, and the episode API returns it as `failover` in run stats.
+- The Failover card shows Provider B as off, with no action, while Provider B is disabled; `GET /failover` reports `enabled` per target.
+- Failover triggered and cancelled events are no longer suppressed by the 5-minute alert dedup; every state change sends its event.
+- A transcriber switch logs which failover backend and endpoint took over, matching the LLM switch line in the run log.
+- Logged endpoint URLs keep their port, so endpoints that differ only by port are distinguishable. Credentials and query strings are still removed.
+- A run that started on the failover provider requeues if the failover account is replaced mid-run, instead of finishing on a different account.
+- An LLM max-retries setting of 0 now sends one request before failing over; the two per-window retries no longer run on top of it.
+- When saving failover state fails, the call logs that the failover provider was skipped instead of skipping it silently.
+- **Probe now** no longer loads a local Whisper model in a web worker; the background worker runs the diagnostic decode and the card shows the last result until then.
+- Local recovery no longer stalls under load: busy probes leave recovery progress unchanged, and failover-model decodes no longer discard a probe of the original model. Local probes normalize device and compute type the way the transcriber does.
+- Transcription probes count HTTP 405 from `/models` as reachable, like 404.
+- Anthropic and OpenRouter probes with no API key report Not configured instead of recording a failed request.
+- Deferred episodes resume through healthy providers required by their current routes, including failover providers. Health results are refreshed after configuration, failover state, or local outcome changes.
+- Health checks share ownership across workers and probe only stale endpoints required by each run.
+- Local transcription recovers only after an idle diagnostic decode of the original model; disabled failover configurations no longer receive work.
+- Failover modules load consistently across import orders without circular imports, including installations without the local transcription stack.
+- Exhausted transcription timeouts and throttling switch to the failover transcriber.
+- LLM rate limits and exhausted daily quotas never trigger failover; the rate-limit hold waits out the provider reset. A rate limit on the failover provider holds only the failover account. Transcription 429s that outlast their retry deadline still switch to the failover transcriber. Installs without a failover provider see no change in daily-quota handling.
+- Fixed-provider probes validate response bodies, and transcription probes no longer count timeout or rate-limit responses as healthy.
+- Processing history marks runs that actually dispatched to the failover provider, and retains that usage after recovery. Deferred, held, cancelled, and requeued runs no longer add failed history rows.
+- Manual failover changes take effect on subsequent calls across workers without waiting for the settings cache.
+- Running episodes return to their original LLM routes after recovery or cancellation; legacy failover snapshots requeue safely.
+- LLM recovery requires a valid successful endpoint response; malformed responses and rate limits no longer mark a provider healthy.
+- Failover forms, actions, and model-entry toggles have 44 px mobile tap targets; switches keep their compact track inside a larger clickable area.
+- Health probes use a captured provider configuration and discard results after configuration or failover state changes.
+- When the failover request also fails, the original provider error decides deferral and retry, unless the failover provider rejected the request shape (400 or 422) or returned a hold, cancellation, or account change.
+- Manual failover controls reject invalid request bodies and report persistence failures instead of returning success.
+- Failover model catalogs load only when the Failover card is visible. Settings searches pause hidden-card queries and resume matched cards.
+- LLM HTTP 408 responses now retry and trigger failover like connection timeouts, and defer to the offline queue like other connectivity errors.
+- The OpenRouter health probe and Test Connection now call `/api/v1/key` instead of `/api/v1/auth/key`.
+- Failover state changes and events are saved atomically, preserving manual overrides during concurrent recovery and outage actions.
+- The OPML picker shows feed-loading errors with retry and keeps selected feeds in sync after a refresh.
+- OPML exports and the feed picker use custom feed names.
+- Large feed selections use a POST request so exports do not exceed the server URL limit.
+- The OPML export dialog now has an accessible name for screen readers.
+- OPML picker rows and actions have 44 px mobile tap targets, long feed names wrap into view, and list scrolling stays inside the dialog.
+- The full navigation collapses below 1280 px so header controls stay visible without crowding.
+- Reduced the processing mode selector's leading padding.
+- A stage routed to Provider B used Provider A's request timeout and retry count.
+- A transcription API that answered 401, 402, 403, or 404 failed the episode as a generic transient error; it now reports the status, and auth failures no longer burn retries.
+- A non-string value for a stage's provider field (detection, verification, chapters, or review) returned a 500 instead of a 400.
+- Per-provider timeout, retry, and failover policy settings now reject a numeric string instead of silently accepting it, and invalid failover settings are rejected without partially saving the rest of the request.
+- Artwork hosts that answer a definitive 4xx other than 408 or 429 now back off for 24 hours instead of 6, matching how a 404 is already handled, so a host that permanently blocks the request is not retried every refresh cycle.
+- Slow-transaction warnings now name the first real statement in the transaction instead of always saying "opened by: BEGIN IMMEDIATE", so a long hold can be traced to its actual call site.
+- Successful processing resets the episode retry budget before a future automatic rerun.
+- Cancelling a rerun preserves the published audio and removes only its unpublished replacement.
+- Public episode URLs no longer expose unpublished processed files. Reprocessing advances the file version even for unversioned publications.
+- Local feeds report byte length and duration for the audio actually served.
+- Startup uses an existence query for the search index and runs the historical marker repair once, recording completion only after a successful transaction.
+- Triggering `llm-b` while Provider B is disabled now returns `409 failover_target_disabled`; disabling Provider B also cancels any active Provider B failover.
+- `POST /failover/probe` now re-drives deferred episodes right away when a probe records a recovery, instead of waiting for the next maintenance tick.
+- A transcriber switch now stops in-flight primary chunks before they extract or upload, instead of wasting the work on a result that gets discarded.
+- The chunked transcription plan no longer produces a sub-second trailing chunk; a tail shorter than one second folds into the previous chunk.
+- A network-scope audio cue template kept the network id it was promoted under, so it stopped reaching sibling feeds after the owning feed's network setting changed. It now follows the owning feed's network, or demotes to podcast-only when the feed leaves every network; an upgrade migration heals templates already affected.
+- Subscribed feeds now carry the enclosure `length` attribute the RSS spec requires: the processed file's byte size for a cut episode, or upstream's own `length` while it is still unprocessed. Fixes the podcast validator's "Missing item enclosure length attribute" warning.
+- The background refresh loop's first maintenance pass (pattern cleanup, DB backup, community sync, update check) no longer waits for host uptime to reach the refresh interval before running.
+- Requesting `/ui/index.html` or `/ui/manifest.webmanifest` by its exact path now revalidates instead of caching for an hour, matching `/ui/` itself.
+
+### Security
+- Updated fsspec to 2026.6.0 and Werkzeug to 3.1.9 to fix CVE-2026-104851 and CVE-2026-102598.
+- Updated fast-uri to 3.1.8 to fix a moderate vulnerability in frontend build tooling.
+- Updated source-map-js to 1.2.2 to fix a high-severity denial of service in frontend build tooling.
+
+### Changed
+- Removed unused benchmark imports and report arguments, and corrected benchmark CLI exception chaining and type annotations.
+- Shortened new comments and docstrings without changing behavior.
+- Updated failover documentation and API responses for live routing, recovery checks, and manual control failures.
+- The two LLM provider slots are now labelled Provider A and Provider B. The API accepts `providerB*` payload keys and `a`/`b` slot values; the `secondary*` keys and `primary`/`secondary` values keep working, and `GET` responses still emit both spellings.
+- Updated Python dependencies and frontend test tools from dependency PRs #811 through #820. The TypeScript ESLint packages now share one version.
+- The global ad chapters toggle and the per-category chapter checklist are retired; set a category's segment action to Mark instead. A one-shot migration converts existing Keep-plus-chapter categories to Mark on upgrade. `adChaptersEnabled` and `adChapterCategories` are still accepted on the settings and feed APIs, deprecated, and translated against the segment action map.
+- Keep no longer publishes a chapter. A category that was chaptered through Keep needs its action set to Mark to keep chaptering.
+- The by-text ad editor's playback speed control now uses the same compact popover as the waveform editor, with 44 px tap targets on phones.
+- Removed unused frontend and Python dead code found during the 2.98.0 review sweep.
+
 ## [2.97.45] - 2026-10-01
 
 ### Fixed

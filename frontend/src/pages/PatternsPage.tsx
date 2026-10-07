@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useSearchParams } from 'react-router';
 import {
@@ -25,6 +25,8 @@ import {
 } from '../utils/segmentCategory';
 import AdReviewTab from './patterns/AdReviewTab';
 import DetectedAdsTab from './patterns/DetectedAdsTab';
+import CleanupTab from './patterns/CleanupTab';
+import { getPatternCleanupStatus, patternCleanupQueryKey } from '../api/patternCleanup';
 import UnresolvedCorrectionsPanel from './patterns/UnresolvedCorrectionsPanel';
 import { btnOutline } from '../components/buttonStyles';
 import Checkbox from '../components/Checkbox';
@@ -39,7 +41,8 @@ import { ActiveBadge } from '../components/ActiveBadge';
 type ScopeFilter = 'all' | 'global' | 'network' | 'podcast';
 type OriginFilter = 'all' | 'auto' | 'user';
 type SourceFilter = 'all' | 'local' | 'community' | 'imported';
-type PatternsTab = 'patterns' | 'ad-review' | 'detected-ads';
+type PatternsTab = 'patterns' | 'ad-review' | 'detected-ads' | 'cleanup';
+const OTHER_TABS: readonly string[] = ['ad-review', 'detected-ads', 'cleanup'];
 
 // Shared by the three header actions so none of them reads as the odd one
 // out; whitespace-nowrap keeps the sync stamp on one line.
@@ -64,7 +67,22 @@ function PatternsPage() {
 
   const tabParam = searchParams.get('tab');
   const activeTab: PatternsTab =
-    tabParam === 'ad-review' || tabParam === 'detected-ads' ? tabParam : 'patterns';
+    tabParam && OTHER_TABS.includes(tabParam) ? (tabParam as PatternsTab) : 'patterns';
+  const tablistRef = useRef<HTMLDivElement>(null);
+  const activeTabRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    const tablist = tablistRef.current;
+    const activeButton = activeTabRef.current;
+    if (!tablist || !activeButton) return;
+    const tablistRect = tablist.getBoundingClientRect();
+    const buttonRect = activeButton.getBoundingClientRect();
+    if (buttonRect.left < tablistRect.left) {
+      tablist.scrollLeft -= tablistRect.left - buttonRect.left;
+    } else if (buttonRect.right > tablistRect.right) {
+      tablist.scrollLeft += buttonRect.right - tablistRect.right;
+    }
+  }, [activeTab]);
 
   const switchTab = (tab: PatternsTab) => {
     setSearchParams(tab === 'patterns' ? {} : { tab });
@@ -117,6 +135,14 @@ function PatternsPage() {
       console.error('Protect toggle failed', e);
     }
   }
+
+  // Only the pending count feeds the tab badge here; a minute-old count is fine.
+  const { data: cleanupStatus } = useQuery({
+    queryKey: patternCleanupQueryKey,
+    queryFn: getPatternCleanupStatus,
+    staleTime: 60_000,
+  });
+  const cleanupPending = cleanupStatus?.pending.total ?? 0;
 
   const { data: stats } = useQuery({
     queryKey: ['patternStats'],
@@ -244,25 +270,33 @@ function PatternsPage() {
         onClose={() => setExportOpen(false)}
       />
 
-      <div role="tablist" className="flex gap-1 border-b border-border mb-6">
+      {/* Scrolls instead of pushing the page wider on phones under 380px. */}
+      <div ref={tablistRef} role="tablist" className="flex gap-1 border-b border-border mb-6 overflow-x-auto overflow-y-hidden">
         {([
           ['patterns', 'Patterns'],
           ['detected-ads', 'Detected Ads'],
           ['ad-review', 'Ad Review'],
+          ['cleanup', 'Cleanup'],
         ] as const).map(
           ([key, label]) => (
             <button
               key={key}
+              ref={activeTab === key ? activeTabRef : undefined}
               role="tab"
               aria-selected={activeTab === key}
+              aria-label={key === 'cleanup' && cleanupPending > 0
+                ? `Cleanup, ${cleanupPending} pending` : undefined}
               onClick={() => switchTab(key)}
-              className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-colors ${
+              className={`px-2 sm:px-4 py-2 text-sm font-medium whitespace-nowrap border-b-2 -mb-px transition-colors ${
                 activeTab === key
                   ? 'border-primary text-foreground'
                   : 'border-transparent text-muted-foreground hover:text-foreground'
               } ${focusRing}`}
             >
               {label}
+              {key === 'cleanup' && cleanupPending > 0 && (
+                <span className={`ml-2 ${badgeBase} ${tint.warning} tabular-nums`}>{cleanupPending}</span>
+              )}
             </button>
           ),
         )}
@@ -270,6 +304,7 @@ function PatternsPage() {
 
       {activeTab === 'detected-ads' && <DetectedAdsTab />}
       {activeTab === 'ad-review' && <AdReviewTab />}
+      {activeTab === 'cleanup' && <CleanupTab />}
 
       {activeTab === 'patterns' && (<>
 

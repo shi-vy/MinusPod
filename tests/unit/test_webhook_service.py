@@ -163,7 +163,7 @@ class TestBuildContext:
         mock_db = MagicMock()
         mock_db.get_setting.return_value = 'America/New_York'
         payload = _make_payload()
-        with patch('webhook_service.Database', return_value=mock_db):
+        with patch('webhook_service.database.Database', return_value=mock_db):
             ctx = _build_context(payload)
         assert ctx['timestamp'].endswith('Z')
         assert ctx['timestamp_local'].endswith(('-04:00', '-05:00'))
@@ -712,6 +712,41 @@ class TestQueueAndServiceAlerts:
         assert webhook_service.fire_service_offline_event('llm', 'down', 's', 'e', 'P') is False
         # A different service is its own key but shares the 60s burst cap.
         assert webhook_service.fire_service_offline_event('whisper', 'down', 's', 'e', 'P') is False
+
+    @patch('webhook_service.threading.Thread', SyncThread)
+    @patch('webhook_service.email_service.send_event_email')
+    @patch('webhook_service._prepare_and_dispatch')
+    @patch('webhook_service.load_webhooks')
+    @patch('webhook_service.time.time')
+    def test_failover_triggered_dedups_per_target_not_globally(
+            self, mock_time, mock_load, mock_dispatch, _mock_email):
+        """Each target gets its own 300s dedup key; past the shared 60s burst
+        cap, a second target's trigger still fires (#806 review finding)."""
+        mock_load.return_value = []
+        mock_time.side_effect = [1000.0, 1070.0]
+        assert webhook_service.fire_failover_event(
+            'trigger', 'llm:primary', 'auto', 'HTTP 503') is True
+        assert webhook_service.fire_failover_event(
+            'trigger', 'whisper', 'auto', 'down') is True
+
+    @patch('webhook_service.threading.Thread', SyncThread)
+    @patch('webhook_service.email_service.send_event_email')
+    @patch('webhook_service._prepare_and_dispatch')
+    @patch('webhook_service.load_webhooks')
+    @patch('webhook_service.time.time')
+    def test_failover_transitions_are_never_deduplicated(
+            self, mock_time, mock_load, mock_dispatch, _mock_email):
+        mock_load.return_value = [{'url': 'https://example.com/h', 'enabled': True,
+                                   'events': ['Failover Triggered', 'Failover Cancelled']}]
+        clock = iter(range(1000, 2000, 5))
+        mock_time.side_effect = lambda: float(next(clock))
+        assert webhook_service.fire_failover_event('trigger', 'llm:primary', 'auto', 'HTTP 503')
+        assert webhook_service.fire_failover_event('cancel', 'llm:primary', 'auto', None)
+        assert webhook_service.fire_failover_event('trigger', 'llm:primary', 'auto', 'HTTP 503')
+        assert webhook_service.fire_failover_event('trigger', 'whisper', 'auto', 'down')
+        events = [c[0][1]['event'] for c in mock_dispatch.call_args_list]
+        assert events == ['Failover Triggered', 'Failover Cancelled',
+                          'Failover Triggered', 'Failover Triggered']
 
     @patch('webhook_service.threading.Thread', SyncThread)
     @patch('webhook_service.email_service.send_event_email')

@@ -42,7 +42,7 @@ from config import (
     AD_CONTENT_PHONE_PATTERNS, AD_COPY_PHRASES, AD_OFFER_PHRASES,
     MIN_KEYWORD_LENGTH, MIN_UNCOVERED_TAIL_DURATION,
     TERMINAL_SNAP_EOF_TOLERANCE_SECONDS,
-    DEFAULT_SEGMENT_ACTION, normalize_segment_category,
+    DEFAULT_SEGMENT_ACTION, normalize_segment_category, is_keep_like,
     MIN_AD_DURATION_FOR_REMOVAL,
     PATTERN_TIGHTEN_MIN_EXCESS_SECONDS, PATTERN_TIGHTEN_MIN_CONFIDENCE,
 )
@@ -1682,6 +1682,13 @@ def resolve_category_action(category, action_map: dict[str, str]) -> str:
     return action_map.get(normalize_segment_category(category), DEFAULT_SEGMENT_ACTION)
 
 
+def _pattern_overridden_action(action, marker: dict) -> str | None:
+    """A pattern-defined detection overrides a keep-like resolution to remove."""
+    if is_keep_like(action) and marker.get('pattern_defined'):
+        return 'remove'
+    return action
+
+
 def effective_resolved_action(marker: dict,
                               action_map: dict[str, str] | None) -> str | None:
     """Marker's resolved action with the pattern-overrides-keep rule applied,
@@ -1689,14 +1696,12 @@ def effective_resolved_action(marker: dict,
     if action_map is None:
         return None
     action = resolve_category_action(marker.get('category'), action_map)
-    if action == 'keep' and marker.get('pattern_defined'):
-        return 'remove'
-    return action
+    return _pattern_overridden_action(action, marker)
 
 
 def _clip_estimated_keep(keep: dict, keep_action, other: dict, other_action) -> dict:
-    """An estimated keep contests a precise remove only over its matched text and measured keep members."""
-    if (keep_action != 'keep' or other_action != 'remove' or not keep.get('span_estimated')
+    """An estimated keep-like span contests a precise remove only over its matched text and measured keep members."""
+    if (not is_keep_like(keep_action) or other_action != 'remove' or not keep.get('span_estimated')
             or not any(_quote_edge_valid(other, edge) or word_timed_edge_valid(other, edge)
                        for edge in ('start', 'end'))):
         return keep
@@ -1762,14 +1767,11 @@ def split_conflicting_action_span(last: dict, current: dict,
         fragment.pop('end_text', None)
         return mark_measured_fragment(fragment, parent)
 
-    priority = {'remove': 0, 'beep': 1, 'keep': 2}
-    last_pattern = bool(last.get('pattern_defined'))
-    current_pattern = bool(current.get('pattern_defined'))
-    effective_last_action = (
-        'remove' if last_pattern and last_action == 'keep' else last_action)
-    effective_current_action = (
-        'remove' if current_pattern and current_action == 'keep'
-        else current_action)
+    priority = {'remove': 0, 'beep': 1, 'keep': 2, 'mark': 2}
+    # Shared with effective_resolved_action: a direct caller (or a test) may
+    # hand in an action string not yet run through that resolver.
+    effective_last_action = _pattern_overridden_action(last_action, last)
+    effective_current_action = _pattern_overridden_action(current_action, current)
     last = _clip_estimated_keep(last, effective_last_action, current, effective_current_action)
     current = _clip_estimated_keep(current, effective_current_action, last, effective_last_action)
     if current['start'] >= last['end'] or current['end'] <= last['start']:

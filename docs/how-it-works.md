@@ -29,6 +29,7 @@ Processing happens on-demand when you play an episode, or automatically when new
 | **Keep Content Only** | Inverted detection: the model marks show content and the rest is removed, guarded by safety gates | Feed page > Feed Settings > Processing mode |
 | **Skip Ad Detection** | Transcripts and chapters only; no detection LLM calls, nothing cut | Feed page > Feed Settings > Processing mode |
 | **Skip Verification Pass** | First pass still detects and cuts; the post-cut second sweep does not run | Feed page > Feed Settings > Advanced |
+| **Transcript Diff** | Diffs the Whisper transcript against the publisher's ad-free transcript; gaps corroborate or hold, never auto-cut | Automatic, per-feed opt-out |
 
 See detailed sections below for configuration and usage.
 
@@ -123,6 +124,7 @@ A fourth outcome is **held for review**. An ad is held when one of these rules b
 - **Standalone verification-pass miss** - global tunable (Settings > Ad Detection, default 0.60 confidence). A pass-2 detection overlapping no pass-1 marker clears the verification-miss hold floor but not the (off-by-default) autocut floor. Shown with a "Verification catch" chip. See [Verification Pass](#verification-pass).
 - **No splice evidence** - global rule with a per-feed override. A cut of 60 seconds or more from the detector or a learned pattern is held unless the audio shows an edit point near one of its edges. That can be a DAI transition pair, an ad-break cue template, a volume step of 12 dB or more, a splice event, or an overlapping differential region. Intro and outro cues never count, since they mark the show rather than a break. The rule applies only once the feed's splice calibration says `calibrated`, which takes five episodes of stored history. What matters is whether the ad was joined into the audio, not who reads it. An ad recorded separately and edited in leaves an edit point; one spoken straight through in a single take does not, so a feed whose ads are never joined in has every long cut held. Turn the check off for that feed on its settings page. See [Outbound splice check](configuration.md#splice-check).
 - **Uncorroborated cross-fetch differential region** - global tunable. The two fetches measurably differ, but no other stage, overlap, or matched audio cue backs the region as an ad. See [Cross-Fetch Differential](#cross-fetch-differential).
+- **Uncorroborated transcript differential gap** - global tunable, per-feed override. A block of speech is missing from the publisher's transcript, but no other stage backs the region as an ad. See [Transcript Differential](#transcript-differential).
 - **Reviewer boundary conflict** - a reviewer proposed moving inside protected evidence from a merged candidate. The original span stays in the audio and the proposed boundaries appear for manual review.
 
 Held ads stay in the audio. The episode publishes with them intact. The episode page shows held ads in an amber "Held for Review (N)" section with Approve & Recut and Dismiss buttons. Approve & Recut stores a confirm correction and immediately re-cuts via the Recut Audio mode (no LLM re-run) if the original audio is still retained; without it, the button reads Approve and the cut applies on the next reprocess. Dismiss records a rejection and leaves the audio unchanged. The episode list shows an "N held" chip on any episode with held ads.
@@ -216,16 +218,16 @@ Both sweeps update the persisted marker and the active cut list together, so the
 
 **Opt-in, two ways. Upgrading changes nothing by itself:**
 
-- Every category defaults to remove. A feed cuts exactly as it did before this feature until someone edits that feed's action map, or the global default map, to set a category to keep or beep.
+- Every category defaults to remove. A feed cuts exactly as it did before this feature until someone edits that feed's action map, or the global default map, to set a category to keep, mark, or beep.
 - Intro, outro, and recap are only detected when show-segments detection is on for a feed: a per-feed Inherit/On/Off choice that falls back to the global default when set to Inherit (the feed's default). Sponsor, cross-promo, self-promo, and interaction are always detected regardless of that setting. Setting intro to keep on a feed where show-segments detection resolves to off has no effect, since no intro marker is ever produced.
 
 Every detected marker carries a category: what kind of content the span is, not just whether it is an ad. Sponsor covers paid host-read or produced reads, dynamic ad insertion, and platform pre/post-rolls; cross-promo covers other-show and network promos; self-promo covers Patreon, merch, and subscribe/donate asks for the show itself; interaction covers follow/rate/review prompts. These four are always detected. Intro, outro, and recap (show intro or theme, outro and credits, "coming up" or "listen next" housekeeping) are detected only when show-segments detection resolves to on for the feed; boundaries on music-heavy intro/outro segments are approximate, since the detector reads the transcript and music rarely produces one. Fingerprint and text-pattern detections inherit the matched pattern's stored category; cross-fetch differential detections carry none. Uncategorized detections default to sponsor. A pattern's category can be set when it is created (manual ad creation or import) and edited later on the pattern detail modal or via `PUT /api/v1/patterns/{id}`, which matters because a pattern categorized as keep-resolving (say, cross-promo on a feed that keeps cross-promos) protects every span it matches.
 
-Each category resolves to one of three actions: remove (cut, the long-standing behavior), beep (replace the span with a tone, keeping the episode's original duration), or keep (leave the audio untouched). Resolution checks the feed's per-category override first, falls back to the global default map, and falls back to remove if neither sets the category. Configure the global map, and the global show-segments default, on the dedicated **Segment actions** card in Settings; override either per feed on the feed settings page under its own **Segment actions** heading, where each category starts in an inherit state until you touch it and show-segments detection is an explicit Inherit/On/Off choice. The episode page shows each marker's category as a chip, plus a muted "Kept" badge on any marker whose resolved action is keep.
+Each category resolves to one of four actions: remove (cut), beep (replace the span with a tone), keep (leave the audio untouched), or mark (leave the audio untouched and publish a skippable chapter). Mark requires chapters to be enabled; see [Ad chapters](podcasting-2.0.md#ad-chapters). Resolution checks the feed's per-category override first, falls back to the global default map, and falls back to remove if neither sets the category. Configure the global map, and the global show-segments default, on the dedicated **Segment actions** card in Settings; override either per feed on the feed settings page under its own **Segment actions** heading, where each category starts in an inherit state until you touch it and show-segments detection is an explicit Inherit/On/Off choice. The episode page shows each marker's category as a chip, plus a "Kept" or "Marked" badge for the corresponding action.
 
 When LLM detections are trimmed against pattern-matched regions, only remove-resolving regions count as coverage, so a keep-resolving pattern match never shadows an overlapping remove detection.
 
-A kept marker is saved with `was_cut = false` and skips the parts of the pipeline that assume something is being cut: it bypasses validator hold rules and reviewer boundary checks (there is nothing to hold or adjust), is dropped from any pass-2 verification finding that overlaps it rather than being re-flagged as a miss, and is excluded from the "Detections Not Cut" count, since choosing to keep a segment is not a miss. Kept markers never create corrections or cross-episode false-positive text, so they cannot poison pattern learning with a "not an ad" signal, but they still feed the pattern learner as detections and carry their category onto the learned pattern, so future matches on the same text keep improving regardless of the action applied to them.
+A kept or marked marker is saved with `was_cut = false` and skips the parts of the pipeline that assume something is being cut: it bypasses validator hold rules and reviewer boundary checks (there is nothing to hold or adjust), is dropped from any pass-2 verification finding that overlaps it rather than being re-flagged as a miss, and is excluded from the "Detections Not Cut" count, since choosing to keep a segment is not a miss. Kept and marked markers never create corrections or cross-episode false-positive text, so they cannot poison pattern learning with a "not an ad" signal, but they still feed the pattern learner as detections and carry their category onto the learned pattern, so future matches on the same text keep improving regardless of the action applied to them.
 
 Changing an action map does not retroactively touch already-processed episodes. The feed settings page has a **Re-render episodes with current segment actions** button that re-cuts every processed episode with a retained original against the current per-feed and global maps, using the same recut path as a single-episode recut; a category's action can also be changed after the fact through a normal per-episode recut, which re-resolves actions the same way.
 
@@ -244,6 +246,18 @@ The global setting (Settings > Global Defaults > Cross-fetch diff) has three pos
 Each detection found this way is tagged with the cross-fetch stage in the ad list, and the episode header shows a "Cross-fetch: N inserted" badge when the comparison found differing regions.
 
 Rejecting a differential detection as not an ad, held or not, still blocks that same episode-region from re-surfacing, but no longer seeds cross-episode false-positive text: it was only ever a candidate, never a confirmed false positive from a real detector, so it does not suppress future matching on other episodes of the feed.
+
+### Transcript Differential
+
+When a feed's `podcast:transcript` tag points at a transcript made before the
+ads were spliced in, MinusPod diffs its own Whisper transcript against it:
+any block of speech the publisher's copy omits is a candidate ad, with no
+audio refetch required. A found gap releases its own hold when another
+stage's detection covers at least half of the gap. A detection that a gap
+covers for at least half of its own length is also marked corroborated and
+gains confidence. A gap nothing releases holds for review on its own, tagged
+"Upstream transcript omits this span". It never cuts by itself. See [Upstream Transcript Differential](transcript-differential.md)
+for the full mechanism, thresholds, and settings.
 
 ### Keep Content Only
 

@@ -1132,15 +1132,7 @@ class Storage:
 
     def _download_artwork_uncached(self, slug: str, artwork_url: str,
                                    force: bool) -> tuple[bool, str | None]:
-        """Fetch, validate, and save one artwork URL. See download_artwork.
-
-        Content-Type header is advisory only; the saved bytes are validated
-        against a fixed file-magic allowlist (JPEG/PNG/GIF/WebP). SVG is
-        excluded because it admits script execution. Oversize responses are
-        rejected outright with a structured log rather than saved partially.
-        Returns (success, failure_status): failure_status is 'not_found' for
-        an HTTP 404, else 'error', and is None on success.
-        """
+        """Validate artwork; return (success, status), mapping non-retryable 4xx responses to not_found."""
         try:
             # Check if we already have this artwork on disk. Callers that
             # already wrote the new URL to the row pass force, since the
@@ -1179,7 +1171,9 @@ class Storage:
                     "[%s] artwork_fetch_failed status=%s url=%s",
                     slug, status_code, safe_url_for_log(artwork_url),
                 )
-                return False, ('not_found' if status_code == 404 else 'error')
+                not_found = (status_code is not None and 400 <= status_code < 500
+                             and status_code not in (408, 429))
+                return False, ('not_found' if not_found else 'error')
 
             declared_type = (response.headers.get('Content-Type') or '').split(';', 1)[0].strip().lower()
             if declared_type and declared_type not in _ALLOWED_IMAGE_TYPES:
@@ -1217,7 +1211,8 @@ class Storage:
     # ========== Cleanup Methods ==========
 
     def delete_processed_file(self, slug: str, episode_id: str,
-                               keep_original: bool = False) -> bool:
+                               keep_original: bool = False,
+                               can_delete=None) -> bool:
         """Delete the processed audio file(s) and any retained original.
 
         keep_original=True skips the original: local feeds keep it as the
@@ -1230,6 +1225,8 @@ class Storage:
             if original and original.exists():
                 candidates.append(original)
         for path in candidates:
+            if can_delete is not None and not can_delete():
+                break
             if path.exists():
                 path.unlink()
                 deleted = True

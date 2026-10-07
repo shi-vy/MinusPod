@@ -19,10 +19,11 @@ import { DETECTION_STAGE_META } from '../utils/detectionStage';
 import { CORROBORATION_CLASS, CORROBORATION_META } from '../utils/corroboration';
 import { formatConfidence } from '../utils/confidence';
 import { isActionBlocked } from '../utils/processingStage';
+import { isKeepLike } from '../utils/segmentCategory';
 import { applyEpisodeJobState, jobStateFromError } from '../utils/jobStateCache';
 import AdEditor, { AdCorrection } from '../components/AdEditor';
 import AdReviewModal from '../components/AdReviewModal';
-import type { AdSegment, EpisodeCorrection, Feed, EpisodeDetail as EpisodeDetailApi, JobState, ThinkingNoticePass } from '../api/types';
+import type { AdSegment, EpisodeCorrection, Feed, EpisodeDetail as EpisodeDetailApi, JobState, ThinkingNoticePass, UpstreamTranscript } from '../api/types';
 import PatternLink from '../components/PatternLink';
 import ExpandableText from '../components/ExpandableText';
 import RichText from '../components/RichText';
@@ -87,6 +88,15 @@ function formatList(items: string[]): string {
   if (items.length < 2) return items[0] ?? '';
   if (items.length === 2) return `${items[0]} and ${items[1]}`;
   return `${items.slice(0, -1).join(', ')}, and ${items[items.length - 1]}`;
+}
+
+// Heading for the kept-markers section: reflects whether the bucket is all
+// keep, all mark, or a mix of both.
+function keptSectionTitle(markers: AdSegment[]): string {
+  const markedCount = markers.filter((m) => m.actionApplied === 'mark').length;
+  if (markedCount === 0) return `Kept segments (${markers.length})`;
+  if (markedCount === markers.length) return `Marked segments (${markers.length})`;
+  return `Kept and marked segments (${markers.length})`;
 }
 
 function btnClass(status: string, idleClass: string): string {
@@ -295,6 +305,29 @@ function SpendSummary({ label, spend, title }: {
     <span className="text-xs text-muted-foreground" title={title}>
       {label}: <CostAmount amount={parseFloat(spend.costUsd)} unpriced={spend.hasUnknownCost} />
       {' '}({formatTokenRange(spend.inputTokens, spend.outputTokens)})
+    </span>
+  );
+}
+
+// Header summary of the upstream transcript diff; hidden when the stage did not run.
+function TranscriptDiffBadge({ diff }: { diff?: UpstreamTranscript | null }) {
+  if (!diff || diff.status === 'none') return null;
+  const match = diff.coverage != null ? `${Math.round(diff.coverage * 100)}%` : null;
+  const gaps = diff.spans.length;
+  const [label, title] = {
+    ok: [gaps ? `Transcript diff: ${gaps} ${gaps === 1 ? 'gap' : 'gaps'}` : 'Transcript diff: no gaps',
+      `The publisher's transcript matched ${match} of this episode's speech. Gaps in it are treated as likely ads.`],
+    unreliable: ['Transcript diff: unreliable',
+      `The publisher's transcript matched only ${match} of this episode's speech, so its gaps were not used.`],
+    empty: ['Transcript diff: empty', "The publisher's transcript or this episode's transcript had no words to compare."],
+    error: ['Transcript diff: failed', "The publisher's transcript could not be fetched or read."],
+  }[diff.status];
+  return (
+    <span
+      className={`${badgeBase} font-medium ${diff.status === 'ok' && gaps ? tint.teal : tint.neutral}`}
+      title={title}
+    >
+      {label}
     </span>
   );
 }
@@ -520,6 +553,11 @@ function EpisodeDetail() {
     correctionMutation.mutate(correction);
   };
 
+  // Same mutation, awaited: a multi-span create submits several runs in
+  // sequence and needs to know each one's outcome before starting the next.
+  const handleCorrectionAsync = (correction: AdCorrection): Promise<void> =>
+    correctionMutation.mutateAsync(correction).then(() => undefined);
+
   // Per-row, per-action save status for the Held-for-Review and
   // Detections-Not-Cut rows. Match on the full row identity plus which
   // action (confirm / confirm-trimmed / reject) submitted the in-flight
@@ -581,6 +619,8 @@ function EpisodeDetail() {
       confidence: marker.confidence,
       reason: marker.reason || '',
       sponsor: marker.sponsor,
+      category: marker.category ?? null,
+      action_applied: marker.actionApplied ?? null,
       pattern_id: undefined,
       detection_stage: marker.detection_stage || 'first_pass',
     }));
@@ -864,6 +904,7 @@ function EpisodeDetail() {
                     : 'Cross-fetch: failed'}
                 </span>
               )}
+              <TranscriptDiffBadge diff={episode.upstreamTranscript} />
               {episode.activeRunSpend && (
                 <SpendSummary
                   label="Active run"
@@ -1093,6 +1134,7 @@ function EpisodeDetail() {
               detectedAds={[]}
               audioDuration={episode.originalDuration ?? 0}
               onCorrection={handleCorrection}
+              onCorrectionAsync={handleCorrectionAsync}
               onClose={() => {
                 setShowEditor(false);
                 setCreateModeRequested(false);
@@ -1190,6 +1232,7 @@ function EpisodeDetail() {
                 hasOriginal={!!episode.hasOriginalAudio}
                 onAudioModeChange={setReviewMode}
                 onCorrection={handleCorrection}
+                onCorrectionAsync={handleCorrectionAsync}
                 onClose={() => {
                   setShowEditor(false);
                   setCreateModeRequested(false);
@@ -1239,7 +1282,7 @@ function EpisodeDetail() {
                       : `${formatTimestamp(segment.start)} - ${formatTimestamp(segment.end)}`}
                   </span>
                   <SegmentCategoryBadge category={segment.category} />
-                  {segment.actionApplied === 'keep' && <KeptBadge />}
+                  {isKeepLike(segment.actionApplied) && <KeptBadge actionApplied={segment.actionApplied} />}
                   {segment.detection_stage && DETECTION_STAGE_META[segment.detection_stage] && (
                     <StageBadge stage={segment.detection_stage} />
                   )}
@@ -1527,7 +1570,7 @@ function EpisodeDetail() {
                         {formatTimestamp(segment.start)} - {formatTimestamp(segment.end)}
                       </span>
                       <SegmentCategoryBadge category={segment.category} />
-                      {segment.actionApplied === 'keep' && <KeptBadge />}
+                      {isKeepLike(segment.actionApplied) && <KeptBadge actionApplied={segment.actionApplied} />}
                       {segment.detection_stage && DETECTION_STAGE_META[segment.detection_stage] && (
                         <StageBadge stage={segment.detection_stage} />
                       )}
@@ -1675,7 +1718,7 @@ function EpisodeDetail() {
       {episode.keptMarkers && episode.keptMarkers.length > 0 && (
         <div className="mb-6" data-testid="kept-segments-section">
           <CollapsibleSection
-            title={`Kept segments (${episode.keptMarkers.length})`}
+            title={keptSectionTitle(episode.keptMarkers)}
             subtitle="Detected, and left in the audio by your category actions"
             defaultOpen={false}
             storageKey="episode-kept-segments"
@@ -1704,7 +1747,7 @@ function EpisodeDetail() {
                       {formatTimestamp(segment.start)} - {formatTimestamp(segment.end)}
                     </span>
                     <SegmentCategoryBadge category={segment.category} />
-                    <KeptBadge />
+                    <KeptBadge actionApplied={segment.actionApplied} />
                   </div>
                 </div>
               ))}
@@ -1760,7 +1803,7 @@ function EpisodeDetail() {
                             {formatTimestamp(segment.start)} - {formatTimestamp(segment.end)}
                           </span>
                           <SegmentCategoryBadge category={segment.category} />
-                          {segment.actionApplied === 'keep' && <KeptBadge />}
+                          {isKeepLike(segment.actionApplied) && <KeptBadge actionApplied={segment.actionApplied} />}
                           <span className={`${badgeBase} font-medium ${tint.destructive}`}>
                             Not cut
                           </span>

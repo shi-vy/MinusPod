@@ -42,14 +42,14 @@ from text_pattern_matcher import is_defined_pattern
 from database import DEFAULT_REVIEW_PROMPT, DEFAULT_RESURRECT_PROMPT
 from llm_capabilities import PASS_REVIEWER_1, PASS_REVIEWER_2
 from llm_route import (
-    Route, SAME_AS_PASS, SLOT_PRIMARY, client_for_route, resolve_review_route,
-    resolve_route,
+    Route, SAME_AS_PASS, SLOT_PRIMARY, apply_failover, client_for_route,
+    live_route_from, resolve_review_route, resolve_route,
 )
 from run_context import route_for_phase, run_in_worker_thread
 from llm_client import (
     extract_error_body,
     get_effective_provider,
-    get_llm_max_retries, get_llm_timeout, is_rate_limit_error,
+    is_rate_limit_error,
     is_review_inconclusive_error, ProviderRateLimitedError,
     StructuralRateLimitError,
 )
@@ -103,13 +103,7 @@ logger = logging.getLogger(__name__)
 
 
 def _review_failure_reason(error: Exception) -> str:
-    """Short, non-leaking reason for a failed reviewer LLM call.
-
-    The full error is logged separately; the raw provider payload (e.g. a Gemini
-    429 JSON blob) must never reach the verdict reasoning, which the UI renders.
-    StructuralRateLimitError carries our own already-sanitized, actionable text
-    (per-minute cap or daily-quota guidance), so surface it verbatim.
-    """
+    """Show sanitized quota guidance without exposing raw provider payloads."""
     if isinstance(error, StructuralRateLimitError):
         return f"Review unavailable: {error}"
     if is_rate_limit_error(error):
@@ -1322,12 +1316,17 @@ class AdReviewer:
         self.sponsor_service = sponsor_service
         self._sponsor_history_provider = sponsor_history_provider
 
+    def _live_route(self) -> Route | None:
+        """The resolved review route, switched to failover if one triggered since."""
+        return apply_failover(self._active_route) if self._active_route else None
+
+    def _client_for(self, route: Route | None):
+        """An explicit override (tests, calibration) wins; otherwise `route`'s client."""
+        return client_for_route(route, override=self._llm_client_override)
+
     @property
     def _llm_client(self):
-        """Client for the in-progress review() call: an explicit override
-        (tests, calibration) wins; otherwise the resolved route's client."""
-        return client_for_route(self._active_route,
-                                override=self._llm_client_override)
+        return self._client_for(self._live_route())
 
     def review(
         self,
@@ -1746,18 +1745,18 @@ class AdReviewer:
         window_label = f"reviewer-pass{pass_num}-{pool}"
 
         pass_name = PASS_REVIEWER_1 if pass_num == 1 else PASS_REVIEWER_2
-        provider = self._active_route.provider_key if self._active_route else None
+        live = live_route_from(self._live_route(), model)
+        provider, credential_slot, model = live.provider, live.credential_slot, live.model
         max_tokens, temperature, reasoning = resolve_stage_tunables(
             'reviewer', provider=provider)
-        credential_slot = self._active_route.credential_slot if self._active_route else 'primary'
         t0 = time.monotonic()
         response, error = call_llm_for_window(
-            llm_client=self._llm_client,
+            llm_client=self._client_for(live.route),
             model=model,
             system_prompt=system_prompt,
             prompt=user_prompt,
-            llm_timeout=get_llm_timeout(),
-            max_retries=get_llm_max_retries(),
+            llm_timeout=live.timeout,
+            max_retries=live.max_retries,
             max_tokens=max_tokens,
             temperature=temperature,
             reasoning_effort=reasoning,
@@ -2176,15 +2175,15 @@ class AdReviewer:
         )
         pass_name = PASS_REVIEWER_1 if pass_num == 1 else PASS_REVIEWER_2
         call_label = f"reviewer-pass{pass_num}-trim-recovery"
-        provider = self._active_route.provider_key if self._active_route else None
-        credential_slot = self._active_route.credential_slot if self._active_route else 'primary'
+        live = live_route_from(self._live_route(), model)
+        provider, credential_slot, model = live.provider, live.credential_slot, live.model
         try:
             response, error = call_llm(
-                llm_client=self._llm_client,
+                llm_client=self._client_for(live.route),
                 model=model,
                 system_prompt=_TRIM_RECOVERY_SYSTEM_PROMPT,
                 prompt=user_prompt,
-                llm_timeout=get_llm_timeout(),
+                llm_timeout=live.timeout,
                 max_retries=0,
                 max_tokens=300,
                 slug=slug,
@@ -2462,7 +2461,7 @@ class AdReviewer:
         same_as_pass inherits the invoking pass's full route (pass 1 detection,
         pass 2 verification). Outside a run, falls back to a live resolve_route.
         """
-        review_entry = route_for_phase('review')
+        review_entry = route_for_phase('review', apply_live_failover=False)
         gate = review_entry.get('gate') if review_entry else None
         if gate is not None:
             review_provider_setting = gate.get('review_provider') or SAME_AS_PASS
@@ -2472,9 +2471,13 @@ class AdReviewer:
                     phase='review', provider_key=review_entry['provider_key'],
                     model_id=review_entry['configured_model'],
                     base_url=review_entry.get('base_url'),
-                    slot=slot, credential_slot=slot)
+                    slot=slot, credential_slot=slot,
+                    account_id=review_entry.get('account_id'))
             invoking_phase = 'verification' if pass_num == 2 else 'detection'
-            pass_entry = route_for_phase(invoking_phase) or {}
+            pass_entry = route_for_phase(invoking_phase, apply_live_failover=False) or {}
+            if pass_entry:
+                pass_provider = pass_entry['provider_key']
+                pass_model = pass_entry['configured_model']
             pass_base_url = None
             pass_credential_slot = None
             if pass_entry.get('provider_key') == pass_provider:

@@ -1,10 +1,11 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { Play, Pause, SkipBack, SkipForward, Rewind, FastForward, Square, ChevronDown } from 'lucide-react';
+import type { ReactNode } from 'react';
+import { Play, Pause, SkipBack, SkipForward, Rewind, FastForward, Square } from 'lucide-react';
 import { formatTime } from '../../utils/adReviewHelpers';
-import { PLAYBACK_RATES, ghostBtn, primaryBtn, selectionBtn } from './controlStyles';
+import { ghostBtn, primaryBtn, selectionBtn } from './controlStyles';
 import { focusRing } from '../../components/fieldStyles';
-import { useOutsideClick } from '../../hooks/useOutsideClick';
+import { touchTarget } from '../buttonStyles';
 import { tint } from '../badgeStyles';
+import SpeedMenu from './SpeedMenu';
 
 // Shared editor controls; the host owns audio, playhead, and handlers.
 // Wrap only when controls cannot fit on one row.
@@ -43,21 +44,6 @@ function TransportBar({
   onPlaySelection,
   selectionInfo,
 }: TransportBarProps) {
-  // Custom speed control (not a native <select>): iOS Safari sizes native
-  // selects with its own width/height that Tailwind cannot fully override, so a
-  // button + popover renders identically everywhere and stays button-sized.
-  const [speedOpen, setSpeedOpen] = useState(false);
-  const speedRef = useRef<HTMLDivElement>(null);
-  useOutsideClick(speedRef, speedOpen, () => setSpeedOpen(false));
-  useEffect(() => {
-    if (!speedOpen) return;
-    // stopPropagation so Escape only closes the popover, not the parent modal
-    // (both editors close on a window-level Escape and would discard the edit).
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') { e.stopPropagation(); setSpeedOpen(false); } };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [speedOpen]);
-
   return (
     <div className="mt-3 mx-auto w-fit max-w-full px-3 py-2 rounded-lg bg-secondary/50 border border-border">
       {/* Controls and the selection readout share one row on desktop (there is
@@ -66,20 +52,20 @@ function TransportBar({
           grouped beside it at any width. */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-center sm:gap-4">
         <div className="flex flex-wrap items-center justify-center gap-0.5">
-          <button type="button" onClick={onSeekToStart} className={`p-1.5 rounded ${ghostBtn} ${focusRing}`} title="Jump to START pin">
+          <button type="button" onClick={onSeekToStart} className={`p-1.5 rounded ${ghostBtn} ${touchTarget} ${focusRing}`} title="Jump to START pin">
             <SkipBack className="w-4 h-4" />
           </button>
-          <button type="button" onClick={() => onSeekRelative(-10)} className={`p-1.5 rounded ${ghostBtn} ${focusRing}`} title="Back 10s">
+          <button type="button" onClick={() => onSeekRelative(-10)} className={`p-1.5 rounded ${ghostBtn} ${touchTarget} ${focusRing}`} title="Back 10s">
             <Rewind className="w-4 h-4" />
           </button>
-          <button type="button" onClick={onTogglePlay} className={`p-1.5 rounded ${primaryBtn} ${focusRing}`} title="Play / pause (Space)">
+          <button type="button" onClick={onTogglePlay} className={`p-1.5 rounded ${primaryBtn} ${touchTarget} ${focusRing}`} title="Play / pause (Space)">
             {isPlaying ? <Pause className="w-5 h-5" /> : <Play className="w-5 h-5" />}
           </button>
           {onPlaySelection && (
             <button
               type="button"
               onClick={onPlaySelection}
-              className={`${selectionBtn} ${focusRing}`}
+              className={`${selectionBtn} ${touchTarget} ${focusRing}`}
               title="Play the selection only"
               aria-label="Play selection"
             >
@@ -88,44 +74,16 @@ function TransportBar({
               <span aria-hidden="true" className="text-xs font-bold leading-none">]</span>
             </button>
           )}
-          <button type="button" onClick={() => onSeekRelative(10)} className={`p-1.5 rounded ${ghostBtn} ${focusRing}`} title="Forward 10s">
+          <button type="button" onClick={() => onSeekRelative(10)} className={`p-1.5 rounded ${ghostBtn} ${touchTarget} ${focusRing}`} title="Forward 10s">
             <FastForward className="w-4 h-4" />
           </button>
-          <button type="button" onClick={onSeekToEnd} className={`p-1.5 rounded ${ghostBtn} ${focusRing}`} title="Jump to END pin">
+          <button type="button" onClick={onSeekToEnd} className={`p-1.5 rounded ${ghostBtn} ${touchTarget} ${focusRing}`} title="Jump to END pin">
             <SkipForward className="w-4 h-4" />
           </button>
-          <button type="button" onClick={onStop} className={`p-1.5 rounded ${ghostBtn} ${focusRing}`} title="Stop (pause + return to START)">
+          <button type="button" onClick={onStop} className={`p-1.5 rounded ${ghostBtn} ${touchTarget} ${focusRing}`} title="Stop (pause + return to START)">
             <Square className="w-4 h-4" />
           </button>
-          <div className="relative ml-0.5" ref={speedRef}>
-            <button
-              type="button"
-              onClick={() => setSpeedOpen((o) => !o)}
-              className={`h-8 px-1.5 rounded inline-flex items-center gap-1 text-xs font-semibold tabular-nums ${ghostBtn} focus:outline-hidden focus:ring-2 focus:ring-ring`}
-              title="Playback speed"
-              aria-expanded={speedOpen}
-              aria-label="Playback speed"
-            >
-              {playbackRate}&times;
-              <ChevronDown className="w-3 h-3 opacity-60" aria-hidden="true" />
-            </button>
-            {speedOpen && (
-              <ul className="absolute right-0 bottom-full mb-1 z-20 min-w-[3.25rem] rounded-md border border-border bg-card shadow-lg py-1">
-                {PLAYBACK_RATES.map((r) => (
-                  <li key={r}>
-                    <button
-                      type="button"
-                      aria-current={r === playbackRate}
-                      onClick={() => { onPlaybackRateChange(r); setSpeedOpen(false); }}
-                      className={`block w-full px-3 py-1 text-right text-xs tabular-nums hover:bg-accent ${r === playbackRate ? 'text-foreground font-semibold' : 'text-muted-foreground'} ${focusRing}`}
-                    >
-                      {r}&times;
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
+          <SpeedMenu playbackRate={playbackRate} onChange={onPlaybackRateChange} className="ml-0.5" />
         </div>
         {/* Selection readout: below the controls on mobile, beside them on desktop. */}
         <div className="mt-2 sm:mt-0 flex items-center justify-center gap-2 flex-wrap text-xs tabular-nums text-muted-foreground">

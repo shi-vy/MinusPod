@@ -9,7 +9,8 @@ from typing import ClassVar
 # Shared with the stats mixin so both agree on what counts as processed.
 from database.stats import _PROCESSED_EPISODE_EXISTS_SQL
 from utils.constants import EpisodeStatus
-from utils.time import ISO_FORMAT, utc_now, utc_now_iso
+from utils.text import is_timezone_drift, normalize_title_for_match
+from utils.time import ISO_FORMAT, parse_iso_utc, utc_now, utc_now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,13 @@ logger = logging.getLogger(__name__)
 # archive feed held the single write lock long enough for every other writer to
 # exceed its 30s busy_timeout and fail with "database is locked".
 DISCOVERY_UPSERT_CHUNK = 50
+
+# Preference order when several existing rows fall inside the fuzzy match
+# window: a row with real processing state wins over a bare discovered one.
+_STATUS_MATCH_PRIORITY = {
+    EpisodeStatus.PROCESSED.value: 2,
+    EpisodeStatus.PROCESSING.value: 1,
+}
 
 # Shared SET clause for requeueing an episode to 'pending' (params: reprocess_mode,
 # reprocess_requested_at). One definition so a new reset column cannot be added to
@@ -81,6 +89,46 @@ def _serialize_applied_cut(cut: dict) -> dict:
     if replacement is not None:
         out['replacement_duration'] = float(replacement)
     return out
+
+
+def _fuzzy_index_key_and_dt(row: dict):
+    """Normalized title and parsed published_at for a row, or (None, None)
+    when either is missing so the row cannot ever fuzzy-match."""
+    title = row.get('title')
+    published = row.get('published_at')
+    if not title or not published:
+        return None, None
+    dt = parse_iso_utc(published)
+    if not dt:
+        return None, None
+    key = normalize_title_for_match(title)
+    return (key, dt) if key else (None, None)
+
+
+def _add_to_fuzzy_index(fuzzy_index: dict, row: dict) -> None:
+    key, dt = _fuzzy_index_key_and_dt(row)
+    if key is not None:
+        fuzzy_index.setdefault(key, []).append((dt, row))
+
+
+def _remove_from_fuzzy_index(fuzzy_index: dict, row: dict | None) -> None:
+    """Drop the entry for row['episode_id'] from the bucket row's title maps
+    to. Matches by id, not object identity: titles are immutable once set
+    (see _upsert_one_discovered_episode), so a stale cached copy of a row
+    always shares its bucket with a freshly re-fetched copy of that row."""
+    if row is None:
+        return
+    key, _ = _fuzzy_index_key_and_dt(row)
+    bucket = fuzzy_index.get(key) if key is not None else None
+    if not bucket:
+        return
+    episode_id = row.get('episode_id')
+    for i, (_, candidate) in enumerate(bucket):
+        if candidate.get('episode_id') == episode_id:
+            bucket.pop(i)
+            break
+    if not bucket:
+        fuzzy_index.pop(key, None)
 
 
 class EpisodeMixin:
@@ -321,7 +369,8 @@ class EpisodeMixin:
                                'deferred_at', 'deferred_service', 'detection_degraded',
                                'low_yield_rerun_at', 'reprocess_source',
                                'season_number', 'p20_item_json',
-                               'pending_recut_at', 'chapters_regen_error'):
+                               'pending_recut_at', 'chapters_regen_error',
+                               'processed_size_bytes'):
                         fields.append(f"{key} = ?")
                         values.append(value)
                     elif key == 'tags':
@@ -837,6 +886,11 @@ class EpisodeMixin:
             VALUES (?, ?)
             ON CONFLICT(episode_id) DO UPDATE
             SET dai_differential_json = excluded.dai_differential_json""",
+        'upstream_transcript_json': """
+            INSERT INTO episode_details (episode_id, upstream_transcript_json)
+            VALUES (?, ?)
+            ON CONFLICT(episode_id) DO UPDATE
+            SET upstream_transcript_json = excluded.upstream_transcript_json""",
     }
 
     def _upsert_episode_detail_json(self, slug, episode_id, column, value) -> bool:
@@ -901,6 +955,29 @@ class EpisodeMixin:
             (db_episode_id,),
         ).fetchone()
         return row['dai_differential_json'] if row else None
+
+    def save_episode_upstream_transcript(self, slug: str, episode_id: str, payload: dict):
+        """Save the upstream transcript differential result for an episode."""
+        if self._upsert_episode_detail_json(
+                slug, episode_id, 'upstream_transcript_json', json.dumps(payload)):
+            logger.debug(f"[{slug}:{episode_id}] Saved upstream transcript diff to database")
+
+    def get_episode_upstream_transcript(self, slug: str, episode_id: str) -> dict | None:
+        """Return the parsed upstream_transcript_json for an episode, or None."""
+        conn = self.get_connection()
+        db_episode_id = self._get_episode_db_id(slug, episode_id)
+        if not db_episode_id:
+            return None
+        row = conn.execute(
+            "SELECT upstream_transcript_json FROM episode_details WHERE episode_id = ?",
+            (db_episode_id,),
+        ).fetchone()
+        if not row or not row['upstream_transcript_json']:
+            return None
+        try:
+            return json.loads(row['upstream_transcript_json'])
+        except (TypeError, ValueError):
+            return None
 
     def get_transcribed_details_created_at(self, slug: str, episode_id: str) -> str | None:
         """created_at of the details row, when it holds a transcript.
@@ -1015,6 +1092,7 @@ class EpisodeMixin:
         cursor = conn.execute('''
             SELECT e.podcast_id AS podcast_id,
                    p.slug AS feed_slug, p.title AS feed_title,
+                   p.segment_category_actions AS segment_category_actions,
                    e.episode_id, e.title AS episode_title,
                    e.published_at, e.created_at, e.original_file,
                    e.processed_version, e.original_duration,
@@ -1032,7 +1110,8 @@ class EpisodeMixin:
         conn = self.get_connection()
         cursor = conn.execute(
             """SELECT episode_id, title, description, published_at,
-                      new_duration, episode_number, original_url
+                      new_duration, episode_number, original_url,
+                      processed_version, processed_size_bytes
                FROM episodes
                WHERE podcast_id = ? AND status = 'processed'
                      AND processed_file IS NOT NULL
@@ -1277,6 +1356,7 @@ class EpisodeMixin:
             f"""UPDATE episodes SET
                 status = 'discovered',
                 processed_file = NULL, original_file = NULL, processed_at = NULL,
+                processed_size_bytes = NULL,
                 original_duration = NULL, new_duration = NULL,
                 ads_removed = 0, ads_removed_firstpass = 0, ads_removed_secondpass = 0,
                 error_message = NULL, ad_detection_status = NULL,
@@ -1332,16 +1412,28 @@ class EpisodeMixin:
             (row['title'], row['published_at']): row['episode_id']
             for row in rows if row['title'] and row['published_at']
         }
+        fuzzy_index = self._build_fuzzy_index(existing_by_id)
 
         for start in range(0, len(normalized), DISCOVERY_UPSERT_CHUNK):
             chunk = normalized[start:start + DISCOVERY_UPSERT_CHUNK]
+            chunk_ids = [ep['id'] for ep in chunk if ep.get('id')]
+            stale_snapshot = {cid: existing_by_id[cid] for cid in chunk_ids if cid in existing_by_id}
             with self.transaction(immediate=True) as conn:
-                self._refresh_discovery_state(
-                    conn, podcast_id, chunk, existing_by_id, title_date_map)
+                touched_ids = self._refresh_discovery_state(
+                    conn, podcast_id, chunk, existing_by_id, title_date_map) or set()
+                # Rows matched by id or by title/date may have been swapped
+                # for fresh DB copies; resync the fuzzy index to match.
+                for tid in set(chunk_ids) | set(touched_ids):
+                    refreshed = existing_by_id.get(tid)
+                    if refreshed is not None:
+                        _remove_from_fuzzy_index(fuzzy_index, refreshed)
+                        _add_to_fuzzy_index(fuzzy_index, refreshed)
+                    else:
+                        _remove_from_fuzzy_index(fuzzy_index, stale_snapshot.get(tid))
                 newly_inserted_pairs = []
                 for ep in chunk:
                     row_inserted, row_skipped = self._upsert_one_discovered_episode(
-                        conn, podcast_id, slug, ep, existing_by_id, title_date_map)
+                        conn, podcast_id, slug, ep, existing_by_id, title_date_map, fuzzy_index)
                     inserted += row_inserted
                     skipped += row_skipped
                     if row_inserted:
@@ -1366,7 +1458,11 @@ class EpisodeMixin:
     @staticmethod
     def _refresh_discovery_state(
             conn, podcast_id, chunk, existing_by_id, title_date_map):
-        """Refresh the chunk's dedup keys after taking the writer lock."""
+        """Refresh the chunk's dedup keys after taking the writer lock.
+
+        Returns the episode_ids whose existing_by_id entry may have changed
+        (id-matched plus title/date-matched), for fuzzy-index resync.
+        """
         ids = [episode['id'] for episode in chunk if episode.get('id')]
         title_dates = [
             (episode.get('title'), episode['_iso_published']) for episode in chunk
@@ -1383,7 +1479,7 @@ class EpisodeMixin:
             for title, published_at in title_dates:
                 params.extend((title, published_at))
         if not clauses:
-            return
+            return set()
 
         for episode_id in ids:
             existing_by_id.pop(episode_id, None)
@@ -1394,14 +1490,49 @@ class EpisodeMixin:
             f"FROM episodes WHERE podcast_id = ? AND ({' OR '.join(clauses)})",
             params,
         ).fetchall()
+        touched_ids = set(ids)
         for raw_row in rows:
             row = dict(raw_row)
+            touched_ids.add(row['episode_id'])
             existing_by_id[row['episode_id']] = row
             if row['title'] and row['published_at']:
                 title_date_map[(row['title'], row['published_at'])] = row['episode_id']
+        return touched_ids
+
+    @staticmethod
+    def _build_fuzzy_index(existing_by_id: dict) -> dict:
+        """Group existing rows by normalized title, with published_at parsed
+        once, so fuzzy lookup is a dict lookup plus a scan of same-title rows."""
+        fuzzy_index: dict = {}
+        for row in existing_by_id.values():
+            _add_to_fuzzy_index(fuzzy_index, row)
+        return fuzzy_index
+
+    @staticmethod
+    def _find_fuzzy_duplicate(title, iso_published, exclude_id, fuzzy_index):
+        """Find a same-episode row under a different GUID via a dropped
+        timezone offset, when the exact title+date lookup misses."""
+        target_dt = parse_iso_utc(iso_published)
+        target_title = normalize_title_for_match(title)
+        if not target_dt or not target_title:
+            return None
+        bucket = fuzzy_index.get(target_title)
+        if not bucket:
+            return None
+        best, best_key = None, None
+        for candidate_dt, row in bucket:
+            if row.get('episode_id') == exclude_id:
+                continue
+            if not is_timezone_drift(candidate_dt, target_dt):
+                continue
+            delta_seconds = abs((candidate_dt - target_dt).total_seconds())
+            key = (-_STATUS_MATCH_PRIORITY.get(row.get('status'), 0), delta_seconds)
+            if best is None or key < best_key:
+                best, best_key = row, key
+        return best
 
     def _upsert_one_discovered_episode(
-            self, conn, podcast_id, slug, ep, existing_by_id, title_date_map):
+            self, conn, podcast_id, slug, ep, existing_by_id, title_date_map, fuzzy_index):
         """Upsert one discovered episode. Returns an (inserted, skipped) delta.
 
         Lock errors propagate so the whole batch fails and the caller retries the
@@ -1415,6 +1546,9 @@ class EpisodeMixin:
             if ep.get('title') and iso_published:
                 existing_id = title_date_map.get((ep.get('title'), iso_published))
                 existing = existing_by_id.get(existing_id) if existing_id != ep['id'] else None
+                if existing is None:
+                    existing = self._find_fuzzy_duplicate(
+                        ep.get('title'), iso_published, ep['id'], fuzzy_index)
                 if existing is not None:
                     # Update episode_id to match new GUID for discovered episodes
                     # (no cached files yet, safe to update)
@@ -1458,13 +1592,17 @@ class EpisodeMixin:
                 """INSERT INTO episodes
                    (podcast_id, episode_id, original_url, title, description,
                     artwork_url, episode_number, published_at, rss_duration,
-                    upstream_chapters_url, tags, status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'discovered')
+                    upstream_chapters_url, upstream_transcript_url,
+                    upstream_transcript_type, tags, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'discovered')
                    ON CONFLICT(podcast_id, episode_id) DO UPDATE SET
                     episode_number = COALESCE(excluded.episode_number, episodes.episode_number),
                     published_at = COALESCE(excluded.published_at, episodes.published_at),
                     rss_duration = COALESCE(excluded.rss_duration, episodes.rss_duration),
                     upstream_chapters_url = COALESCE(excluded.upstream_chapters_url, episodes.upstream_chapters_url),
+                    upstream_transcript_url = COALESCE(excluded.upstream_transcript_url, episodes.upstream_transcript_url),
+                    upstream_transcript_type = CASE WHEN excluded.upstream_transcript_url IS NOT NULL
+                        THEN excluded.upstream_transcript_type ELSE episodes.upstream_transcript_type END,
                     original_url = COALESCE(episodes.original_url, excluded.original_url),
                     title = CASE WHEN COALESCE(episodes.title, '') = '' THEN excluded.title ELSE episodes.title END,
                     description = CASE WHEN COALESCE(episodes.description, '') = '' THEN excluded.description ELSE episodes.description END,
@@ -1474,6 +1612,9 @@ class EpisodeMixin:
                       OR episodes.published_at IS NOT COALESCE(episodes.published_at, excluded.published_at)
                       OR episodes.rss_duration IS NOT COALESCE(episodes.rss_duration, excluded.rss_duration)
                       OR episodes.upstream_chapters_url IS NOT COALESCE(episodes.upstream_chapters_url, excluded.upstream_chapters_url)
+                      OR episodes.upstream_transcript_url IS NOT COALESCE(excluded.upstream_transcript_url, episodes.upstream_transcript_url)
+                      OR episodes.upstream_transcript_type IS NOT CASE WHEN excluded.upstream_transcript_url IS NOT NULL
+                        THEN excluded.upstream_transcript_type ELSE episodes.upstream_transcript_type END
                       OR episodes.original_url IS NOT COALESCE(episodes.original_url, excluded.original_url)
                       OR episodes.title IS NOT CASE WHEN COALESCE(episodes.title, '') = '' THEN excluded.title ELSE episodes.title END
                       OR episodes.description IS NOT CASE WHEN COALESCE(episodes.description, '') = '' THEN excluded.description ELSE episodes.description END
@@ -1490,15 +1631,19 @@ class EpisodeMixin:
                     iso_published,
                     ep.get('rss_duration'),
                     ep.get('upstream_chapters_url'),
+                    ep.get('upstream_transcript_url'),
+                    ep.get('upstream_transcript_type'),
                     tags_json,
                 )
             )
             if ep['id'] not in existing_by_id:
-                existing_by_id[ep['id']] = {
+                new_row = {
                     'episode_id': ep['id'], 'episode_number': ep.get('episode_number'),
                     'status': 'discovered', 'title': ep.get('title'),
                     'published_at': iso_published,
                 }
+                existing_by_id[ep['id']] = new_row
+                _add_to_fuzzy_index(fuzzy_index, new_row)
                 if ep.get('title') and iso_published:
                     title_date_map[(ep.get('title'), iso_published)] = ep['id']
                 return 1, 0
@@ -1507,11 +1652,13 @@ class EpisodeMixin:
             effective_published = current['published_at'] or iso_published
             if all(old_key) and title_date_map.get(old_key) == ep['id']:
                 title_date_map.pop(old_key)
+            _remove_from_fuzzy_index(fuzzy_index, current)
             current.update(
                 episode_number=ep.get('episode_number') or current['episode_number'],
                 title=effective_title,
                 published_at=effective_published,
             )
+            _add_to_fuzzy_index(fuzzy_index, current)
             if effective_title and effective_published:
                 title_date_map[(effective_title, effective_published)] = ep['id']
         except sqlite3.OperationalError:
@@ -1529,6 +1676,7 @@ class EpisodeMixin:
             status=EpisodeStatus.DISCOVERED.value,
             processed_file=None,
             processed_at=None,
+            processed_size_bytes=None,
             original_duration=None,
             new_duration=None,
             ads_removed=0,

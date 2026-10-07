@@ -1,4 +1,5 @@
 """Transcription using Faster Whisper."""
+import contextvars
 import io
 import json
 from datetime import timedelta
@@ -12,18 +13,21 @@ import subprocess
 import threading
 import time
 import wave
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass, field, replace
 
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import database
+import failover
 import run_context
-from run_context import run_in_worker_thread
 from user_agent import download_user_agent
-from utils.audio import get_audio_duration, mean_volume_db
+import utils.audio
 from utils.errors import (
     ServiceUnavailableError, AudioTooLargeError, AudioExtractionError,
     AudioExtractionTimeout, LocalTranscriptionUnavailableError, ModelLoadError,
+    TranscriptionRejectedError,
 )
 from utils.text import transcript_gaps
 from utils.time import format_vtt_timestamp, parse_iso_utc, utc_now, utc_now_iso
@@ -37,7 +41,7 @@ from utils.safe_http import (
     ResponseTooLargeError,
 )
 from utils.rate_limit import parse_retry_after
-from utils.subprocess_registry import tracked_run
+import utils.subprocess_registry
 from utils.ffmpeg_run import SAFE_MEDIA_INPUT_ARGS
 from utils.ttl_cache import TTLCache
 from whisper_pool import get_pool
@@ -103,6 +107,10 @@ def _local_unavailable_message() -> str:
     )
 
 
+def local_transcription_available() -> bool:
+    return _LOCAL_IMPORT_ERROR is None
+
+
 def _require_local_transcription() -> None:
     if _LOCAL_IMPORT_ERROR is not None:
         raise LocalTranscriptionUnavailableError(_local_unavailable_message())
@@ -127,15 +135,48 @@ BATCH_SIZE_TIERS = [
     (120 * 60, 8),      # 90-120 min: batch_size=8
 ]
 
-# Bounded admission for local (in-process) CUDA transcription. A single GPU
-# holds one Whisper model at a time (WhisperModelSingleton); two concurrent
-# local transcriptions would each allocate batched-inference memory against
-# the same device and OOM each other. This is unrelated to whisper_pool
-# (bounded admission for the remote API backend only) and to LLM provider
-# budgets/holds: it guards local GPU memory specifically. CPU transcription
-# is unaffected (no shared VRAM to protect).
+# Limit concurrent CUDA decodes to protect shared model memory; CPU work is unaffected.
 GPU_TRANSCRIBE_MAX_CONCURRENT = max(1, int(os.getenv('GPU_TRANSCRIBE_MAX_CONCURRENT', '1')))
 _GPU_ADMISSION_SEMAPHORE = threading.Semaphore(GPU_TRANSCRIBE_MAX_CONCURRENT)
+
+
+_local_activity = threading.Condition()
+_local_decode_count = 0
+_local_probe_active = False
+
+
+@contextmanager
+def _local_decode_activity():
+    global _local_decode_count
+    with _local_activity:
+        _local_activity.wait_for(lambda: not _local_probe_active)
+        _local_decode_count += 1
+    try:
+        yield
+    finally:
+        with _local_activity:
+            _local_decode_count -= 1
+            _local_activity.notify_all()
+
+
+@contextmanager
+def _idle_local_probe():
+    global _local_probe_active
+    with _local_activity:
+        admitted = not _local_probe_active and _local_decode_count == 0
+        if admitted:
+            _local_probe_active = True
+    try:
+        if not admitted:
+            yield False
+            return
+        with _all_admission_permits() as free:
+            yield free
+    finally:
+        if admitted:
+            with _local_activity:
+                _local_probe_active = False
+                _local_activity.notify_all()
 
 
 def _gpu_admission_acquire(device: str) -> bool:
@@ -169,7 +210,7 @@ def _all_admission_permits():
 
 def unload_whisper_if_idle() -> bool:
     """Unload the local model when no transcription holds an admission permit; True if one was unloaded."""
-    with _all_admission_permits() as free:
+    with _idle_local_probe() as free:
         if not free or not WhisperModelSingleton.is_loaded():
             return False
         WhisperModelSingleton.unload_model()
@@ -196,22 +237,19 @@ def _record_local_transcription_outcome(outcome: dict) -> None:
     record['backend'] = WHISPER_BACKEND_LOCAL
     if not record.get('device'):
         record['device'] = resolve_whisper_device()
-    record['observed_at'] = utc_now_iso()
+    record['observed_at'] = utc_now().isoformat().replace('+00:00', 'Z')
     with _local_transcription_state_lock:
         _last_local_transcription_outcome = record
-    # Inline import: database imports modules that import transcriber.
-    from database import Database
     try:
-        Database().set_setting(LOCAL_OUTCOME_SETTING, json.dumps(record))
+        database.Database().set_setting(LOCAL_OUTCOME_SETTING, json.dumps(record))
     except Exception as e:
         logger.debug(f"Could not persist local transcription outcome: {e}")
 
 
 def _read_persisted_local_outcome() -> dict | None:
     """Last local outcome any worker persisted, or None if unreadable."""
-    from database import Database
     try:
-        raw = Database().get_setting(LOCAL_OUTCOME_SETTING)
+        raw = database.Database().get_setting(LOCAL_OUTCOME_SETTING)
     except Exception as e:
         logger.debug(f"Could not read local transcription outcome: {e}")
         return None
@@ -225,18 +263,15 @@ def _read_persisted_local_outcome() -> dict | None:
 
 
 def _latest_local_outcome(device: str) -> dict | None:
-    """Newest outcome for `device` across this process and shared state.
-
-    A record from another device (the setting changed since) says nothing
-    about the device now configured, so it is ignored rather than reported.
-    """
+    """Newest persisted or in-process outcome for the configured device."""
     with _local_transcription_state_lock:
         in_process = dict(_last_local_transcription_outcome) if _last_local_transcription_outcome else None
     candidates = [c for c in (in_process, _read_persisted_local_outcome())
                   if c and c.get('device') == device]
     if not candidates:
         return None
-    return max(candidates, key=lambda c: c.get('observed_at') or '')
+    return max(candidates, key=lambda c: (stamp.timestamp()
+               if (stamp := parse_iso_utc(c.get('observed_at'))) else 0))
 
 
 def get_local_transcriber_health() -> dict:
@@ -271,6 +306,40 @@ def get_local_transcriber_health() -> dict:
         'available': outcome is None or outcome.get('outcome') != 'failed',
         'lastOutcome': last_outcome,
     }
+
+
+def probe_local_transcription(request_config: dict) -> dict:
+    """Probe the captured local config without interrupting active decodes."""
+    if not local_transcription_available():
+        return {'reachable': False, 'status': None, 'detail': 'Local stack unavailable'}
+    load_config = {'model': request_config['local_model'], 'device': request_config['device'],
+                   'compute_type': request_config['compute_type']}
+    outcome = _latest_local_outcome(load_config['device'])
+    failed = (outcome and outcome.get('outcome') == 'failed'
+              and outcome.get('model') in (None, load_config['model']))
+    if not request_config.get('recover_runtime') and not failed:
+        return {'reachable': True, 'status': None, 'detail': 'Local stack available'}
+    # Only the background queue thread owns the model; a web request thread
+    # loading one would hold VRAM it never frees, even on the leader process.
+    if not run_context.in_background_thread():
+        return {'reachable': None, 'status': None, 'deferred': True,
+                'detail': 'Diagnostic decode runs in the background worker'}
+    with _idle_local_probe() as free:
+        if not free:
+            return {'reachable': None, 'status': None, 'detail': 'Local transcription busy'}
+        try:
+            model, _pipeline = WhisperModelSingleton.get_instance(load_config=load_config)
+            segments, _info = model.transcribe(
+                io.BytesIO(_probe_wav_bytes()), language='en', beam_size=1, vad_filter=False)
+            list(segments)
+        except Exception as exc:
+            logger.warning('Local recovery decode failed: %s', exc)
+            return {'reachable': False, 'status': None, 'detail': f'Local decode failed: {type(exc).__name__}'}
+    return {'reachable': True, 'status': None, 'detail': 'Local diagnostic decode succeeded',
+            'local_outcome': {'outcome': 'success', 'backend': WHISPER_BACKEND_LOCAL,
+                              'model': load_config['model'], 'device': load_config['device'],
+                              'compute_type': load_config['compute_type'],
+                              'observed_at': utc_now().isoformat().replace('+00:00', 'Z')}}
 
 
 def get_remote_transcriber_health() -> dict:
@@ -374,7 +443,7 @@ def extract_audio_chunk(
         # other ffmpeg call site does (#644): chunk size follows available GPU
         # memory, so a flat budget silently fails once chunks grow past it.
         timeout = (FFMPEG_LONG_TIMEOUT if preprocess else FFMPEG_CHUNK_TIMEOUT) + int(duration / 12)
-        result = tracked_run(cmd, capture_output=True, timeout=timeout)
+        result = utils.subprocess_registry.tracked_run(cmd, capture_output=True, timeout=timeout)
 
         if result.returncode == 0 and os.path.exists(output_path):
             logger.debug(f"Extracted chunk {start_time:.1f}s-{end_time:.1f}s to {output_path}")
@@ -533,7 +602,7 @@ class _ChunkPrefetcher:
             # run_in_worker_thread keeps the pool thread's ffmpeg log lines
             # inside the episode's run log.
             self._pending[bounds] = self._executor.submit(
-                run_in_worker_thread(extract_audio_chunk),
+                run_context.run_in_worker_thread(extract_audio_chunk),
                 self._audio_path, start, end, preprocess=True,
             )
 
@@ -629,12 +698,11 @@ def _get_whisper_settings() -> dict[str, str]:
         'skip_flac_compression': coerce_bool_setting(os.environ.get('SKIP_FLAC_COMPRESSION', 'false')),
         'api_timeout': _clamp_api_timeout(
             os.environ.get('WHISPER_API_TIMEOUT') or HTTP_TIMEOUT_WHISPER),
+        'max_attempts': 2,
+        'is_failover': False,
     }
     try:
-        # Inline import: Database depends on modules that import transcriber,
-        # causing a circular import if placed at module level.
-        from database import Database
-        db = Database()
+        db = database.Database()
         for setting_key, default_key in [
             ('whisper_backend', 'backend'),
             ('whisper_api_base_url', 'api_base_url'),
@@ -655,10 +723,67 @@ def _get_whisper_settings() -> dict[str, str]:
 
         defaults['api_timeout'] = _clamp_api_timeout(db.get_setting_float(
             'whisper_api_timeout_seconds', defaults['api_timeout']))
+        defaults['max_attempts'] = db.get_setting_int(
+            'whisper_max_attempts', defaults['max_attempts'])
     except Exception as e:
         logger.warning(f"Could not read whisper settings from DB, using env defaults: {e}")
 
     return defaults
+
+
+def _get_failover_whisper_settings() -> dict[str, str]:
+    """Return standby settings, inheriting blank language and max attempts."""
+    active = _get_whisper_settings()
+    defaults = {
+        'backend': WHISPER_BACKEND_API,
+        'api_base_url': '',
+        'api_key': '',
+        'api_model': 'whisper-1',
+        'language': active['language'],
+        'skip_flac_compression': active['skip_flac_compression'],
+        'api_timeout': active['api_timeout'],
+        'max_attempts': active['max_attempts'],
+        'local_model': '',
+        'is_failover': True,
+    }
+    try:
+        db = database.Database()
+        backend = db.get_setting('failover_whisper_backend')
+        if backend:
+            defaults['backend'] = backend
+        defaults['local_model'] = db.get_setting('failover_whisper_model') or ''
+        base_url = db.get_setting('failover_whisper_api_base_url')
+        if base_url:
+            defaults['api_base_url'] = base_url
+        api_key = db.get_secret('failover_whisper_api_key')
+        if api_key:
+            defaults['api_key'] = api_key
+        api_model = db.get_setting('failover_whisper_api_model')
+        if api_model:
+            defaults['api_model'] = api_model
+        language = db.get_setting('failover_whisper_language')
+        if language:
+            defaults['language'] = language
+
+        defaults['api_timeout'] = _clamp_api_timeout(db.get_setting_float(
+            'failover_whisper_api_timeout_seconds', defaults['api_timeout']))
+        defaults['max_attempts'] = db.get_setting_int(
+            'failover_whisper_max_attempts', active['max_attempts'])
+    except Exception as e:
+        logger.warning(f"Could not read failover whisper settings from DB, using defaults: {e}")
+
+    return defaults
+
+
+def active_whisper_settings() -> dict[str, str]:
+    """Use eligible active standby settings, otherwise the primary settings."""
+    try:
+        if (failover.is_active(failover.TARGET_WHISPER)
+                and failover.is_configured(failover.TARGET_WHISPER)):
+            return _get_failover_whisper_settings()
+    except Exception as e:
+        logger.warning(f"Could not check whisper failover state: {e}")
+    return _get_whisper_settings()
 
 
 def _clamp_api_timeout(value) -> float:
@@ -692,31 +817,66 @@ def _connection_test_timeout(whisper_settings: dict = None) -> float:
                min(_api_timeout(settings), CONNECTION_TEST_TIMEOUT_CEILING))
 
 
-def check_whisper_connectivity(timeout: float = 5.0) -> bool:
-    """Availability probe for the offline queue re-drive (#482).
+def _trigger_whisper_failover(original: Exception) -> None:
+    """Trigger whisper failover; re-raise `original` when no failover ends up active, so the episode defers."""
+    target = failover.TARGET_WHISPER
+    if not failover.trigger(target, str(original)) and not failover.is_active(target):
+        raise original
 
-    Local backend (or an unconfigured API URL) never blocks a re-drive: those
-    failure modes are not connectivity. For the API backend, any HTTP response
-    with status below 500 proves the endpoint is up (401/404 included).
+
+def _switch_to_failover_whisper(original: Exception) -> dict:
+    """Trigger whisper failover and return the standby settings, logging the switch to the run log."""
+    _trigger_whisper_failover(original)
+    fo = _get_failover_whisper_settings()
+    ctx = run_context.current()
+    tag = f"[{ctx.key}] " if ctx is not None else ''
+    target = (safe_url_for_log(fo['api_base_url']) if fo['backend'] == WHISPER_BACKEND_API
+              else f"model {fo.get('local_model') or 'inherited'}")
+    logger.warning(f"{tag}Transcription switching to failover transcriber {fo['backend']} {target}")
+    return fo
+
+
+def _note_whisper_settings(whisper_settings: dict) -> None:
+    """Mark the current run as having used the failover transcriber."""
+    if whisper_settings.get('is_failover'):
+        ctx = run_context.current()
+        if ctx is not None:
+            ctx.note_whisper_failover()
+
+
+def is_whisper_failover_trigger(exc: Exception) -> bool:
+    """Errors that mean this transcriber config cannot serve the episode right now."""
+    return isinstance(exc, (ServiceUnavailableError, TranscriptionRejectedError,
+                            ModelLoadError, LocalTranscriptionUnavailableError))
+
+
+# Local-backend model override while running on the failover config (#806);
+# consulted by WhisperModelSingleton.get_configured_model() ahead of the DB
+# setting. Set only around a local transcription that uses failover settings.
+_local_model_override: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    'whisper_local_model_override', default=None)
+
+# Sentinel: a chunk plan's failure budget was blown with no failover switch
+# available, so the caller aborts with no transcript (#806).
+_ABORT_CHUNK_PLAN = object()
+
+
+@dataclass(frozen=True)
+class _ChunkPlanContext:
+    """Per-episode inputs shared by every pass of a chunk plan.
+
+    switch_event: set once this pass decides to switch backend or abort, so
+    chunks already in flight stop before extraction or upload instead of
+    wasting work on a result that will be discarded (#806). Scoped to one
+    pass: a caller rerunning remaining chunks on a new backend builds a
+    fresh context rather than reusing this one.
     """
-    settings = _get_whisper_settings()
-    if settings['backend'] != WHISPER_BACKEND_API or not settings['api_base_url']:
-        return True
-    url = f"{settings['api_base_url'].rstrip('/')}/models"
-    headers = {}
-    if settings['api_key']:
-        headers['Authorization'] = f"Bearer {settings['api_key']}"
-    try:
-        response = safe_get(
-            url,
-            trust=URLTrust.OPERATOR_CONFIGURED,
-            timeout=timeout,
-            headers=headers,
-        )
-        return response.status_code < 500
-    except Exception as e:
-        logger.debug(f"Whisper connectivity probe failed: {e}")
-        return False
+    audio_path: str
+    language_override: str | None
+    prefix: str
+    max_workers: int
+    max_failed_chunks: int
+    switch_event: threading.Event = field(default_factory=threading.Event)
 
 
 _HEALTH_INSTANCE_FIELDS = (
@@ -985,7 +1145,7 @@ def _probe_upload(skip_flac_compression: bool) -> tuple[str, bytes]:
             fh.write(wav)
         fd, flac_path = tempfile.mkstemp(suffix='.flac')
         os.close(fd)
-        encode = tracked_run(
+        encode = utils.subprocess_registry.tracked_run(
             ['ffmpeg', *SAFE_MEDIA_INPUT_ARGS, '-y', '-i', wav_path, '-c:a', 'flac', flac_path],
             capture_output=True, timeout=FFMPEG_SHORT_TIMEOUT,
         )
@@ -1093,8 +1253,7 @@ def _get_chunk_settings() -> dict[str, int]:
         'chunk_overlap_seconds': CHUNK_OVERLAP_SECONDS,
     }
     try:
-        from database import Database
-        db = Database()
+        db = database.Database()
         for setting_key, default_key in [
             ('transcribe_max_chunk_seconds', 'max_chunk_seconds'),
             ('transcribe_concurrent_chunks', 'concurrent_chunks'),
@@ -1137,12 +1296,16 @@ def _log_prefix() -> str:
 _CANONICAL_COMPUTE_TYPES = {t: t for t in WHISPER_COMPUTE_TYPES}
 
 
+def canonical_compute_type(raw: str | None) -> str:
+    """The compute type the runtime loads for a raw setting value."""
+    return _CANONICAL_COMPUTE_TYPES.get(raw or WHISPER_COMPUTE_TYPE_DEFAULT, WHISPER_COMPUTE_TYPE_DEFAULT)
+
+
 def _get_whisper_compute_type() -> str:
     """Read WHISPER_COMPUTE_TYPE (DB preferred, env fallback), validated."""
     raw = os.environ.get('WHISPER_COMPUTE_TYPE', WHISPER_COMPUTE_TYPE_DEFAULT)
     try:
-        from database import Database
-        db_value = Database().get_setting('whisper_compute_type')
+        db_value = database.Database().get_setting('whisper_compute_type')
         if db_value:
             raw = db_value
     except Exception as e:
@@ -1240,13 +1403,17 @@ class WhisperModelSingleton:
     _base_model = None
     _current_model_name = None
     _needs_reload = False
+    _load_config = None
 
     @classmethod
     def get_configured_model(cls) -> str:
-        """Get the configured model from database settings."""
+        """Get the configured model: the failover override while set (#806),
+        else the database setting."""
+        override = _local_model_override.get()
+        if override:
+            return override
         try:
-            from database import Database
-            db = Database()
+            db = database.Database()
             model = db.get_setting('whisper_model')
             if model:
                 return model
@@ -1262,21 +1429,6 @@ class WhisperModelSingleton:
         logger.info("Whisper model marked for reload")
 
     @classmethod
-    def _should_reload(cls) -> str | None:
-        """Check if model needs to be reloaded.
-
-        Returns the configured model name if a reload is needed, None otherwise.
-        This avoids a duplicate DB query in get_instance().
-        """
-        configured = cls.get_configured_model()
-        if cls._needs_reload:
-            return configured
-        if cls._current_model_name and cls._current_model_name != configured:
-            logger.info(f"Model changed from {cls._current_model_name} to {configured}")
-            return configured
-        return None
-
-    @classmethod
     def unload_model(cls):
         """Unload the current model and free GPU memory.
 
@@ -1290,6 +1442,7 @@ class WhisperModelSingleton:
             cls._base_model = None
             cls._current_model_name = None
             cls._needs_reload = False
+            cls._load_config = None
 
             # Force garbage collection and clear CUDA cache
             clear_gpu_memory()
@@ -1300,24 +1453,19 @@ class WhisperModelSingleton:
         return cls._instance is not None or cls._base_model is not None
 
     @classmethod
-    def get_instance(cls) -> tuple[WhisperModel, BatchedInferencePipeline]:
-        """
-        Get both the base model and batched pipeline instance.
-        Will reload if the configured model has changed.
-        Returns:
-            Tuple[WhisperModel, BatchedInferencePipeline]: Base model for operations like language detection,
-                                                          and batched pipeline for transcription
-        """
-        # Check if we need to reload
-        reload_model = cls._should_reload() if cls._instance is not None else None
-        if reload_model:
+    def get_instance(cls, *, load_config: dict | None = None) -> tuple[WhisperModel, BatchedInferencePipeline]:
+        """Return the local model and pipeline, reloading for a captured probe config when needed."""
+        requested_config = load_config or {
+            'model': cls.get_configured_model(), 'device': resolve_whisper_device(),
+            'compute_type': _get_whisper_compute_type()}
+        if cls._instance is not None and (cls._needs_reload or cls._load_config != requested_config):
             cls.unload_model()
 
         if cls._instance is None:
             _require_local_transcription()
-            model_size = reload_model or cls.get_configured_model()
-            device = resolve_whisper_device()
-            configured_compute_type = _get_whisper_compute_type()
+            model_size = requested_config['model']
+            device = requested_config['device']
+            configured_compute_type = requested_config['compute_type']
 
             # Resolve device and the compute type 'auto' falls back to.
             if device == "cuda":
@@ -1381,6 +1529,7 @@ class WhisperModelSingleton:
                 cls._base_model
             )
             cls._current_model_name = model_size
+            cls._load_config = requested_config
             cls._needs_reload = False
             logger.info(
                 f"Whisper model '{model_size}' and batched pipeline initialized "
@@ -1398,14 +1547,8 @@ class WhisperModelSingleton:
 
     @classmethod
     def get_batched_pipeline(cls) -> BatchedInferencePipeline:
-        """
-        Get just the batched pipeline for transcription
-        Returns:
-            BatchedInferencePipeline: Batched pipeline for efficient transcription
-        """
-        if cls._instance is None or cls._should_reload():
-            cls.get_instance()
-        return cls._instance
+        """Return the pipeline after validating the current requested configuration."""
+        return cls.get_instance()[1]
 
     @classmethod
     def get_current_model_name(cls) -> str | None:
@@ -1558,7 +1701,7 @@ class Transcriber:
                 fd, flac_path = tempfile.mkstemp(suffix='.flac')
                 os.close(fd)
                 try:
-                    ffmpeg_result = tracked_run(
+                    ffmpeg_result = utils.subprocess_registry.tracked_run(
                         ['ffmpeg', *SAFE_MEDIA_INPUT_ARGS, '-y', '-i', transcribe_path, '-c:a', 'flac', flac_path],
                         capture_output=True, timeout=FFMPEG_SHORT_TIMEOUT,
                     )
@@ -1618,7 +1761,7 @@ class Transcriber:
             # response body signals that rejection.
             response = None
             last_request_exc = None
-            max_attempts = 2
+            max_attempts = int(whisper_settings.get('max_attempts') or 2)
             granularity_modes = (
                 ['segment', 'word'],
                 ['segment'],
@@ -1650,6 +1793,7 @@ class Transcriber:
                                         retry_deadline = now + _api_timeout(whisper_settings)
                                     else:
                                         retry_deadline += now - permit_wait_start
+                                    _note_whisper_settings(whisper_settings)
                                     response = safe_post(
                                         url,
                                         trust=URLTrust.OPERATOR_CONFIGURED,
@@ -1676,7 +1820,7 @@ class Transcriber:
                                 logger.warning(
                                     "%sWhisper API still busy (429) after the "
                                     "retry deadline; giving up", _log_prefix())
-                                return None
+                                raise TranscriptionRejectedError(429, 'retry deadline exceeded')
                             # Floor so a Retry-After: 0 (or absent) header still yields.
                             parsed_retry_after = parse_retry_after(
                                 (response.headers or {}).get('Retry-After'), max_seconds=300.0)
@@ -1688,7 +1832,7 @@ class Transcriber:
                             time.sleep(retry_after)
                             response = None
                             continue
-                        if response.status_code < 500:
+                        if response.status_code < 500 and response.status_code != 408:
                             break
                         logger.warning(
                             "Whisper API attempt %d/%d returned %d",
@@ -1725,7 +1869,9 @@ class Transcriber:
                 break
 
             if response is None or response.status_code != 200:
-                if response is not None and response.status_code >= 500:
+                if response is not None and response.status_code in (401, 402, 403, 404, 429):
+                    raise TranscriptionRejectedError(response.status_code)
+                if response is not None and (response.status_code == 408 or response.status_code >= 500):
                     raise ServiceUnavailableError(
                         'whisper',
                         f"Whisper API returned {response.status_code} after retries")
@@ -1781,7 +1927,7 @@ class Transcriber:
 
             return result
 
-        except ServiceUnavailableError:
+        except (ServiceUnavailableError, TranscriptionRejectedError):
             raise
         except Exception as e:
             logger.error(f"API transcription failed: {e}")
@@ -1813,7 +1959,7 @@ class Transcriber:
 
         The batched pipeline can skip the start of a clip; this path is for short repair spans.
         """
-        whisper_settings = _get_whisper_settings()
+        whisper_settings = active_whisper_settings()
         if whisper_settings['backend'] == WHISPER_BACKEND_API:
             return self._transcribe_via_api(
                 audio_path, whisper_settings, language_override=language_override,
@@ -1822,29 +1968,31 @@ class Transcriber:
         language_setting = _effective_language(language_override, whisper_settings)
         language = None if language_setting == 'auto' else (language_setting or 'en')
         preprocessed_path = None
-        acquired = _gpu_admission_acquire(resolve_whisper_device())
-        try:
-            preprocessed_path = self.preprocess_audio(audio_path)
-            model, _batched = WhisperModelSingleton.get_instance()
-            segments, _info = model.transcribe(
-                preprocessed_path or audio_path, language=language, beam_size=5,
-                word_timestamps=True, vad_filter=False)
-            return [{
-                'start': seg.start,
-                'end': seg.end,
-                'text': seg.text.strip(),
-                'words': [{'word': w.word, 'start': w.start, 'end': w.end}
-                          for w in seg.words or []],
-            } for seg in segments]
-        except ModelLoadError:
-            raise
-        except Exception as e:
-            logger.error(f"{_log_prefix()}Sequential transcription failed: {e}")
-            return None
-        finally:
-            if acquired:
-                _gpu_admission_release()
-            _unlink_quiet(preprocessed_path)
+        with _local_decode_activity():
+            acquired = _gpu_admission_acquire(resolve_whisper_device())
+            try:
+                preprocessed_path = self.preprocess_audio(audio_path)
+                model, _batched = WhisperModelSingleton.get_instance()
+                _note_whisper_settings(whisper_settings)
+                segments, _info = model.transcribe(
+                    preprocessed_path or audio_path, language=language, beam_size=5,
+                    word_timestamps=True, vad_filter=False)
+                return [{
+                    'start': seg.start,
+                    'end': seg.end,
+                    'text': seg.text.strip(),
+                    'words': [{'word': w.word, 'start': w.start, 'end': w.end}
+                              for w in seg.words or []],
+                } for seg in segments]
+            except ModelLoadError:
+                raise
+            except Exception as e:
+                logger.error(f"{_log_prefix()}Sequential transcription failed: {e}")
+                return None
+            finally:
+                if acquired:
+                    _gpu_admission_release()
+                _unlink_quiet(preprocessed_path)
 
     def transcribe_span_no_vad(self, audio_path: str, start: float, end: float,
                                language_override: str | None, flag: str,
@@ -1858,7 +2006,7 @@ class Transcriber:
         label = _NOVAD_LABELS[flag]
         prefix = _log_prefix()
         if quiet_db is not None:
-            volume = mean_volume_db(audio_path, start, end - start)
+            volume = utils.audio.mean_volume_db(audio_path, start, end - start)
             if volume is None or volume < quiet_db:
                 reading = 'unreadable' if volume is None else f'{volume:.1f} dB'
                 logger.info(f"{prefix}{label} {start:.1f}s-{end:.1f}s mean volume {reading}; skipping")
@@ -1904,7 +2052,7 @@ class Transcriber:
     @staticmethod
     def unload_after_repair() -> None:
         """Free the model the repair decodes reloaded after transcribe_chunked unloaded it."""
-        with _all_admission_permits() as free:
+        with _idle_local_probe() as free:
             if not free:
                 logger.debug("Skipping the post-repair Whisper unload: a local transcription holds the GPU")
                 return
@@ -2043,7 +2191,7 @@ class Transcriber:
 
         Delegates to utils.audio.get_audio_duration for consistent implementation.
         """
-        duration = get_audio_duration(audio_path)
+        duration = utils.audio.get_audio_duration(audio_path)
         if duration is not None:
             logger.info(f"Audio duration: {duration:.1f}s ({duration/60:.1f} min)")
         return duration
@@ -2064,11 +2212,9 @@ class Transcriber:
         """Stored ceiling for this device as {'size', 'recorded_at'}, or None
         when unset, malformed, or recorded for a different device. recorded_at
         is None for pre-2.96.0 payloads, which read as expired."""
-        # Inline import: see _get_whisper_settings above, Database would be a
-        # circular import at module level.
-        from database import Database
+
         try:
-            raw = Database().get_setting(self.BATCH_CEILING_SETTING)
+            raw = database.Database().get_setting(self.BATCH_CEILING_SETTING)
         except Exception as e:
             logger.debug(f"Could not read batch size ceiling: {e}")
             return None
@@ -2091,19 +2237,11 @@ class Transcriber:
         return (recorded_at is None
                 or utc_now() - recorded_at > timedelta(days=self.BATCH_CEILING_TTL_DAYS))
 
-    def _batch_size_ceiling(self) -> int | None:
-        """Unexpired stored ceiling as a positive int, else None."""
-        entry = self._read_ceiling()
-        if entry is None or self._ceiling_expired(entry):
-            return None
-        return entry['size']
-
     def record_batch_size_ceiling(self, batch_size: int) -> None:
         """Persist batch_size as this device's ceiling. Called only after a
         completed run, since only completion proves a size fits; ratchets down
         against an unexpired ceiling and keeps its timestamp so it still ages out.
         """
-        from database import Database
         candidate = max(1, int(batch_size))
         entry = self._read_ceiling()
         live = entry if entry and not self._ceiling_expired(entry) else None
@@ -2113,7 +2251,7 @@ class Transcriber:
             'device': self._batch_ceiling_device(), 'size': value, 'recorded_at': recorded_at,
         })
         try:
-            Database().set_setting(self.BATCH_CEILING_SETTING, payload)
+            database.Database().set_setting(self.BATCH_CEILING_SETTING, payload)
         except Exception as e:
             logger.debug(f"Could not persist batch size ceiling: {e}")
 
@@ -2169,7 +2307,7 @@ class Transcriber:
             # e.g. 50MB file = 500s, 100MB = 1000s, floor at FFMPEG_LONG_TIMEOUT (300s)
             file_size_mb = os.path.getsize(input_path) / (1024 * 1024)
             preprocess_timeout = max(FFMPEG_LONG_TIMEOUT, int(file_size_mb * 10))
-            result = tracked_run(cmd, capture_output=True, timeout=preprocess_timeout)
+            result = utils.subprocess_registry.tracked_run(cmd, capture_output=True, timeout=preprocess_timeout)
             if result.returncode == 0:
                 logger.info(f"Audio preprocessed: {input_path} -> {output_path}")
                 success = True
@@ -2333,26 +2471,12 @@ class Transcriber:
         language_override: str | None = None,
         vad_filter: bool = True,
         preprocessed: bool = False,
+        whisper_settings: dict[str, str] | None = None,
     ) -> list[dict]:
-        """Transcribe audio file using Faster Whisper with batched pipeline.
-
-        Uses adaptive batch sizing based on audio duration to prevent CUDA OOM errors.
-        Automatically retries with smaller batch size on OOM.
-
-        `language_override` (when non-empty) takes precedence over the global
-        whisper_language setting for this call only -- used to honor per-feed
-        language overrides without mutating shared settings.
-
-        ``vad_filter=False`` disables Whisper's VAD (tail re-transcription,
-        spec 1.2). The API backend forwards it as a `vad_filter=false` form
-        field; servers without the switch ignore it.
-
-        ``preprocessed=True`` means the caller already applied the preprocess
-        filter chain (chunks from extract_audio_chunk(preprocess=True)), so
-        the redundant preprocess pass is skipped.
-        """
-        # Check whisper backend setting
-        whisper_settings = _get_whisper_settings()
+        """Transcribe with OOM retries; explicit settings pin the backend.
+        language_override replaces the global language; preprocessed skips filtering.
+        vad_filter is forwarded to either backend."""
+        whisper_settings = whisper_settings or active_whisper_settings()
         if whisper_settings['backend'] == WHISPER_BACKEND_API:
             return self._transcribe_via_api(
                 audio_path, whisper_settings,
@@ -2363,22 +2487,33 @@ class Transcriber:
         # Outside the try below so the actionable message is not swallowed.
         _require_local_transcription()
 
-        language_setting = _effective_language(language_override, whisper_settings)
-        transcribe_language = None if language_setting == 'auto' else (language_setting or 'en')
+        # Local decode under the failover config pins the configured failover
+        # model; reset in the finally below so later calls see the primary
+        # model again.
+        override_token = None
+        failover_local_model = (
+            whisper_settings.get('local_model') if whisper_settings.get('is_failover') else None)
+        if failover_local_model:
+            override_token = _local_model_override.set(failover_local_model)
 
-        preprocessed_path = None
-        # Defensive defaults: referenced in the stats recording below even if
-        # an exception hits before the real assignments further down.
-        device = None
-        batch_size = None
-        current_model = None
-        retry_count = 0
-        # Admission guard (module-level, see GPU_TRANSCRIBE_MAX_CONCURRENT):
-        # taken for the whole call so preprocessing and every retry attempt
-        # for this episode hold the device before another local transcription
-        # can start. Released in the finally below on every exit path.
-        gpu_admission_acquired = _gpu_admission_acquire(resolve_whisper_device())
+        activity = ExitStack()
         try:
+            preprocessed_path = None
+            # Defensive defaults: referenced in the stats recording below even if
+            # an exception hits before the real assignments further down.
+            device = None
+            batch_size = None
+            current_model = None
+            retry_count = 0
+            # Hold the device across preprocessing and retries; initialize the flag
+            # before acquisition so finally can handle failed device resolution.
+            gpu_admission_acquired = False
+            activity.enter_context(_local_decode_activity())
+            gpu_admission_acquired = _gpu_admission_acquire(resolve_whisper_device())
+
+            language_setting = _effective_language(language_override, whisper_settings)
+            transcribe_language = None if language_setting == 'auto' else (language_setting or 'en')
+
             # Get audio duration for adaptive batch sizing
             audio_duration = self.get_audio_duration(audio_path)
 
@@ -2440,6 +2575,7 @@ class Transcriber:
                     # _should_detect_foreign_language so it only runs when the audio
                     # is English; on non-English podcasts it would false-positive
                     # every segment.
+                    _note_whisper_settings(whisper_settings)
                     segments_generator, info = model.transcribe(
                         transcribe_path,
                         language=transcribe_language,
@@ -2593,6 +2729,9 @@ class Transcriber:
         finally:
             if gpu_admission_acquired:
                 _gpu_admission_release()
+            activity.close()
+            if override_token is not None:
+                _local_model_override.reset(override_token)
             # Clean up preprocessed file
             if preprocessed_path and os.path.exists(preprocessed_path):
                 try:
@@ -2601,72 +2740,30 @@ class Transcriber:
                 except OSError:
                     pass
 
-    def _transcribe_chunked_parallel_api(
+    def _run_chunk_plan(
         self,
-        audio_path: str,
-        duration: float,
+        ctx: _ChunkPlanContext,
+        plan_subset: list[tuple[int, float, float]],
         whisper_settings: dict[str, str],
-        language_override: str | None = None,
-    ) -> list[dict] | None:
-        """Parallel chunked transcription for remote API backends.
-
-        Submits all chunks to a ThreadPoolExecutor; preserves chronological
-        ordering at merge time so merge_overlapping_segments dedupes the
-        overlap zone exactly as in the sequential path. Failure tolerance
-        matches the sequential loop (~20% chunks may fail before abort).
-        """
-        chunk_settings = _get_chunk_settings()
-        chunk_duration = chunk_settings['max_chunk_seconds']
-        overlap = chunk_settings['chunk_overlap_seconds']
-        max_workers = get_pool().chunk_workers(chunk_settings['concurrent_chunks'])
-        prefix = _log_prefix()
-
-        # Single-shot if entire audio fits in one chunk
-        if duration <= chunk_duration:
-            logger.info(
-                f"Audio duration {duration/60:.1f}min fits in one chunk "
-                f"({chunk_duration}s), single-shot API transcription"
-            )
-            return self.transcribe(audio_path, language_override=language_override)
-
-        # Build chunk plan: list of (idx, start, end_with_overlap)
-        plan: list[tuple[int, float, float]] = []
-        chunk_start = 0.0
-        idx = 0
-        while chunk_start < duration:
-            chunk_end = min(chunk_start + chunk_duration, duration)
-            chunk_end_with_overlap = (
-                min(chunk_end + overlap, duration)
-                if chunk_end < duration else chunk_end
-            )
-            plan.append((idx, chunk_start, chunk_end_with_overlap))
-            idx += 1
-            chunk_start = chunk_end
-
-        num_chunks = len(plan)
-        max_failed_chunks = max(1, num_chunks // 5)
-        logger.info(
-            f"Starting parallel chunked transcription: {duration/60:.1f} min "
-            f"in {num_chunks} chunks (chunk_size={chunk_duration}s, "
-            f"overlap={overlap}s, workers={max_workers})"
-        )
-
-        connectivity_errors: list[ServiceUnavailableError] = []
-        # Chunk indexes whose ffmpeg extract failed (before any API call).
-        # list.append is thread-safe; used so an abort can name local
-        # extraction as the cause instead of the generic transcription
-        # failure that sent #556's reporter debugging a healthy provider.
+        results: list[list[dict] | None],
+        stop_on_connectivity_error: bool,
+    ) -> tuple[object, list[Exception]]:
+        """Fill indexed results; return a failover chunk, _ABORT_CHUNK_PLAN, or None."""
+        audio_path, language_override, prefix = ctx.audio_path, ctx.language_override, ctx.prefix
+        max_failed_chunks = ctx.max_failed_chunks
+        # Per pass, so each pass classifies on its own failures; stragglers from
+        # an aborted pass keep appending only to that pass's lists.
+        connectivity_errors: list[Exception] = []
+        # Chunks whose ffmpeg extract failed before any API call, so an abort
+        # can name local extraction as the cause (#556).
         extraction_failures: list[int] = []
-        # Subset of the above that ran out of clock rather than failing to
-        # decode, so the abort message does not blame the source file (#644).
+        # Subset of the above that ran out of clock rather than failing to decode (#644).
         extraction_timeouts: list[int] = []
-
-        # One ffmpeg pass per chunk: extraction applies the preprocess filter
-        # chain, and (unless the operator opted out of FLAC compression)
-        # encodes straight to FLAC ready for upload.
         extract_as_flac = not bool(whisper_settings.get('skip_flac_compression', False))
 
         def _process_chunk(chunk_idx: int, c_start: float, c_end: float):
+            if ctx.switch_event.is_set():
+                return chunk_idx, None
             try:
                 chunk_path = extract_audio_chunk(
                     audio_path, c_start, c_end,
@@ -2682,6 +2779,8 @@ class Transcriber:
                 extraction_failures.append(chunk_idx)
                 return chunk_idx, None
             try:
+                if ctx.switch_event.is_set():
+                    return chunk_idx, None
                 segs = self._transcribe_via_api(
                     chunk_path, whisper_settings,
                     language_override=language_override,
@@ -2698,9 +2797,10 @@ class Transcriber:
                             word['start'] += c_start
                             word['end'] += c_start
                 return chunk_idx, segs
-            except ServiceUnavailableError as e:
+            except (ServiceUnavailableError, TranscriptionRejectedError) as e:
                 # list.append is thread-safe; recorded so an endpoint-down
-                # abort can defer the episode (#482) instead of failing it.
+                # abort can defer the episode (#482) or trigger failover (#806)
+                # instead of failing it.
                 logger.error(f"{prefix}Chunk {chunk_idx + 1} failed: {e}")
                 connectivity_errors.append(e)
                 return chunk_idx, None
@@ -2710,16 +2810,16 @@ class Transcriber:
             finally:
                 _unlink_quiet(chunk_path)
 
-        results: list[list[dict] | None] = [None] * num_chunks
         failed = 0
         # Managed manually (not `with`) so an early abort can return promptly:
         # a `with` block's __exit__ calls shutdown(wait=True), which would
         # re-block on the in-flight workers and defeat the short-circuit.
-        exe = ThreadPoolExecutor(max_workers=max_workers)
+        exe = ThreadPoolExecutor(max_workers=ctx.max_workers)
+        seen_connectivity = 0
         try:
             futures = [
-                exe.submit(run_in_worker_thread(_process_chunk), i, s, e)
-                for i, s, e in plan
+                exe.submit(run_context.run_in_worker_thread(_process_chunk), i, s, e)
+                for i, s, e in plan_subset
             ]
             for completed, fut in enumerate(as_completed(futures), 1):
                 chunk_idx, segs = fut.result()
@@ -2728,14 +2828,22 @@ class Transcriber:
                     failed += 1
                 logger.info(
                     f"{prefix}Chunk {chunk_idx + 1} complete "
-                    f"({completed}/{num_chunks}): "
+                    f"({completed}/{len(plan_subset)}): "
                     f"{len(segs) if segs else 0} segments"
                 )
+                # A connectivity failure switches backend immediately rather
+                # than waiting on the failure budget below (#806).
+                if (stop_on_connectivity_error and segs is None
+                        and len(connectivity_errors) > seen_connectivity):
+                    ctx.switch_event.set()
+                    return chunk_idx, connectivity_errors
+                seen_connectivity = len(connectivity_errors)
                 # Short-circuit like the sequential path: once the failure
                 # budget is blown the run can't succeed, so stop instead of
                 # burning a full HTTP timeout on each remaining doomed chunk.
                 # Returning here still runs the finally below (pool shutdown).
                 if failed > max_failed_chunks:
+                    ctx.switch_event.set()
                     logger.error(
                         f"{prefix}Too many failed chunks ({failed} > {max_failed_chunks}); "
                         f"aborting transcription early"
@@ -2760,12 +2868,111 @@ class Transcriber:
                             'Audio chunk extraction failed (ffmpeg could not '
                             'decode the source file); the transcription API '
                             'was not the problem')
-                    return None
+                    return _ABORT_CHUNK_PLAN, connectivity_errors
         finally:
             # wait=False: return without blocking on in-flight workers (they
             # finish in the background and self-clean temp files via
             # _process_chunk's finally). cancel_futures drops queued chunks.
             exe.shutdown(wait=False, cancel_futures=True)
+        return None, connectivity_errors
+
+    def _transcribe_chunked_parallel_api(
+        self,
+        audio_path: str,
+        duration: float,
+        whisper_settings: dict[str, str],
+        language_override: str | None = None,
+        allow_failover: bool = True,
+    ) -> list[dict] | None:
+        """Merge parallel API chunks; failover retains completed chunks only for the same backend."""
+        chunk_settings = _get_chunk_settings()
+        chunk_duration = chunk_settings['max_chunk_seconds']
+        overlap = chunk_settings['chunk_overlap_seconds']
+        max_workers = get_pool().chunk_workers(chunk_settings['concurrent_chunks'])
+        prefix = _log_prefix()
+
+        # Computed once up front (not only for the chunk-plan path below) so
+        # the single-shot branch can also switch on an outage instead of
+        # just propagating it (#806).
+        can_switch_on_outage = False
+        if allow_failover and not whisper_settings.get('is_failover'):
+            try:
+                can_switch_on_outage = failover.is_configured(failover.TARGET_WHISPER)
+            except Exception as e:
+                logger.warning(f"Could not check whisper failover configuration: {e}")
+
+        # Single-shot if entire audio fits in one chunk
+        if duration <= chunk_duration:
+            logger.info(
+                f"Audio duration {duration/60:.1f}min fits in one chunk "
+                f"({chunk_duration}s), single-shot API transcription"
+            )
+            try:
+                return self.transcribe(audio_path, language_override=language_override,
+                                       whisper_settings=whisper_settings)
+            except (ServiceUnavailableError, TranscriptionRejectedError) as e:
+                if not can_switch_on_outage:
+                    raise
+                fo = _switch_to_failover_whisper(e)
+                if fo['backend'] != whisper_settings['backend']:
+                    return self._transcribe_chunked_local(audio_path, duration, fo, language_override)
+                return self.transcribe(audio_path, language_override=language_override,
+                                       whisper_settings=fo)
+
+        # Build chunk plan: list of (idx, start, end_with_overlap)
+        plan: list[tuple[int, float, float]] = []
+        chunk_start = 0.0
+        idx = 0
+        while chunk_start < duration:
+            chunk_end = min(chunk_start + chunk_duration, duration)
+            # A sub-second tail is not worth its own chunk/upload; fold it
+            # into this one instead of leaving a near-empty final chunk.
+            if 0 < duration - chunk_end < 1.0:
+                chunk_end = duration
+            chunk_end_with_overlap = (
+                min(chunk_end + overlap, duration)
+                if chunk_end < duration else chunk_end
+            )
+            plan.append((idx, chunk_start, chunk_end_with_overlap))
+            idx += 1
+            chunk_start = chunk_end
+
+        num_chunks = len(plan)
+        max_failed_chunks = max(1, num_chunks // 5)
+        logger.info(
+            f"Starting parallel chunked transcription: {duration/60:.1f} min "
+            f"in {num_chunks} chunks (chunk_size={chunk_duration}s, "
+            f"overlap={overlap}s, workers={max_workers})"
+        )
+
+        results: list[list[dict] | None] = [None] * num_chunks
+        plan_ctx = _ChunkPlanContext(audio_path, language_override, prefix, max_workers, max_failed_chunks)
+
+        # Class-qualified: some callers pass a duck-typed self.
+        outage, connectivity_errors = Transcriber._run_chunk_plan(
+            self, plan_ctx, plan, whisper_settings, results,
+            stop_on_connectivity_error=can_switch_on_outage,
+        )
+
+        if isinstance(outage, int):
+            fo = _switch_to_failover_whisper(connectivity_errors[0])
+            if fo['backend'] != whisper_settings['backend']:
+                # Different backend type: discard the partial chunk results
+                # and rerun the whole episode on the failover backend.
+                return self._transcribe_chunked_local(audio_path, duration, fo, language_override)
+            # Same backend type: rerun only chunks still missing a result,
+            # keeping what this pass finished. No further switch, already failover.
+            remaining = [(i, s, e) for i, s, e in plan if results[i] is None]
+            # Fresh event for this pass: the first pass's switch_event is
+            # already set, which would make every remaining chunk bail.
+            retry_ctx = replace(plan_ctx, switch_event=threading.Event())
+            second, _ = Transcriber._run_chunk_plan(
+                self, retry_ctx, remaining, fo, results, stop_on_connectivity_error=False,
+            )
+            if second is _ABORT_CHUNK_PLAN:
+                return None
+        elif outage is _ABORT_CHUNK_PLAN:
+            return None
 
         # Merge in chronological order so merge_overlapping_segments
         # dedupes overlap zones the same way the sequential path does.
@@ -2783,8 +2990,8 @@ class Transcriber:
                     all_segments, chunk_segs, c_start, overlap
                 )
 
-        # The as_completed loop above already aborts (returns None) once the
-        # failure budget is blown, so by here failures are within budget; the
+        # Both passes above already abort (return None) once their failure
+        # budget is blown, so by here failures are within budget; the
         # surviving failed_chunks only feed the gap-summary log below.
         original_count = len(all_segments)
         all_segments = self.filter_hallucinations(all_segments)
@@ -2816,25 +3023,9 @@ class Transcriber:
         self,
         audio_path: str,
         language_override: str | None = None,
+        whisper_settings: dict[str, str] | None = None,
     ) -> list[dict]:
-        """Transcribe audio files with dynamic chunking to prevent OOM errors.
-
-        This method:
-        1. Checks available memory and model size to calculate optimal chunk duration
-        2. Processes audio in appropriately-sized chunks
-        3. Catches OOM errors and retries with smaller chunks
-        4. Clears GPU memory between chunks to limit peak usage
-
-        Args:
-            audio_path: Path to the audio file to transcribe
-            language_override: Optional per-feed language; when set, takes
-                precedence over the global whisper_language setting for this
-                call only (forwarded to each chunk's transcribe()).
-
-        Returns:
-            List of transcript segments with timestamps, or None on failure
-        """
-        # Get audio duration
+        """Choose API or local chunking using explicit settings, otherwise the active configuration."""
         duration = self.get_audio_duration(audio_path)
         if duration is None:
             logger.error("Cannot determine audio duration for chunked transcription")
@@ -2842,15 +3033,52 @@ class Transcriber:
 
         # Branch to parallel path for remote API backends - no GPU or
         # WhisperModelSingleton constraints, so chunks can run concurrently.
-        whisper_settings = _get_whisper_settings()
+        whisper_settings = whisper_settings or active_whisper_settings()
         if whisper_settings['backend'] == WHISPER_BACKEND_API:
             with get_pool().transcribing():
                 return self._transcribe_chunked_parallel_api(
                     audio_path, duration, whisper_settings,
                     language_override=language_override,
                 )
-        _require_local_transcription()
+        return self._transcribe_chunked_local(audio_path, duration, whisper_settings, language_override)
 
+    def _transcribe_chunked_local(
+        self,
+        audio_path: str,
+        duration: float,
+        whisper_settings: dict[str, str],
+        language_override: str | None = None,
+    ) -> list[dict] | None:
+        """Local chunked transcription; a trigger error reruns the whole episode
+        on the failover whisper config, once (#806)."""
+        failover_local_model = (
+            whisper_settings.get('local_model') if whisper_settings.get('is_failover') else None)
+        # Set for the whole body so chunk sizing also sees the failover model.
+        override_token = _local_model_override.set(failover_local_model) if failover_local_model else None
+        try:
+            _require_local_transcription()
+            with _local_decode_activity():
+                return self._transcribe_chunked_local_body(
+                    audio_path, duration, whisper_settings, language_override)
+        except Exception as e:
+            if not whisper_settings.get('is_failover') and is_whisper_failover_trigger(e):
+                if failover.is_configured(failover.TARGET_WHISPER):
+                    return self.transcribe_chunked(
+                        audio_path, language_override,
+                        whisper_settings=_switch_to_failover_whisper(e))
+            raise
+        finally:
+            if override_token is not None:
+                _local_model_override.reset(override_token)
+
+    def _transcribe_chunked_local_body(
+        self,
+        audio_path: str,
+        duration: float,
+        whisper_settings: dict[str, str],
+        language_override: str | None = None,
+    ) -> list[dict] | None:
+        """Decode memory-sized chunks, reducing their size after OOM."""
         # Get current model and device for memory calculation
         model_name = WhisperModelSingleton.get_configured_model()
         device = resolve_whisper_device()
@@ -2868,7 +3096,8 @@ class Transcriber:
                 f"({chunk_duration/60:.0f}min), trying regular transcription"
             )
             try:
-                result = self.transcribe(audio_path, language_override=language_override)
+                result = self.transcribe(audio_path, language_override=language_override,
+                                         whisper_settings=whisper_settings)
                 if result is not None:
                     return result
                 # If transcribe returns None but didn't raise, fall through to chunked
@@ -2967,6 +3196,7 @@ class Transcriber:
                     chunk_segments = self.transcribe(
                         chunk_path,
                         language_override=language_override, preprocessed=True,
+                        whisper_settings=whisper_settings,
                     )
 
                     if chunk_segments is None:

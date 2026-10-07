@@ -32,6 +32,13 @@ export function useLocalStorageState<T>(
 ): [T, (value: T | ((prev: T) => T)) => void] {
   const [value, setValue] = useState<T>(() => readStoredValue(key, defaultValue));
 
+  // Reload the new key before committing effects so feed navigation preserves its saved state.
+  const [prevKey, setPrevKey] = useState(key);
+  if (key !== prevKey) {
+    setPrevKey(key);
+    setValue(readStoredValue(key, defaultValue));
+  }
+
   useEffect(() => {
     try {
       localStorage.setItem(key, JSON.stringify(value));
@@ -42,5 +49,3 @@ export function useLocalStorageState<T>(
 
   return [value, setValue];
 }
-
-export default useLocalStorageState;

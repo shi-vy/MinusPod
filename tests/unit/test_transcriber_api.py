@@ -9,12 +9,14 @@ import requests as requests_lib
 
 from transcriber import (
     Transcriber, _get_whisper_settings, _get_whisper_compute_type,
-    check_whisper_connectivity, _api_timeout,
+    _api_timeout,
     _whisper_api_rejects_word_timestamps,
     _whisper_api_rejects_vad_filter,
     extract_audio_chunk,
     _ffmpeg_error_tail,
     PREPROCESS_AUDIO_FILTERS,
+    TranscriptionRejectedError,
+    is_whisper_failover_trigger,
 )
 from utils.errors import (
     ServiceUnavailableError, AudioExtractionError, AudioExtractionTimeout,
@@ -665,7 +667,7 @@ class TestSkipFlacCompressionSetting:
             ])
 
             with patch('transcriber.safe_post', return_value=mock_response), \
-                 patch('transcriber.tracked_run') as mock_tracked_run:
+                 patch('transcriber.utils.subprocess_registry.tracked_run') as mock_tracked_run:
                 transcriber = Transcriber()
                 transcriber.preprocess_audio = MagicMock(return_value=None)
                 result = transcriber._transcribe_via_api(
@@ -703,7 +705,7 @@ class TestSkipFlacCompressionSetting:
             ffmpeg_result.returncode = 1  # Force fallback path so no flac file lookup needed.
 
             with patch('transcriber.safe_post', return_value=mock_response), \
-                 patch('transcriber.tracked_run', return_value=ffmpeg_result) as mock_tracked_run:
+                 patch('transcriber.utils.subprocess_registry.tracked_run', return_value=ffmpeg_result) as mock_tracked_run:
                 transcriber = Transcriber()
                 transcriber.preprocess_audio = MagicMock(return_value=None)
                 transcriber._transcribe_via_api(
@@ -797,33 +799,71 @@ class TestWhisperServiceUnavailable:
             mock_post.assert_not_called()
 
 
-class TestCheckWhisperConnectivity:
-    """Availability probe used by the offline queue re-drive."""
+class TestTranscriptionRejected:
+    """401/402/403/404 from the whisper API refuse the request outright (#806)."""
 
-    def test_local_backend_always_reachable(self):
-        with patch('transcriber._get_whisper_settings',
-                   return_value={'backend': WHISPER_BACKEND_LOCAL,
-                                 'api_base_url': '', 'api_key': ''}):
-            assert check_whisper_connectivity() is True
+    def _make_settings(self, **overrides):
+        settings = {
+            'backend': WHISPER_BACKEND_API,
+            'api_base_url': 'http://localhost:8765/v1',
+            'api_key': '',
+            'api_model': 'whisper-1',
+            'skip_flac_compression': True,
+        }
+        settings.update(overrides)
+        return settings
 
-    def test_api_backend_reachable_below_500(self):
-        mock_response = MagicMock()
-        mock_response.status_code = 401
-        with patch('transcriber._get_whisper_settings',
-                   return_value={'backend': WHISPER_BACKEND_API,
-                                 'api_base_url': 'http://localhost:8765/v1',
-                                 'api_key': ''}), \
-             patch('transcriber.safe_get', return_value=mock_response):
-            assert check_whisper_connectivity() is True
+    def _make_audio_file(self):
+        f = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+        f.write(b'fake' * 512)
+        f.close()
+        return f.name
 
-    def test_api_backend_unreachable_on_exception(self):
-        with patch('transcriber._get_whisper_settings',
-                   return_value={'backend': WHISPER_BACKEND_API,
-                                 'api_base_url': 'http://localhost:8765/v1',
-                                 'api_key': ''}), \
-             patch('transcriber.safe_get',
-                   side_effect=requests_lib.exceptions.ConnectionError('refused')):
-            assert check_whisper_connectivity() is False
+    @pytest.mark.parametrize('status', [401, 402, 403, 404])
+    def test_auth_and_missing_raise(self, status):
+        temp_path = self._make_audio_file()
+        try:
+            mock_response = MagicMock()
+            mock_response.status_code = status
+            with patch('transcriber.safe_post', return_value=mock_response):
+                transcriber = Transcriber()
+                transcriber.preprocess_audio = MagicMock(return_value=None)
+                with pytest.raises(TranscriptionRejectedError) as exc:
+                    transcriber._transcribe_via_api(
+                        temp_path, whisper_settings=self._make_settings())
+                assert exc.value.status == status
+                assert is_whisper_failover_trigger(exc.value) is True
+        finally:
+            os.unlink(temp_path)
+
+    def test_other_4xx_still_returns_none(self):
+        temp_path = self._make_audio_file()
+        try:
+            mock_response = MagicMock()
+            mock_response.status_code = 413
+            with patch('transcriber.safe_post', return_value=mock_response):
+                transcriber = Transcriber()
+                transcriber.preprocess_audio = MagicMock(return_value=None)
+                result = transcriber._transcribe_via_api(
+                    temp_path, whisper_settings=self._make_settings())
+                assert result is None
+        finally:
+            os.unlink(temp_path)
+
+    def test_max_attempts_setting_is_honoured(self):
+        temp_path = self._make_audio_file()
+        try:
+            post = MagicMock(side_effect=requests_lib.exceptions.ConnectionError('down'))
+            with patch('transcriber.safe_post', post):
+                transcriber = Transcriber()
+                transcriber.preprocess_audio = MagicMock(return_value=None)
+                with pytest.raises(ServiceUnavailableError):
+                    transcriber._transcribe_via_api(
+                        temp_path,
+                        whisper_settings=self._make_settings(max_attempts=3))
+            assert post.call_count == 3
+        finally:
+            os.unlink(temp_path)
 
 
 class TestExtractAudioChunkSinglePass:
@@ -840,7 +880,7 @@ class TestExtractAudioChunkSinglePass:
             result.returncode = 0
             return result
 
-        with patch('transcriber.tracked_run', side_effect=fake_run):
+        with patch('transcriber.utils.subprocess_registry.tracked_run', side_effect=fake_run):
             path = extract_audio_chunk('/tmp/in.mp3', start, end, **kwargs)
         if path:
             os.unlink(path)
@@ -872,7 +912,7 @@ class TestExtractAudioChunkSinglePass:
         def fake_run(cmd, **run_kwargs):
             raise subprocess.TimeoutExpired(cmd, run_kwargs.get('timeout'))
 
-        with patch('transcriber.tracked_run', side_effect=fake_run):
+        with patch('transcriber.utils.subprocess_registry.tracked_run', side_effect=fake_run):
             with pytest.raises(AudioExtractionTimeout) as exc:
                 extract_audio_chunk('/tmp/in.mp3', 0.0, 3630.0, preprocess=True)
         assert 'timed out' in str(exc.value)
@@ -886,7 +926,7 @@ class TestExtractAudioChunkSinglePass:
             result.stderr = b'moov atom not found'
             return result
 
-        with patch('transcriber.tracked_run', side_effect=fake_run):
+        with patch('transcriber.utils.subprocess_registry.tracked_run', side_effect=fake_run):
             assert extract_audio_chunk('/tmp/in.mp3', 0.0, 30.0) is None
 
     def test_flac_output_for_api_upload(self):
@@ -964,12 +1004,35 @@ class TestChunkedSinglePass:
         'concurrent_chunks': 1,
     }
 
+    def test_sub_second_tail_folds_into_previous_chunk(self):
+        # 180.036s at 60s chunks would otherwise plan a 4th, 36ms chunk (R7).
+        ffmpeg_cmds = []
+        transcriber = Transcriber()
+        transcriber.preprocess_audio = MagicMock(return_value=None)
+        chunk_settings = {'max_chunk_seconds': 60, 'chunk_overlap_seconds': 5,
+                          'concurrent_chunks': 1}
+
+        with patch('transcriber.utils.subprocess_registry.tracked_run',
+                   side_effect=self._fake_run_factory(ffmpeg_cmds)), \
+             patch('transcriber.safe_post', return_value=self._mock_api_response()), \
+             patch('transcriber._get_chunk_settings', return_value=chunk_settings):
+            result = transcriber._transcribe_chunked_parallel_api(
+                '/tmp/full.mp3', 180.036, self._make_settings()
+            )
+
+        assert result is not None
+        assert len(ffmpeg_cmds) == 3
+        last_cmd = ffmpeg_cmds[-1]
+        start = float(last_cmd[last_cmd.index('-ss') + 1])
+        chunk_duration = float(last_cmd[last_cmd.index('-t') + 1])
+        assert start + chunk_duration == pytest.approx(180.036)
+
     def test_api_chunks_one_ffmpeg_pass_each_with_filters(self):
         ffmpeg_cmds = []
         transcriber = Transcriber()
         transcriber.preprocess_audio = MagicMock(return_value=None)
 
-        with patch('transcriber.tracked_run',
+        with patch('transcriber.utils.subprocess_registry.tracked_run',
                    side_effect=self._fake_run_factory(ffmpeg_cmds)), \
              patch('transcriber.safe_post', return_value=self._mock_api_response()), \
              patch('transcriber._get_chunk_settings', return_value=self._CHUNK_SETTINGS):
@@ -991,7 +1054,7 @@ class TestChunkedSinglePass:
         transcriber = Transcriber()
         transcriber.preprocess_audio = MagicMock(return_value=None)
 
-        with patch('transcriber.tracked_run',
+        with patch('transcriber.utils.subprocess_registry.tracked_run',
                    side_effect=self._fake_run_factory(ffmpeg_cmds)), \
              patch('transcriber.safe_post', return_value=self._mock_api_response()), \
              patch('transcriber._get_chunk_settings', return_value=self._CHUNK_SETTINGS):
@@ -1015,7 +1078,7 @@ class TestChunkedSinglePass:
         transcriber = Transcriber()
         transcriber.preprocess_audio = MagicMock(return_value=None)
 
-        with patch('transcriber.tracked_run',
+        with patch('transcriber.utils.subprocess_registry.tracked_run',
                    side_effect=self._fake_run_factory(ffmpeg_cmds)), \
              patch('transcriber.safe_post', return_value=self._mock_api_response()), \
              patch('transcriber._get_chunk_settings', return_value=self._CHUNK_SETTINGS):
@@ -1040,7 +1103,7 @@ class TestChunkedSinglePass:
         transcriber = Transcriber()
         transcriber.preprocess_audio = MagicMock(return_value=None)
 
-        with patch('transcriber.tracked_run', side_effect=failing_run), \
+        with patch('transcriber.utils.subprocess_registry.tracked_run', side_effect=failing_run), \
              patch('transcriber._get_chunk_settings', return_value=self._CHUNK_SETTINGS):
             with pytest.raises(AudioExtractionError):
                 transcriber._transcribe_chunked_parallel_api(
@@ -1057,7 +1120,7 @@ class TestChunkedSinglePass:
             transcriber = Transcriber()
             transcriber.preprocess_audio = MagicMock(return_value=None)
             with patch('transcriber.safe_post', return_value=self._mock_api_response()), \
-                 patch('transcriber.tracked_run') as mock_run:
+                 patch('transcriber.utils.subprocess_registry.tracked_run') as mock_run:
                 result = transcriber._transcribe_via_api(
                     temp_path, self._make_settings(),
                     preprocessed=True,

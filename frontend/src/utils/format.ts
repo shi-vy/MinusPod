@@ -29,6 +29,16 @@ export function formatDateTime(dateStr: string | null): string {
   });
 }
 
+// Past time relative to now ("just now", "5m ago", "3h ago", "2d ago").
+export function formatTimeAgo(dateStr: string, now = Date.now()): string {
+  const minutes = Math.floor((now - new Date(dateStr).getTime()) / 60000);
+  if (!Number.isFinite(minutes) || minutes < 1) return 'just now';
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
 // Compact stats duration: `Ns` under a minute, `N.Nm` under an hour, else
 // `N.Nh`. Distinct from formatTimestamp (clock-style) and
 // settingsUtils.formatDuration (episode lengths).
@@ -36,6 +46,35 @@ export function formatStatsDuration(seconds: number): string {
   if (seconds < 60) return `${Math.round(seconds)}s`;
   if (seconds < 3600) return `${(seconds / 60).toFixed(1)}m`;
   return `${(seconds / 3600).toFixed(1)}h`;
+}
+
+// Episode-list duration: `Xh Ym` at or above one hour, else `Xm`. '' for a
+// falsy value (0, null, undefined).
+export function formatDurationHoursMinutes(seconds?: number): string {
+  if (!seconds) return '';
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  return `${minutes}m`;
+}
+
+// Processing-history duration: sub-minute shown to one decimal (`X.Xs`),
+// else rounded to the nearest second as `Xm Ys`. '-' for null/undefined.
+export function formatDurationPrecise(seconds: number | null | undefined): string {
+  if (seconds === null || seconds === undefined) return '-';
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  const roundedSeconds = Math.round(seconds);
+  const mins = Math.floor(roundedSeconds / 60);
+  const secs = roundedSeconds % 60;
+  return `${mins}m ${secs}s`;
+}
+
+// Job-progress duration: floored whole seconds, `Xs` under a minute else
+// `Xm Ys`. '0s' for a non-finite or negative value.
+export function formatDurationWhole(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return '0s';
+  if (seconds < 60) return `${Math.floor(seconds)}s`;
+  return `${Math.floor(seconds / 60)}m ${Math.floor(seconds % 60)}s`;
 }
 
 // LLM cost with sub-cent precision.

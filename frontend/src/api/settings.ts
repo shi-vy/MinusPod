@@ -25,7 +25,7 @@ export async function resetPrompts(): Promise<{ message: string }> {
   });
 }
 
-export type PromptName = 'system' | 'verification' | 'review' | 'resurrect' | 'chapter';
+export type PromptName = 'system' | 'verification' | 'review' | 'resurrect' | 'chapter' | 'pattern_cleanup';
 
 export async function resetPrompt(name: PromptName): Promise<{ value: string; isDefault: boolean }> {
   return apiRequest<{ value: string; isDefault: boolean }>(`/settings/prompts/${name}/reset`, {
@@ -101,7 +101,7 @@ export async function updateProviderBudget(
 }
 
 export async function getProviderBudgetCurrencies(): Promise<CurrencyOption[]> {
-  const result = await apiRequest<{ currencies: CurrencyOption[] }>('/settings/provider-budget/currencies');
+  const result = await apiRequest<{ currencies: CurrencyOption[] }>('/settings/provider-budget/currencies', { skipRetry: true });
   return result.currencies;
 }
 
@@ -119,8 +119,9 @@ export async function getProviderBudgetRate(
 }
 
 // slot='secondary' previews the given provider type's catalog using the
-// secondary slot's own credentials/base URL instead of the primary slot's.
-export async function getModels(provider?: string, slot?: ProviderSlot): Promise<ClaudeModel[]> {
+// secondary slot's own credentials/base URL instead of the primary slot's;
+// slot='failover' (#806) does the same for the failover LLM account.
+export async function getModels(provider?: string, slot?: ProviderSlot | 'failover'): Promise<ClaudeModel[]> {
   const params = new URLSearchParams();
   if (provider) params.set('provider', provider);
   if (slot) params.set('slot', slot);
@@ -131,7 +132,7 @@ export async function getModels(provider?: string, slot?: ProviderSlot): Promise
 
 // One query key shape for a stage's catalog, so a refresh can invalidate the
 // slot it rebuilt instead of the whole ['models'] prefix.
-export function modelsQueryOptionsFor(provider: string, slot: ProviderSlot) {
+export function modelsQueryOptionsFor(provider: string, slot: ProviderSlot | 'failover') {
   return {
     queryKey: ['models', provider, slot] as const,
     queryFn: () => getModels(provider, slot),
@@ -345,14 +346,15 @@ export interface TemplateValidationResult {
 
 // Data Management
 
-// slugs limits the export to those feeds; omit it to export every feed.
+// Omit slugs to export all feeds; pass a list to export only those feeds.
 export async function exportOpml(
   mode: 'original' | 'modified' = 'original',
   slugs?: string[],
 ): Promise<void> {
   const fallback = mode === 'modified' ? 'minuspod-feeds-modified.opml' : 'minuspod-feeds.opml';
-  const slugsQs = slugs ? `&slugs=${encodeURIComponent(slugs.join(','))}` : '';
-  const { blob, filename } = await apiFileRequest(`/feeds/export-opml?mode=${mode}${slugsQs}`, {
+  const { blob, filename } = await apiFileRequest(`/feeds/export-opml?mode=${mode}`, {
+    method: slugs === undefined ? 'GET' : 'POST',
+    body: slugs === undefined ? undefined : { slugs },
     fallbackFilename: fallback,
   });
   downloadBlob(blob, filename);

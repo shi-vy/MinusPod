@@ -9,6 +9,9 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+from utils.text import is_timezone_drift, normalize_title_for_match
+from utils.time import parse_iso_utc
+
 logger = logging.getLogger(__name__)
 
 # Rows read per page by the duplicate-marker collapse, so a large library does
@@ -32,7 +35,7 @@ _AUTO_FILED_REASON_RE = re.compile(r'\s*corroborated (\S+) hold')
 
 
 # SQL DDL constants live in tables.py - re-exported for backward compat
-from database.schema.tables import SCHEMA_SQL, TABLE_DDL
+from database.schema.tables import PATTERN_CLEANUP_INDEXES, SCHEMA_SQL, TABLE_DDL
 from database.search import (
     SEARCH_CHANGE_JOURNAL_DDL,
     SEARCH_CHANGE_TRIGGERS_SQL,
@@ -42,8 +45,10 @@ from community_export import find_foreign_sponsors, declared_sponsor_names_lower
 from config import (
     CORRECTION_ORIGIN_AUTO_PASS2, CORRECTION_ORIGIN_USER, HOLD_REASON_DIFFERENTIAL_UNCORROBORATED,
     PASS2_AUTOAPPROVE_SNIPPET_PREFIX, count_pending_review,
+    SEGMENT_CATEGORIES, SEGMENT_ACTIONS, resolve_segment_category_actions_map,
 )
 from utils.markers import collapse_duplicate_markers
+from utils.text import extract_text_in_range
 
 # 2.63.2-2.67.0 snippets named the differential hold by its short form.
 _LEGACY_SNIPPET_REASONS = {'differential': HOLD_REASON_DIFFERENTIAL_UNCORROBORATED}
@@ -177,6 +182,9 @@ class SchemaMixin:
         'upload_reservations',
         'feed_subscriber_keys',
         'provider_spend_reservations',
+        'failover_events',
+        'pattern_cleanup_runs',
+        'pattern_cleanup_suggestions',
     )
 
     def _create_new_tables_only(self, conn):
@@ -230,6 +238,12 @@ class SchemaMixin:
             "CREATE INDEX IF NOT EXISTS idx_provider_spend_provider_day "
             "ON provider_spend_reservations(provider, created_at, status)"
         )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_failover_events_created "
+            "ON failover_events(created_at DESC)"
+        )
+        for statement in PATTERN_CLEANUP_INDEXES:
+            conn.execute(statement)
         conn.execute("DROP INDEX IF EXISTS idx_upload_reservations_active_target")
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_upload_reservations_active_target "
@@ -310,6 +324,9 @@ class SchemaMixin:
             ('rss_duration', 'REAL'),
             # Upstream podcast:chapters JSON URL (issue #560 follow-up)
             ('upstream_chapters_url', 'TEXT'),
+            # Upstream podcast:transcript URL + MIME type (2.98.0)
+            ('upstream_transcript_url', 'TEXT'),
+            ('upstream_transcript_type', 'TEXT'),
             # Degraded pass-1 completion: sanitized error when a transient,
             # non-auth LLM failure published on pattern/cross-fetch markers
             # alone. NULL on a clean run.
@@ -335,9 +352,113 @@ class SchemaMixin:
             ('chapters_regen_error', 'TEXT'),
             # Per-episode pass-through override, issue #746.
             ('passthrough_enabled', 'INTEGER'),
+            # Served enclosure length (RSS spec): byte size of processed_file.
+            ('processed_size_bytes', 'INTEGER'),
         ]
         for col, definition in episodes_migrations:
             self._add_column_if_missing(conn, 'episodes', col, definition, ep_cols)
+
+    # Tables whose rows mean an episode has real state and must never be
+    # deleted as an orphan duplicate. ad_reviewer_log.podcast_id has TEXT
+    # affinity, so it matches on episode_id alone to avoid a false delete.
+    _EPISODE_STATE_TABLES = (
+        ('processing_history', 'h', 'h.podcast_id = e.podcast_id AND h.episode_id = e.episode_id'),
+        ('pattern_corrections', 'pc', 'pc.podcast_id = e.podcast_id AND pc.episode_id = e.episode_id'),
+        ('processing_runs', 'r', 'r.podcast_id = e.podcast_id AND r.episode_id = e.episode_id'),
+        ('auto_process_queue', 'q', 'q.podcast_id = e.podcast_id AND q.episode_id = e.episode_id'),
+        ('cue_detections', 'cd', 'cd.podcast_id = e.podcast_id AND cd.episode_id = e.episode_id'),
+        ('addressing_log', 'al', 'al.podcast_slug = p.slug AND al.episode_id = e.episode_id'),
+        ('ad_reviewer_log', 'rl', 'rl.episode_id = e.episode_id'),
+        ('llm_call_usage', 'lu', 'lu.podcast_id = e.podcast_id AND lu.episode_id = e.episode_id'),
+    )
+
+    def _dedup_orphan_discovered_episodes(self, conn) -> None:
+        """One-shot cleanup: removes the state-free orphan of a discovered
+        duplicate pair left by a stale pre-fix published_at (see
+        episodes.py's fuzzy GUID-change match)."""
+        gate = 'dedup_orphan_discovered_episodes_v1'
+        if not (self._table_exists(conn, 'episodes') and self._table_exists(conn, 'podcasts')):
+            return
+        if conn.execute("SELECT 1 FROM schema_migrations WHERE name = ?", (gate,)).fetchone():
+            return
+
+        state_fragments = ['EXISTS(SELECT 1 FROM episode_details ed '
+                           'WHERE ed.episode_id = e.id) AS has_details']
+        for table, alias, cond in self._EPISODE_STATE_TABLES:
+            if self._table_exists(conn, table):
+                # table/alias/cond come from the fixed tuple above, not user input.
+                state_fragments.append(
+                    f"EXISTS(SELECT 1 FROM {table} {alias} WHERE {cond}) AS has_{table}")  # noqa: S608
+            else:
+                state_fragments.append(f"0 AS has_{table}")
+
+        rows = conn.execute(
+            "SELECT e.id, e.podcast_id, e.episode_id, e.title, e.published_at, "  # noqa: S608
+            "e.status, e.processed_file, e.passthrough_enabled, p.slug, "
+            + ', '.join(state_fragments)
+            + " FROM episodes e JOIN podcasts p ON e.podcast_id = p.id "
+              "WHERE e.title IS NOT NULL AND e.published_at IS NOT NULL"
+        ).fetchall()
+
+        groups: dict[tuple, list] = {}
+        for row in rows:
+            title_key = normalize_title_for_match(row['title'])
+            if not title_key:
+                continue
+            groups.setdefault((row['podcast_id'], title_key), []).append(dict(row))
+
+        def has_state(row) -> bool:
+            if (row['status'] != 'discovered' or bool(row['processed_file'])
+                    or row['passthrough_enabled'] is not None):
+                return True
+            return any(row[f'has_{table}']
+                       for table in ('details',) + tuple(t for t, _, _ in self._EPISODE_STATE_TABLES))
+
+        to_delete = []
+        for group_rows in groups.values():
+            if len(group_rows) < 2:
+                continue
+            group_rows.sort(key=lambda r: r['published_at'])
+            clusters = [[group_rows[0]]]
+            for row in group_rows[1:]:
+                anchor_dt = parse_iso_utc(clusters[-1][0]['published_at'])
+                this_dt = parse_iso_utc(row['published_at'])
+                if anchor_dt and this_dt and is_timezone_drift(anchor_dt, this_dt):
+                    clusters[-1].append(row)
+                else:
+                    clusters.append([row])
+
+            for members in clusters:
+                if len(members) < 2:
+                    continue
+                stateful = [r for r in members if has_state(r)]
+                orphans = [r for r in members if not has_state(r)]
+                if not orphans:
+                    continue
+                if stateful:
+                    to_delete.extend(orphans)
+                else:
+                    oldest_id = min(r['id'] for r in members)
+                    to_delete.extend(r for r in members if r['id'] != oldest_id)
+
+        if to_delete:
+            ids = [r['id'] for r in to_delete]
+            placeholders = ','.join('?' for _ in ids)
+            conn.execute(
+                f"DELETE FROM episodes WHERE id IN ({placeholders})",  # noqa: S608
+                ids)
+            if self._table_exists(conn, 'search_index'):
+                # Skipped on an old DB that hasn't reached the search_index
+                # creation step yet; the index is rebuilt from episodes anyway.
+                pairs = [(r['episode_id'], r['slug']) for r in to_delete]
+                for start in range(0, len(pairs), _COLLAPSE_BATCH_ROWS):
+                    self._delete_indexed_episodes(conn, pairs[start:start + _COLLAPSE_BATCH_ROWS])
+            logger.info(
+                f"Migration: removed {len(to_delete)} orphan discovered-episode "
+                "duplicate(s) left by a stale pre-fix published_at"
+            )
+        conn.execute("INSERT INTO schema_migrations (name) VALUES (?)", (gate,))
+        conn.commit()
 
     def _run_schema_migrations(self):
         """Run schema migrations for existing databases."""
@@ -387,6 +508,8 @@ class SchemaMixin:
             ('applied_cuts_json', 'TEXT'),
             # Transcript holes re-transcribed without speech, skipped on reprocess.
             ('repair_holes_json', 'TEXT'),
+            # Upstream transcript differential result (2.98.0)
+            ('upstream_transcript_json', 'TEXT'),
         ]
         for col, definition in details_migrations:
             self._add_column_if_missing(conn, 'episode_details', col, definition, det_cols)
@@ -423,6 +546,9 @@ class SchemaMixin:
             ('splice_veto_enabled', 'INTEGER'),
             ('cue_gated_approval', 'INTEGER DEFAULT 0'),
             ('skip_second_pass', 'INTEGER'),
+            # Per-feed opt-out for the upstream-transcript differential
+            # (2.98.0); NULL inherits transcript_differential_enabled.
+            ('transcript_differential', 'INTEGER'),
             ('max_episodes', 'INTEGER'),
             ('etag', 'TEXT'),
             ('last_modified_header', 'TEXT'),
@@ -677,6 +803,8 @@ class SchemaMixin:
                 logger.info(f"Migration: Normalized {fixed} RFC 2822 published_at dates to ISO 8601")
         except Exception as e:
             logger.warning(f"published_at normalization migration: {e}")
+
+        self._dedup_orphan_discovered_episodes(conn)
 
         # -- Addressing log columns (per-mode yield and waste) --
         # Nullable on purpose: NULL marks rows from before yield recording
@@ -1189,8 +1317,8 @@ class SchemaMixin:
         # Auto-populate search index if empty
         search_index_freshly_populated = False
         try:
-            cursor = conn.execute("SELECT COUNT(*) FROM search_index")
-            if cursor.fetchone()[0] == 0:
+            cursor = conn.execute("SELECT 1 FROM search_index LIMIT 1")
+            if cursor.fetchone() is None:
                 logger.info("Search index is empty, rebuilding...")
                 count = self.rebuild_search_index()
                 search_index_freshly_populated = True
@@ -2094,6 +2222,20 @@ class SchemaMixin:
                 conn.rollback()
                 logger.warning(f"{_scan_table}.claim_epoch migration: {e}")
 
+        # Pattern cleanup review stamps. After the sponsor FK table rebuild,
+        # which copies only the columns it knows.
+        try:
+            ap_cols = self._get_table_columns(conn, 'ad_patterns')
+            self._add_column_if_missing(conn, 'ad_patterns', 'cleanup_reviewed_at', 'TEXT', ap_cols)
+            self._add_column_if_missing(conn, 'ad_patterns', 'cleanup_reviewed_hash', 'TEXT', ap_cols)
+            self._add_column_if_missing(conn, 'ad_patterns', 'cleanup_stats_reviewed', 'TEXT', ap_cols)
+            run_cols = self._get_table_columns(conn, 'pattern_cleanup_runs')
+            self._add_column_if_missing(conn, 'pattern_cleanup_runs', 'error_count',
+                                        'INTEGER NOT NULL DEFAULT 0', run_cols)
+        except Exception as e:
+            conn.rollback()
+            logger.warning(f"ad_patterns cleanup review columns migration: {e}")
+
         # Refresh the default review prompt with the PARTIAL SPAN contract:
         # when the reviewer concludes part of the span is not ad content, it
         # must return adjusted boundaries, never the original boundaries with
@@ -2118,6 +2260,181 @@ class SchemaMixin:
         except Exception as e:
             conn.rollback()
             logger.warning(f"Migration failed for review_prompt PARTIAL SPAN refresh: {e}")
+
+        # One-time heal for network cue templates stranded on a stale
+        # network id (2.98.0).
+        try:
+            self._run_retag_network_cue_templates(conn)
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"network cue template retag migration failed: {e}")
+
+        # Fold the retired ad_chapters_enabled/ad_chapter_categories toggles
+        # into the 'mark' segment action (2.98.0, spec 1.3).
+        try:
+            self._run_mark_action_from_ad_chapters_migration(conn)
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"mark action from ad chapters migration failed: {e}")
+
+    def _run_retag_network_cue_templates(self, conn):
+        """Re-tag network-scope cue templates to their owning feed's current
+        effective network; an empty effective network demotes to podcast scope."""
+        gate = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE name = 'retag_network_cue_templates_2980'"
+        ).fetchone()
+        if gate is not None:
+            return
+
+        rows = conn.execute(
+            """SELECT t.id, t.network_id,
+                      COALESCE(NULLIF(p.network_id_override, ''), p.network_id) AS effective
+               FROM audio_cue_templates t
+               JOIN podcasts p ON p.id = t.podcast_id
+               WHERE t.scope = 'network'"""
+        ).fetchall()
+        moved = demoted = 0
+        for row in rows:
+            effective = row['effective']
+            if effective == row['network_id']:
+                continue
+            if effective:
+                conn.execute(
+                    "UPDATE audio_cue_templates SET network_id = ? WHERE id = ?",
+                    (effective, row['id']))
+                moved += 1
+            else:
+                conn.execute(
+                    "UPDATE audio_cue_templates SET scope = 'podcast', network_id = NULL "
+                    "WHERE id = ?", (row['id'],))
+                demoted += 1
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (name) VALUES "
+            "('retag_network_cue_templates_2980')")
+        conn.commit()
+        if moved or demoted:
+            logger.info(
+                "Migration: re-tagged %d and demoted %d network cue template(s) "
+                "to match their owning feed's current network", moved, demoted)
+
+    @staticmethod
+    def _legacy_resolve_ad_chapter_categories(raw_json, baseline):
+        """Frozen copy of the retired resolve_ad_chapter_categories_map;
+        keeps this migration correct regardless of later cleanup."""
+        merged = dict(baseline)
+        if not raw_json:
+            return merged
+        try:
+            parsed = json.loads(raw_json)
+        except (TypeError, ValueError):
+            return merged
+        if not isinstance(parsed, dict):
+            return merged
+        for cat, flag in parsed.items():
+            if cat in merged and isinstance(flag, bool):
+                merged[cat] = flag
+        return merged
+
+    def _run_mark_action_from_ad_chapters_migration(self, conn):
+        """One-shot: folds the retired ad chapter enable/category toggles
+        into the 'mark' segment action (spec 1.3); writes only when needed."""
+        gate = 'mark_action_from_ad_chapters_v1'
+        if conn.execute(
+                "SELECT 1 FROM schema_migrations WHERE name = ?", (gate,)).fetchone():
+            return
+        if not (self._table_exists(conn, 'settings') and self._table_exists(conn, 'podcasts')):
+            return
+
+        global_enabled_pre = self.get_setting_bool('ad_chapters_enabled', False)
+        legacy_default_categories = {
+            cat: cat in ('sponsor', 'cross_promo') for cat in SEGMENT_CATEGORIES}
+        global_categories_pre = self._legacy_resolve_ad_chapter_categories(
+            self.get_setting('ad_chapter_categories'), legacy_default_categories)
+        global_actions_pre = resolve_segment_category_actions_map(
+            self.get_setting('segment_category_actions'))
+
+        global_actions_post = dict(global_actions_pre)
+        promoted = [
+            cat for cat in SEGMENT_CATEGORIES
+            if global_enabled_pre and global_actions_pre.get(cat) == 'keep'
+            and global_categories_pre.get(cat)
+        ]
+        for cat in promoted:
+            global_actions_post[cat] = 'mark'
+
+        if promoted:
+            conn.execute(
+                """INSERT INTO settings (key, value, is_default, updated_at)
+                   VALUES ('segment_category_actions', ?, 0,
+                           strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                     is_default = 0, updated_at = excluded.updated_at""",
+                (json.dumps(global_actions_post),))
+
+        rows = conn.execute(
+            "SELECT slug, ad_chapters_enabled_override, "
+            "ad_chapter_categories_override, segment_category_actions "
+            "FROM podcasts"
+        ).fetchall()
+
+        feeds_marked = feeds_kept = 0
+        for row in rows:
+            podcast_row = dict(row)
+            own_actions_raw = podcast_row['segment_category_actions']
+            malformed = False
+            try:
+                own_actions = json.loads(own_actions_raw) if own_actions_raw else {}
+                if not isinstance(own_actions, dict):
+                    malformed = True
+                    own_actions = {}
+            except (TypeError, ValueError):
+                malformed = True
+                own_actions = {}
+
+            enabled_override = podcast_row.get('ad_chapters_enabled_override')
+            effective_enabled = (enabled_override == 'on' if enabled_override in ('on', 'off')
+                                 else global_enabled_pre)
+            effective_categories = self._legacy_resolve_ad_chapter_categories(
+                podcast_row.get('ad_chapter_categories_override'), global_categories_pre)
+            effective_actions = resolve_segment_category_actions_map(
+                podcast_row.get('segment_category_actions'), baseline=global_actions_pre)
+
+            new_overrides = {}
+            for cat in SEGMENT_CATEGORIES:
+                has_own_action = cat in own_actions and own_actions[cat] in SEGMENT_ACTIONS
+                chaptered_pre = (effective_enabled
+                                 and effective_actions.get(cat) == 'keep'
+                                 and effective_categories.get(cat))
+                if chaptered_pre:
+                    if has_own_action or global_actions_post.get(cat) != 'mark':
+                        new_overrides[cat] = 'mark'
+                elif global_actions_post.get(cat) == 'mark' and not has_own_action:
+                    new_overrides[cat] = 'keep'
+
+            if new_overrides:
+                merged = dict(own_actions)
+                merged.update(new_overrides)
+                if malformed:
+                    logger.warning(
+                        "Migration: feed %r had unparseable segment_category_actions "
+                        "(%r); replacing with %r",
+                        podcast_row['slug'], own_actions_raw, merged)
+                self.update_podcast(podcast_row['slug'], conn=conn,
+                                    segment_category_actions=json.dumps(merged))
+                if 'mark' in new_overrides.values():
+                    feeds_marked += 1
+                if 'keep' in new_overrides.values():
+                    feeds_kept += 1
+
+        conn.execute("INSERT INTO schema_migrations (name) VALUES (?)", (gate,))
+        conn.commit()
+        if promoted or feeds_marked or feeds_kept:
+            logger.info(
+                "Migration: promoted %d global categor%s to mark, added an "
+                "explicit mark override on %d feed(s) and an explicit keep "
+                "override on %d feed(s)",
+                len(promoted), 'y' if len(promoted) == 1 else 'ies',
+                feeds_marked, feeds_kept)
 
     def _run_correct_opus48_token_cost(self, conn):
         """One-time correction of recorded Opus 4.8 (`claudeopus48`) token cost.
@@ -3406,12 +3723,20 @@ class SchemaMixin:
             )
 
     def _cleanup_zyn_ad_markers(self, conn):
+        gate = 'cleanup_zyn_ad_markers_once'
+        transaction_started = False
         try:
-            from utils.text import extract_text_in_range
-        except Exception as e:
-            logger.warning(f"Migration: ad-marker Zyn cleanup skipped (import failed): {e}")
-            return
-        try:
+            if conn.execute(
+                    "SELECT 1 FROM schema_migrations WHERE name = ?", (gate,)
+            ).fetchone() is not None:
+                return
+            conn.execute("BEGIN IMMEDIATE")
+            transaction_started = True
+            if conn.execute(
+                    "SELECT 1 FROM schema_migrations WHERE name = ?", (gate,)
+            ).fetchone() is not None:
+                conn.rollback()
+                return
             rows = conn.execute(
                 "SELECT episode_id, ad_markers_json, original_transcript_text "
                 "FROM episode_details "
@@ -3455,13 +3780,16 @@ class SchemaMixin:
                         (json.dumps(markers), row['episode_id'])
                     )
                     episodes_touched += 1
+            conn.execute("INSERT INTO schema_migrations (name) VALUES (?)", (gate,))
+            conn.commit()
             if markers_cleared:
-                conn.commit()
                 logger.info(
                     f"Migration: cleared sponsor='Zyn' on {markers_cleared} ad markers "
                     f"across {episodes_touched} episodes whose detected text does not contain 'Zyn'"
                 )
         except Exception as e:
+            if transaction_started:
+                conn.rollback()
             logger.warning(f"Migration: ad-marker Zyn cleanup failed: {e}")
 
     def _collapse_duplicate_ad_markers(self, conn):

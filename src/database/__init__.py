@@ -24,6 +24,8 @@ from database.podping_hosts import PodpingHostMixin
 from database.feed_subscribers import FeedSubscriberMixin
 from database.provider_admission import ProviderAdmissionMixin
 from database.upload_reservations import UploadReservationMixin
+from database.failover_events import FailoverEventsMixin
+from database.pattern_cleanup import PatternCleanupMixin
 from utils.paths import resolve_data_dir
 
 logger = logging.getLogger(__name__)
@@ -141,6 +143,9 @@ class TracedConnection(sqlite3.Connection):
             immediate = normalized.startswith('BEGIN IMMEDIATE')
             self._tx_started = time.monotonic() if immediate else started
             self._tx_start_includes_wait = not immediate
+            self._tx_opener = _sql_head(sql)
+        elif self._tx_opener and self._tx_opener.split(None, 1)[0].upper() == 'BEGIN':
+            # Name the first real statement instead of the BEGIN that opened it.
             self._tx_opener = _sql_head(sql)
 
     def _note_transaction_end(self, how, tx_started=None, tx_opener=None):
@@ -448,12 +453,30 @@ Transcript:
 {transcript}"""
 
 
+# Pattern cleanup system prompt (Experiments > Pattern cleanup). The user
+# message carries the pattern text, its sponsor, and optional transcript context.
+DEFAULT_PATTERN_CLEANUP_PROMPT = """You review one learned podcast ad pattern. The pattern text was captured from a transcript of a sponsor read, so it can carry extra words from around the ad.
+
+Your job: return only the exact sponsor copy.
+- Drop host banter, show content, and transitions into or out of the break.
+- If two or more sponsors are read back to back, return each read as a separate piece.
+- Name the sponsor as it is spoken in the read. For a trim, also return sponsor when the recorded sponsor is wrong and the corrected name appears in the kept text.
+- Do not invent, reword, or reorder words. Every text you return must be copied from the pattern text.
+- If the pattern is already clean, return action "keep".
+- Set contaminated to true when the pattern holds show content that a trim cannot fix, and say why in contamination_reason.
+
+Transcript context, when given, shows the audio around the pattern with the pattern marked between [[ and ]]. Use it only to judge where the ad starts and ends; never copy words from outside the pattern text.
+
+Return one JSON object:
+{"action": "keep" | "trim" | "split" | "rename", "text": string or null (trim only), "sponsor": string or null (rename, or optional with trim), "pieces": [{"text": string, "sponsor": string}] (split only), "contaminated": boolean, "contamination_reason": string or null, "confidence": number from 0 to 1, "reasons": [short strings]}"""
+
+
 class Database(SchemaMixin, PodcastMixin, EpisodeMixin, SettingsMixin,
                PatternMixin, SponsorMixin, StatsMixin, MaintenanceMixin,
                FingerprintMixin, CueTemplateMixin, CueDetectionMixin,
                QueueMixin, SearchMixin, AuthLockoutMixin, PodpingHostMixin,
                FeedSubscriberMixin, ProviderAdmissionMixin,
-               UploadReservationMixin):
+               UploadReservationMixin, FailoverEventsMixin, PatternCleanupMixin):
     """SQLite database manager with thread-safe connections."""
 
     _instance = None

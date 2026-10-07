@@ -20,6 +20,14 @@ class ServiceUnavailableError(Exception):
         self.service = service  # 'llm' or 'whisper'
 
 
+class TranscriptionRejectedError(Exception):
+    """The transcription API rejected a request or exhausted its throttle retry window."""
+
+    def __init__(self, status: int, detail: str = ''):
+        super().__init__(f"Whisper API returned {status}{(': ' + detail) if detail else ''}")
+        self.status = status
+
+
 class LocalTranscriptionUnavailableError(RuntimeError):
     """The local Whisper backend is selected but its packages are not installed."""
 

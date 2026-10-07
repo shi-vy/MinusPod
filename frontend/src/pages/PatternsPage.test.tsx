@@ -41,6 +41,14 @@ vi.mock('../api/community', async (importOriginal) => ({
   }),
 }));
 
+const mockCleanupStatus = vi.fn().mockResolvedValue({ pending: { total: 0, byKind: {} } });
+const mockCleanupSuggestions = vi.fn().mockResolvedValue([]);
+vi.mock('../api/patternCleanup', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../api/patternCleanup')>()),
+  getPatternCleanupStatus: (...a: unknown[]) => mockCleanupStatus(...a),
+  getPatternCleanupSuggestions: (...a: unknown[]) => mockCleanupSuggestions(...a),
+}));
+
 function renderPage(initialEntry = '/patterns') {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
@@ -122,6 +130,73 @@ describe('PatternsPage tabs', () => {
     renderPage('/patterns?tab=ad-review');
     const tab = await screen.findByRole('tab', { name: 'Ad Review' });
     expect(tab.getAttribute('aria-selected')).toBe('true');
+  });
+
+  it('scrolls the selected tab into view inside the tab list on a cleanup deep link', async () => {
+    const rect = (left: number, right: number) => ({
+      left, right, top: 0, bottom: 44, width: right - left, height: 44,
+      x: left, y: 0, toJSON: () => ({}),
+    } as DOMRect);
+    const bounds = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      if (this.getAttribute('role') === 'tablist') return rect(0, 320);
+      if (this.getAttribute('role') === 'tab' && this.getAttribute('aria-selected') === 'true') {
+        return rect(330, 400);
+      }
+      return rect(0, 100);
+    });
+    try {
+      renderPage('/patterns?tab=cleanup');
+      const tablist = screen.getByRole('tablist');
+      await screen.findByRole('tab', { name: 'Cleanup', selected: true });
+      expect(tablist.scrollLeft).toBe(80);
+    } finally {
+      bounds.mockRestore();
+    }
+  });
+});
+
+describe('PatternsPage cleanup tab', () => {
+  it('lists the tabs in order with Cleanup last', async () => {
+    renderPage();
+    await screen.findByRole('tab', { name: 'Patterns' });
+    expect(screen.getAllByRole('tab').map((t) => t.textContent)).toEqual([
+      'Patterns', 'Detected Ads', 'Ad Review', 'Cleanup',
+    ]);
+  });
+
+  it('shows the pending count on the Cleanup tab', async () => {
+    mockCleanupStatus.mockResolvedValueOnce({ pending: { total: 3, byKind: { trim: 3 } } });
+    renderPage();
+    const tab = await screen.findByRole('tab', { name: /Cleanup/ });
+    await waitFor(() => expect(tab.textContent).toBe('Cleanup3'));
+    expect(tab.getAttribute('aria-label')).toBe('Cleanup, 3 pending');
+  });
+
+  it('does not refetch the cleanup badge status on every visit to the page', async () => {
+    mockCleanupStatus.mockClear();
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const mount = () => render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={['/patterns']}>
+          <PatternsPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    const first = mount();
+    await screen.findByRole('tab', { name: 'Patterns' });
+    expect(mockCleanupStatus).toHaveBeenCalledTimes(1);
+    first.unmount();
+
+    mount();
+    await screen.findByRole('tab', { name: 'Patterns' });
+    expect(mockCleanupStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it('opens the cleanup tab from the url and loads suggestions', async () => {
+    renderPage('/patterns?tab=cleanup');
+    const tab = await screen.findByRole('tab', { name: /Cleanup/ });
+    expect(tab.getAttribute('aria-selected')).toBe('true');
+    await waitFor(() => expect(mockCleanupSuggestions).toHaveBeenCalled());
   });
 });
 

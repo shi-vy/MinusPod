@@ -13,7 +13,6 @@ from tests.app_bootstrap import bootstrap
 # bootstrap seeds OPENAI_MODEL so an app DB first created here has a model.
 _test_data_dir = bootstrap('recut_test_')
 
-from ad_chapters import AdChapterConfig
 from config import PASS2_REVIEWED_RELEASE_HOLD_REASONS
 from main_app import processing
 from utils.markers import explicit_override
@@ -586,6 +585,39 @@ def test_build_recut_ad_list_empty_when_no_markers(monkeypatch):
     assert processing._build_recut_ad_list('slug', 'ep', [], 600.0, '', 0.80, corrections=_user_corrections('slug', 'ep')) == ([], [], [], [])
 
 
+@pytest.mark.parametrize('toggle,expect_spans', [(0, None), (1, True)])
+def test_recut_gates_stored_transcript_spans_on_toggle(monkeypatch, toggle, expect_spans):
+    """Recut must not apply stored transcript-diff spans when the feed/global
+    toggle that produced them is off, same as the detection stage."""
+    ads = [{'start': 30.0, 'end': 90.0, 'confidence': 0.95, 'sponsor': 'A',
+            'reason': 'sponsor read for A'}]
+    stored_diff = {'status': 'ok', 'spans': [{'start': 30.0, 'end': 90.0}]}
+    monkeypatch.setattr(processing.db, 'get_episode',
+                        lambda s, e: {'ad_markers_json': json.dumps(ads)})
+    monkeypatch.setattr(processing.db, 'get_podcast_by_slug',
+                        lambda slug: {'id': 42, 'transcript_differential': toggle})
+    monkeypatch.setattr(processing.db, 'get_episode_corrections', lambda podcast_id, eid: [])
+    monkeypatch.setattr(processing.db, 'get_false_positive_corrections',
+                        lambda podcast_id, eid: [])
+    monkeypatch.setattr(processing.db, 'get_confirmed_corrections', lambda podcast_id, eid: [])
+    monkeypatch.setattr(processing.db, 'get_episode_upstream_transcript',
+                        lambda s, e: stored_diff)
+    captured = {}
+    real_build_validator = processing._build_validator
+
+    def _spy(*args, **kwargs):
+        captured['transcript_spans'] = kwargs.get('transcript_spans')
+        return real_build_validator(*args, **kwargs)
+    monkeypatch.setattr(processing, '_build_validator', _spy)
+    segments = [{'start': 30.0, 'end': 90.0, 'text': 'sponsor a'}]
+    processing._build_recut_ad_list('slug', 'ep', segments, 600.0, '', 0.80,
+                                    corrections=_user_corrections('slug', 'ep'))
+    if expect_spans is None:
+        assert captured['transcript_spans'] is None
+    else:
+        assert captured['transcript_spans'] == stored_diff['spans']
+
+
 def _stub_assets_io(monkeypatch, counters):
     import chapters_generator
     monkeypatch.setattr(chapters_generator.ChaptersGenerator, 'generate_chapters',
@@ -665,8 +697,8 @@ def test_build_recut_respects_splice_veto_disabled(monkeypatch):
     monkeypatch.setattr(processing.db, 'get_episode_audio_analysis',
                         lambda s, e: json.dumps(analysis))
     monkeypatch.setattr(processing.db, 'get_setting_bool',
-                        lambda k, **kw: (False if k == 'splice_veto_enabled'
-                                         else kw.get('default', False)))
+                        lambda k, default=False, **kw: (False if k == 'splice_veto_enabled'
+                                         else default))
     monkeypatch.setattr(processing.db, 'get_setting_float',
                         lambda k, default=None: default)
     try:
@@ -1246,7 +1278,7 @@ def test_recut_episode_keeps_rejects_out_of_saved_markers_and_applied_cuts(tmp_p
         p(processing, 'get_min_cut_confidence', return_value=0.80)
         p(processing, 'embed_chapters', return_value=True)
         p(processing, 'get_replacement_duration', return_value=1.0)
-        p(processing, 'resolve_ad_chapter_config', return_value=AdChapterConfig.disabled())
+        p(processing, 'resolve_ad_chapter_config', return_value=None)
         db.get_episode.return_value = {'podcast_id': 1, 'processed_version': 1,
                                        'ad_markers_json': json.dumps(ads)}
         db.get_podcast_by_slug.return_value = {'id': 1}
@@ -1364,7 +1396,7 @@ def test_manual_approve_reject_and_adjust_recut_twice_is_identical(tmp_path, ret
             p(processing, 'get_min_cut_confidence', return_value=0.80)
             p(processing, 'embed_chapters', return_value=True)
             p(processing, 'get_replacement_duration', return_value=1.0)
-            p(processing, 'resolve_ad_chapter_config', return_value=AdChapterConfig.disabled())
+            p(processing, 'resolve_ad_chapter_config', return_value=None)
             db.get_episode.return_value = {'podcast_id': 1, 'processed_version': 1,
                                            'ad_markers_json': json.dumps(markers)}
             db.get_podcast_by_slug.return_value = {'id': 1}
@@ -1538,7 +1570,7 @@ def test_approval_fold_recut_keeps_reviewer_reject_conflict_hold(tmp_path, retai
         p(processing, 'get_min_cut_confidence', return_value=0.80)
         p(processing, 'embed_chapters', return_value=True)
         p(processing, 'get_replacement_duration', return_value=1.0)
-        p(processing, 'resolve_ad_chapter_config', return_value=AdChapterConfig.disabled())
+        p(processing, 'resolve_ad_chapter_config', return_value=None)
         db.get_episode.return_value = {'podcast_id': 1, 'processed_version': 1,
                                        'ad_markers_json': json.dumps(ads)}
         db.get_podcast_by_slug.return_value = {'id': 1}

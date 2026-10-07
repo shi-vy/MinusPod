@@ -3,8 +3,7 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 
-from config import (coerce_bool_setting, resolve_ad_chapter_categories_map,
-                    resolve_segment_category_actions_map)
+from config import coerce_bool_setting, resolve_segment_category_actions_map
 from utils.constants import EpisodeStatus
 from utils.time import ISO_FORMAT, utc_now_iso
 
@@ -160,12 +159,6 @@ class PodcastMixin:
             "SELECT * FROM podcasts WHERE slug = ?", (slug,)
         ).fetchone()
         return dict(row) if row else None
-
-    def get_podcast_slugs(self) -> list[str]:
-        """Get podcast slugs without episode aggregates."""
-        return [row['slug'] for row in self.get_connection().execute(
-            "SELECT slug FROM podcasts"
-        ).fetchall()]
 
     def get_podcast_last_checked_at(self, slug: str) -> str | None:
         """Return only the RSS freshness timestamp for a feed."""
@@ -335,12 +328,15 @@ class PodcastMixin:
         conn.commit()
         return cursor.lastrowid
 
-    def update_podcast(self, slug: str, **kwargs) -> bool:
-        """Update podcast fields."""
+    def update_podcast(self, slug: str, conn=None, **kwargs) -> bool:
+        """Update podcast fields. Pass conn to join an existing transaction
+        (caller owns commit/rollback); omit it to commit here as before."""
         if not kwargs:
             return False
 
-        conn = self.get_connection()
+        own_conn = conn is None
+        if own_conn:
+            conn = self.get_connection()
 
         # Build update query
         fields = []
@@ -353,7 +349,6 @@ class PodcastMixin:
                 'network_id_override', 'audio_analysis_override', 'auto_process_override',
                 'language_override', 'title_override', 'detection_notes', 'detection_mode',
                 'chapters_mode', 'chapters_in_notes',
-                'ad_chapters_enabled_override', 'ad_chapter_categories_override',
                 'own_episode_guids',
                 'cue_template_score_override',
                 *self._CUE_OVERRIDE_COLS,
@@ -369,7 +364,8 @@ class PodcastMixin:
                 'last_podping_at', 'podping_uses', 'podping_hive_accounts',
                 'podping_checked_at', 'channel_metadata_at',
                 'segment_category_actions', 'detect_show_segments',
-                'skip_second_pass', 'skip_transcription', 'cue_only_safety',
+                'skip_second_pass', 'transcript_differential',
+                'skip_transcription', 'cue_only_safety',
                 'queue_priority', 'title_skip_patterns', 'title_skip_action',
                 'low_ad_yield_action', 'episode_logs',
                 'retention_days_override', 'keep_original_audio_override',
@@ -392,7 +388,8 @@ class PodcastMixin:
             f"UPDATE podcasts SET {', '.join(fields)} WHERE slug = ?",  # noqa: S608
             values
         )
-        conn.commit()
+        if own_conn:
+            conn.commit()
         return True
 
     def clear_refresh_failure_state(self, slug: str):
@@ -755,25 +752,16 @@ class PodcastMixin:
         global_keep = (self.get_setting('keep_original_audio') or 'true').lower() != 'false'
         return effective_keep_original(per_feed, global_keep)
 
-    def resolve_segment_actions(self, slug: str,
-                                podcast: dict | None = None) -> dict[str, str]:
+    def resolve_segment_actions(self, slug: str, podcast: dict | None = None,
+                                global_actions: dict[str, str] | None = None) -> dict[str, str]:
         """Full map for every SEGMENT_CATEGORIES key: per-feed override ->
-        global segment_category_actions setting -> DEFAULT_SEGMENT_ACTION.
-        Malformed JSON at either level is ignored (treated as unset).
+        global setting -> DEFAULT_SEGMENT_ACTION; malformed JSON is treated
+        as unset. Pass global_actions (resolved) to skip the query for many feeds.
         """
         if podcast is None:
             podcast = self.get_podcast_by_slug(slug)
-        global_resolved = resolve_segment_category_actions_map(
-            self.get_setting('segment_category_actions'))
+        if global_actions is None:
+            global_actions = resolve_segment_category_actions_map(
+                self.get_setting('segment_category_actions'))
         per_feed_raw = podcast.get('segment_category_actions') if podcast else None
-        return resolve_segment_category_actions_map(per_feed_raw, baseline=global_resolved)
-
-    def resolve_ad_chapter_categories(self, slug: str,
-                                      podcast: dict | None = None) -> dict[str, bool]:
-        """Per-feed override -> global ad_chapter_categories -> defaults."""
-        if podcast is None:
-            podcast = self.get_podcast_by_slug(slug)
-        global_resolved = resolve_ad_chapter_categories_map(
-            self.get_setting('ad_chapter_categories'))
-        per_feed_raw = podcast.get('ad_chapter_categories_override') if podcast else None
-        return resolve_ad_chapter_categories_map(per_feed_raw, baseline=global_resolved)
+        return resolve_segment_category_actions_map(per_feed_raw, baseline=global_actions)

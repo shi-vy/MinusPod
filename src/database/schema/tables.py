@@ -93,6 +93,9 @@ TABLE_DDL['podcasts'] = """CREATE TABLE IF NOT EXISTS podcasts (
     splice_veto_enabled INTEGER,
     cue_gated_approval INTEGER DEFAULT 0,
     skip_second_pass INTEGER,
+    -- Per-feed opt-out for the upstream-transcript differential (2.98.0).
+    -- NULL = inherit the global transcript_differential_enabled setting.
+    transcript_differential INTEGER,
     skip_transcription INTEGER,
     cue_only_safety TEXT,
     -- Queue priority (#625): NULL/0 = normal, 10 = high, -10 = low
@@ -143,6 +146,10 @@ TABLE_DDL['episodes'] = """CREATE TABLE IF NOT EXISTS episodes (
     processed_file TEXT,
     original_file TEXT,
     processed_at TEXT,
+    -- Served enclosure length (RSS spec): byte size of processed_file,
+    -- stamped on finalize/recut. NULL for a pre-existing row backfilled
+    -- lazily on render.
+    processed_size_bytes INTEGER,
     processed_version INTEGER DEFAULT 0,
     original_duration REAL,
     new_duration REAL,
@@ -177,6 +184,12 @@ TABLE_DDL['episodes'] = """CREATE TABLE IF NOT EXISTS episodes (
     -- (issue #560 follow-up). Auto mode fetches it when the embedded chapter
     -- probe comes up short. NULL when the feed does not publish the tag.
     upstream_chapters_url TEXT,
+    -- Upstream podcast:transcript URL + MIME type, captured at RSS discovery/
+    -- refresh (2.98.0). The transcript differential stage fetches and diffs
+    -- it against the Whisper transcript to locate ads. NULL when the feed
+    -- does not publish the tag, or none of its tags is http(s).
+    upstream_transcript_url TEXT,
+    upstream_transcript_type TEXT,
     -- Chapter regeneration runs in a background thread; the stamp marks it
     -- in flight and the error is the last failure.
     chapters_regen_started_at TEXT,
@@ -209,6 +222,9 @@ TABLE_DDL['episode_details'] = """CREATE TABLE IF NOT EXISTS episode_details (
     final_segments_json TEXT,
     applied_cuts_json TEXT,
     repair_holes_json TEXT,
+    -- Upstream transcript differential result (2.98.0): status, coverage,
+    -- spans. Raw cues are not persisted here; re-fetched on re-detection.
+    upstream_transcript_json TEXT,
     created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     FOREIGN KEY (episode_id) REFERENCES episodes(id) ON DELETE CASCADE
 )"""
@@ -262,7 +278,10 @@ TABLE_DDL['ad_patterns'] = """CREATE TABLE IF NOT EXISTS ad_patterns (
     source_language TEXT,
     content_hash TEXT,
     category TEXT,
-    community_last_confirmed_at TEXT
+    community_last_confirmed_at TEXT,
+    cleanup_reviewed_at TEXT,
+    cleanup_reviewed_hash TEXT,
+    cleanup_stats_reviewed TEXT
 )"""
 
 TABLE_DDL['pattern_corrections'] = """CREATE TABLE IF NOT EXISTS pattern_corrections (
@@ -342,6 +361,57 @@ TABLE_DDL['provider_spend_reservations'] = """CREATE TABLE IF NOT EXISTS provide
     updated_at TEXT NOT NULL,
     expires_at TEXT NOT NULL
 )"""
+
+TABLE_DDL['failover_events'] = """CREATE TABLE IF NOT EXISTS failover_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    target TEXT NOT NULL,
+    action TEXT NOT NULL,
+    source TEXT NOT NULL,
+    reason TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+)"""
+
+TABLE_DDL['pattern_cleanup_runs'] = """CREATE TABLE IF NOT EXISTS pattern_cleanup_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    finished_at TEXT,
+    status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running', 'completed', 'failed')),
+    forced INTEGER NOT NULL DEFAULT 0,
+    trigger TEXT,
+    model TEXT,
+    provider TEXT,
+    credential_slot TEXT,
+    reviewed_count INTEGER NOT NULL DEFAULT 0,
+    suggested_count INTEGER NOT NULL DEFAULT 0,
+    skipped_count INTEGER NOT NULL DEFAULT 0,
+    error_count INTEGER NOT NULL DEFAULT 0,
+    error TEXT
+)"""
+
+TABLE_DDL['pattern_cleanup_suggestions'] = """CREATE TABLE IF NOT EXISTS pattern_cleanup_suggestions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER REFERENCES pattern_cleanup_runs(id) ON DELETE SET NULL,
+    pattern_id INTEGER NOT NULL REFERENCES ad_patterns(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK(kind IN ('trim', 'split', 'rename', 'retire', 'flag')),
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'approved', 'rejected', 'undone')),
+    confidence REAL,
+    reasons TEXT NOT NULL DEFAULT '[]',
+    payload TEXT NOT NULL DEFAULT '{}',
+    before TEXT,
+    applied TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    reviewed_at TEXT
+)"""
+
+# One pending suggestion per (pattern, kind); a later run replaces it.
+PATTERN_CLEANUP_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_cleanup_suggestions_pattern "
+    "ON pattern_cleanup_suggestions(pattern_id)",
+    "CREATE INDEX IF NOT EXISTS idx_cleanup_suggestions_status "
+    "ON pattern_cleanup_suggestions(status, created_at)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_cleanup_suggestions_pending "
+    "ON pattern_cleanup_suggestions(pattern_id, kind) WHERE status = 'pending'",
+)
 
 TABLE_DDL['audio_fingerprints'] = """CREATE TABLE IF NOT EXISTS audio_fingerprints (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -692,6 +762,16 @@ CREATE INDEX IF NOT EXISTS idx_provider_spend_provider_day
     ON provider_spend_reservations(provider, created_at, status);
 CREATE INDEX IF NOT EXISTS idx_provider_spend_run
     ON provider_spend_reservations(run_id, status);
+
+-- failover_events table (#806): audit log of provider failover triggers/cancels
+""" + TABLE_DDL['failover_events'] + """;
+CREATE INDEX IF NOT EXISTS idx_failover_events_created
+    ON failover_events(created_at DESC);
+
+-- pattern cleanup: LLM review runs and their suggestions for learned patterns
+""" + TABLE_DDL['pattern_cleanup_runs'] + """;
+""" + TABLE_DDL['pattern_cleanup_suggestions'] + """;
+""" + ';\n'.join(PATTERN_CLEANUP_INDEXES) + """;
 
 -- audio_fingerprints table (Chromaprint hashes for DAI-inserted ads)
 """ + TABLE_DDL['audio_fingerprints'] + """;

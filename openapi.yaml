@@ -12,7 +12,7 @@ info:
     - Monitor system status and trigger cleanup operations
     - Manage cross-episode ad patterns with network and podcast scope
     - Submit corrections to improve ad detection accuracy
-  version: 2.97.45
+  version: 2.98.2
   contact:
     name: MinusPod
   license:
@@ -65,6 +65,10 @@ tags:
     description: >-
       Local (archive-import) feeds: no upstream RSS, episode upload and
       edits, and bulk directory/upload import (#625)
+  - name: Failover
+    description: >-
+      Provider failover (#806): state of the LLM A/B and transcriber
+      failover targets, manual trigger/cancel, and on-demand health probes.
 
 paths:
   /auth/status:
@@ -578,6 +582,51 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+    post:
+      tags:
+        - Feeds
+      summary: Export selected feeds as an OPML file
+      description: Export selected feeds in the usual feed order. Unknown slugs are skipped; the request fails if none match.
+      operationId: exportSelectedOpml
+      parameters:
+        - name: mode
+          in: query
+          description: 'URL mode: "original" for upstream source URLs, "modified" for MinusPod ad-free feed URLs'
+          schema:
+            type: string
+            enum: [original, modified]
+            default: original
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [slugs]
+              properties:
+                slugs:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        '200':
+          description: OPML file download
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+              description: 'Attachment filename, e.g. attachment; filename="minuspod-feeds.opml"'
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '400':
+          description: Invalid mode or slug list, or slugs matched no feeds
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
 
   /opml/{mode}.opml:
     servers:
@@ -754,20 +803,20 @@ paths:
                   description: Per-feed override for listing generated chapters in served episode descriptions. null follows the global chaptersInNotes setting.
                 adChaptersEnabled:
                   type:
+                    - boolean
                     - string
                     - 'null'
-                  enum:
-                    - 'on'
-                    - 'off'
-                    - null
-                  description: Per-feed override for publishing kept ad segments as skippable chapters. null follows the global adChaptersEnabled setting.
+                  enum: [true, false, 'on', 'off', null]
+                  deprecated: true
+                  description: Deprecated. Translates into segmentCategoryActions; false (or 'off') demotes every mark to keep. true, 'on', and null are accepted and ignored (null is a no-op, matching the old per-feed override contract).
                 adChapterCategories:
                   type:
                     - object
                     - 'null'
                   additionalProperties:
                     type: boolean
-                  description: Per-feed override mapping each segment category to whether it gets an ad chapter. null follows the global adChapterCategories setting.
+                  deprecated: true
+                  description: Deprecated. Translates into segmentCategoryActions; true promotes keep to mark, false demotes mark to keep; remove and beep stay unchanged. null is a no-op.
                 queuePriority:
                   type:
                     - string
@@ -998,7 +1047,7 @@ paths:
                     - 'null'
                   additionalProperties:
                     type: string
-                    enum: [remove, beep, keep]
+                    enum: [remove, beep, keep, mark]
                   description: Per-feed segment-category action overrides (issue #565). A partial map; only the listed categories override the resolved global default, unlisted categories still inherit. The stored map is replaced outright by each PATCH, not merged, so send the full set of overrides you want kept. Null clears every override back to inherit.
                 detectShowSegments:
                   type:
@@ -1010,6 +1059,11 @@ paths:
                     - boolean
                     - 'null'
                   description: When true, the pass-2 verification scan of the cut audio is skipped. Null follows the global skipSecondPass setting.
+                transcriptDifferential:
+                  type:
+                    - boolean
+                    - 'null'
+                  description: Per-feed override for upstream-transcript differential. True enables and false disables it for this feed; null follows the global transcriptDifferentialEnabled setting.
                 differentialFetchMode:
                   type:
                     - string
@@ -1948,7 +2002,7 @@ paths:
                 properties:
                   episodeId: { type: string }
                   start: { type: number }
-                  end: { type: number, nullable: true }
+                  end: {type: [number, 'null']}
                   resolutionMs: { type: integer }
                   peaks:
                     type: array
@@ -2053,7 +2107,7 @@ paths:
                         start: { type: number }
                         end: { type: number }
                         text: { type: string }
-                        sponsor: { type: string, nullable: true }
+                        sponsor: {type: [string, 'null']}
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
@@ -3584,7 +3638,7 @@ paths:
                   enum: [sponsor, cross_promo, self_promo, interaction, intro, outro, recap, null]
                   description: >-
                     Segment category for this pattern's matches; each feed's
-                    segment actions map the category to remove, beep, or keep.
+                    segment actions map the category to remove, beep, keep, or mark.
                     Null clears the category, and an uncategorized pattern
                     resolves as sponsor. An unrecognized value is rejected
                     with 400.
@@ -3817,7 +3871,7 @@ paths:
                         scope:
                           type: string
                         podcast_name:
-                          type: string
+                          type: [string, 'null']
                         created_at:
                           type: string
                         text_preview:
@@ -3876,9 +3930,9 @@ paths:
                         sponsor:
                           type: string
                         podcast_id:
-                          type: string
+                          type: [string, 'null']
                         podcast_name:
-                          type: string
+                          type: [string, 'null']
                         template_len:
                           type: integer
                         confirmation_count:
@@ -3997,11 +4051,9 @@ paths:
                       type: object
                       properties:
                         sponsor_id:
-                          type: integer
-                          nullable: true
+                          type: [integer, 'null']
                         sponsor:
-                          type: string
-                          nullable: true
+                          type: [string, 'null']
                         suggested_keep_id:
                           type: integer
                           description: Keep-target chosen by the tiebreaker
@@ -4082,6 +4134,295 @@ paths:
           $ref: '#/components/responses/NotFound'
         '500':
           $ref: '#/components/responses/ServerError'
+
+  /patterns/cleanup:
+    get:
+      tags:
+        - Patterns
+      summary: Get pattern cleanup status and settings
+      description: >-
+        Scheduled LLM review of learned ad patterns (Experiments). Combines
+        the six configurable settings with live state: whether a run
+        currently holds the lock, the last run's timestamp/error/summary,
+        and the pending suggestion counts by kind.
+      operationId: getPatternCleanupStatus
+      responses:
+        '200':
+          description: Pattern cleanup status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PatternCleanupStatus'
+
+  /patterns/cleanup/run:
+    post:
+      tags:
+        - Patterns
+      summary: Run pattern cleanup now
+      description: >-
+        Starts a cleanup run on a background thread and returns immediately
+        with the new run's id. Each run processes a configured batch. `force`
+        resets review history used for eligibility and replaces pending
+        suggestions for every active learned pattern; approved and rejected
+        decision records remain. Later normal runs continue the remaining
+        batches. Calling force again restarts this process. A missing body
+        means force=false. A supplied body must be a JSON object and force
+        must be a JSON boolean. Rate limited to 6/hour.
+      operationId: runPatternCleanup
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                force:
+                  type: boolean
+                  default: false
+      responses:
+        '202':
+          description: Run started
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  runId:
+                    type: integer
+        '400':
+          description: Malformed JSON, non-object request body, or non-boolean force
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: 'A cleanup run is already in progress (error: cleanup_in_progress)'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /patterns/cleanup/runs:
+    get:
+      tags:
+        - Patterns
+      summary: List recent pattern cleanup runs
+      operationId: listPatternCleanupRuns
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 20, minimum: 1, maximum: 100 }
+      responses:
+        '200':
+          description: Recent runs, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  runs:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PatternCleanupRun'
+
+  /patterns/cleanup/suggestions:
+    get:
+      tags:
+        - Patterns
+      summary: List pattern cleanup suggestions
+      description: >-
+        Each suggestion carries the current pattern summary (sponsor, scope,
+        podcast title, counts), the proposed payload, and an immutable before
+        snapshot from review time. Prefer before_id (the smallest id already
+        seen) over offset to page to older decisions, including approved
+        suggestions available for undo: a keyset cursor is not disturbed by
+        rows that leave the result set between pages, where offset can skip
+        or repeat rows. before_id takes precedence over offset when both are
+        given.
+      operationId: listPatternCleanupSuggestions
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string, enum: [pending, approved, rejected, undone] }
+        - name: kind
+          in: query
+          schema: { type: string, enum: [trim, split, rename, retire, flag] }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, minimum: 1, maximum: 200 }
+        - name: offset
+          in: query
+          schema: { type: integer, default: 0, minimum: 0 }
+        - name: before_id
+          in: query
+          description: Keyset cursor; only suggestions with id below this are returned.
+          schema: { type: integer, minimum: 1 }
+      responses:
+        '200':
+          description: Suggestions, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  suggestions:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PatternCleanupSuggestion'
+        '400':
+          description: Unknown status or kind filter
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /patterns/cleanup/suggestions/{suggestion_id}/approve:
+    post:
+      tags:
+        - Patterns
+      summary: Approve a pattern cleanup suggestion
+      description: >-
+        Applies the change in place; the pattern keeps a `before` snapshot
+        so it can be undone.
+      operationId: approvePatternCleanupSuggestion
+      parameters:
+        - name: suggestion_id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '200':
+          description: Updated suggestion
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PatternCleanupSuggestion'
+        '404':
+          description: Suggestion not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: >-
+            The suggestion or its pattern does not allow this action
+            (error: invalid_transition)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /patterns/cleanup/suggestions/{suggestion_id}/reject:
+    post:
+      tags:
+        - Patterns
+      summary: Reject a pattern cleanup suggestion
+      description: >-
+        Leaves the pattern alone and acknowledges the reviewed version and
+        statistical evidence. Returns a conflict when the pattern changed
+        after the suggestion was made; unseen newer text is not marked reviewed.
+      operationId: rejectPatternCleanupSuggestion
+      parameters:
+        - name: suggestion_id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '200':
+          description: Updated suggestion
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PatternCleanupSuggestion'
+        '404':
+          description: Suggestion not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: 'The suggestion does not allow this action (error: invalid_transition)'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /patterns/cleanup/suggestions/{suggestion_id}/undo:
+    post:
+      tags:
+        - Patterns
+      summary: Undo an approved pattern cleanup suggestion
+      description: >-
+        Restores only fields owned by the approval, using its before and
+        post-approval snapshots. Split undo restores the original pattern
+        and disables its unchanged children.
+      operationId: undoPatternCleanupSuggestion
+      parameters:
+        - name: suggestion_id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '200':
+          description: Updated suggestion
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PatternCleanupSuggestion'
+        '404':
+          description: Suggestion not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: >-
+            Refused when the suggestion is not approved, a later approval on
+            the same pattern has not been undone, owned fields or split children
+            changed afterward, or an older approval lacks enough saved state
+            for safe undo (error: invalid_transition)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /patterns/cleanup/suggestions/bulk:
+    post:
+      tags:
+        - Patterns
+      summary: Approve or reject several pattern cleanup suggestions
+      operationId: bulkPatternCleanupSuggestions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids, action]
+              properties:
+                ids:
+                  type: array
+                  items: { type: integer }
+                action:
+                  type: string
+                  enum: [approve, reject]
+      responses:
+        '200':
+          description: Per-id results; a failed id carries an `error` instead of `status`
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: integer }
+                        status: { type: string, enum: [approved, rejected] }
+                        error: { type: string, enum: [not_found, invalid_transition] }
+        '400':
+          description: Malformed ids or action
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   /podcast-search:
     get:
@@ -4742,7 +5083,7 @@ paths:
             no filter.
           schema:
             type: string
-            enum: [max_duration, no_cue_evidence, uncorroborated_tail, reviewer_contradiction, reviewer_boundary_conflict, reviewer_inconclusive_bounds, estimated_pattern_bounds, reviewer_reject_conflict, reviewer_failed, no_splice_evidence, verification_miss, verification_kept_conflict, differential_uncorroborated, large_vad_gap_extension, cue_template_unproven, cue_low_confidence, no_transcript_evidence]
+            enum: [max_duration, no_cue_evidence, uncorroborated_tail, reviewer_contradiction, reviewer_boundary_conflict, reviewer_inconclusive_bounds, estimated_pattern_bounds, reviewer_reject_conflict, reviewer_failed, no_splice_evidence, verification_miss, verification_kept_conflict, differential_uncorroborated, large_vad_gap_extension, cue_template_unproven, cue_low_confidence, no_transcript_evidence, transcript_differential_unreviewed]
       responses:
         '200':
           description: Paginated detection list
@@ -4970,6 +5311,125 @@ paths:
                     items:
                       $ref: '#/components/schemas/ProcessingHistoryEntry'
 
+  /failover:
+    get:
+      tags:
+        - Failover
+      summary: Get failover state, probes, policy, and recent events
+      description: >-
+        Snapshot of the three failover targets (llm-a, llm-b, transcriber),
+        the five health probes that drive them (llm-a, llm-b, llm-failover,
+        transcriber, transcriber-failover), the auto-trigger/recovery policy,
+        and the most recent manual/auto/probe events (#806). Reads committed
+        control state without running health probes.
+      operationId: getFailover
+      responses:
+        '200':
+          description: Failover overview
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailoverOverview'
+  /failover/{target}/trigger:
+    post:
+      tags:
+        - Failover
+      summary: Manually trigger failover for one target
+      description: >-
+        Switches `target` onto its failover configuration. Fails with 409
+        when the target's failover config is not set up, so a manual trigger
+        can never land on an endpoint with nowhere to go.
+      operationId: triggerFailover
+      parameters:
+        - in: path
+          name: target
+          required: true
+          schema:
+            type: string
+            enum: [llm-a, llm-b, transcriber]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  description: Free-text note recorded on the failover event.
+      responses:
+        '200':
+          description: Triggered (or already active)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  target:
+                    type: string
+                  state:
+                    $ref: '#/components/schemas/FailoverTargetState'
+        '404': { description: Unknown failover target }
+        '503': { description: 'State could not be saved (error: failover_transition_failed)' }
+        '409':
+          description: >-
+            Target has no failover configuration (error: failover_not_configured), or
+            llm-b is disabled (error: failover_target_disabled)
+        '400': { description: Invalid JSON body or non-string reason }
+  /failover/{target}/cancel:
+    post:
+      tags:
+        - Failover
+      summary: Manually cancel failover for one target
+      description: Switches `target` back onto its original configuration.
+      operationId: cancelFailover
+      parameters:
+        - in: path
+          name: target
+          required: true
+          schema:
+            type: string
+            enum: [llm-a, llm-b, transcriber]
+      responses:
+        '200':
+          description: Cancelled (or already inactive)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  target:
+                    type: string
+                  state:
+                    $ref: '#/components/schemas/FailoverTargetState'
+        '404': { description: Unknown failover target }
+        '503': { description: 'State could not be saved (error: failover_transition_failed)' }
+  /failover/probe:
+    post:
+      tags:
+        - Failover
+      summary: Run an on-demand health probe of every enabled target
+      description: >-
+        Probes every currently enabled target (see `enabled_probe_targets`),
+        records the result, and applies the same auto-trigger/auto-recovery
+        rules as the background probe tick. A local Whisper diagnostic decode
+        requested from a web request is never run inline: it is handed to the
+        background worker to run on its next tick, and this response carries
+        that target's last stored verdict instead of a fresh one.
+      operationId: probeFailover
+      responses:
+        '200':
+          description: Updated probe states
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  probes:
+                    type: object
+                    additionalProperties:
+                      $ref: '#/components/schemas/FailoverProbe'
+
   /settings/providers:
     get:
       tags:
@@ -5012,7 +5472,7 @@ paths:
             schema:
               type: object
               properties:
-                apiKey:  { type: string, nullable: true, description: 'Omit to leave unchanged; null or empty to clear' }
+                apiKey:  {type: [string, 'null'], description: Omit to leave unchanged; null or empty to clear}
                 baseUrl: { type: string }
                 model:   { type: string }
                 affectedRunsAction:
@@ -5086,9 +5546,11 @@ paths:
         - in: path
           name: slot
           required: true
+          description: >-
+            `a`/`b` are accepted as aliases of `primary`/`secondary`.
           schema:
             type: string
-            enum: [primary, secondary]
+            enum: [primary, secondary, a, b]
       responses:
         '200':
           description: The slot's current account and the runs bound to it
@@ -5232,6 +5694,72 @@ paths:
               schema:
                 $ref: '#/components/schemas/ConnectionTestResult'
         '400': { description: 'Invalid input (non-string baseUrl, non-string provider, or provider not one of the supported types)' }
+  /settings/providers/failover/test-connection:
+    post:
+      tags:
+        - Settings
+      summary: Test the LLM failover provider connection end to end
+      description: |
+        Same staged probe as `/settings/providers/secondary/test-connection`,
+        but targets the shared LLM failover slot (#806): its key comes from
+        `failoverLlmApiKey`, and its type and endpoint come from
+        `failoverLlmProvider`/`failoverLlmBaseUrl` unless the request body's
+        `provider`/`baseUrl` override them, to test an unsaved form value
+        before Save. Returns `ok: false` with a `detail` explaining the
+        reason when no failover provider type is configured yet.
+      operationId: testFailoverProviderConnection
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                provider:
+                  type: string
+                  enum: [anthropic, openrouter, openai-compatible, ollama]
+                  description: Provider type to test; when absent the saved failoverLlmProvider is used
+                baseUrl:
+                  type: string
+                  description: Base URL to test; when absent the saved failover value is used
+      responses:
+        '200':
+          description: Probe result (always 200; see `ok` field)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionTestResult'
+        '400': { description: 'Invalid input (non-string baseUrl, non-string provider, or provider not one of the supported types)' }
+  /settings/providers/failover-whisper/test-connection:
+    post:
+      tags:
+        - Settings
+      summary: Test the transcriber failover connection end to end
+      description: |
+        Same staged probe as `/settings/providers/whisper/test-connection`
+        (#806), but targets the transcriber failover slot: its key comes
+        from `failoverWhisperApiKey`, and its base URL/model come from
+        `failoverWhisperApiBaseUrl`/`failoverWhisperApiModel` unless the
+        request body overrides them.
+      operationId: testFailoverWhisperConnection
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                baseUrl: { type: string, description: 'Base URL to test; when the key is absent the saved value is used' }
+                model:   { type: string, description: 'Model name to send; falls back to the saved value' }
+                skipFlacCompression: { type: boolean, description: 'Upload WAV (true) or FLAC (false); falls back to the saved setting' }
+      responses:
+        '200':
+          description: Probe result (always 200; see `ok` field)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionTestResult'
+        '400': { description: 'Invalid input (non-string baseUrl or model, non-boolean skipFlacCompression)' }
   /settings/podcast-index/test:
     post:
       tags:
@@ -5310,6 +5838,9 @@ paths:
                 chapterPromptOverride:
                   type: string
                   description: Optional override appended to the chapter topic-detection prompt (empty by default)
+                patternCleanupPrompt:
+                  type: string
+                  description: System prompt for the pattern cleanup review. Blank resets it to the default.
                 claudeModel:
                   type: string
                   description: AI model ID to use for first pass ad detection. No model ships by default; unset until configured.
@@ -5384,6 +5915,12 @@ paths:
                     returns 0 segments on larger chunks is hitting this limit;
                     raise it or lower transcribeMaxChunkSeconds. A proxy in front
                     of the backend may cut the request sooner than this value.
+                  example: 600
+                transcribeMaxChunkSeconds:
+                  type: integer
+                  minimum: 1
+                  maximum: 7200
+                  description: Max duration, in seconds, of each transcription chunk.
                   example: 600
                 transcribeConcurrentChunks:
                   type: integer
@@ -5681,7 +6218,7 @@ paths:
                   type: object
                   additionalProperties:
                     type: string
-                    enum: [remove, beep, keep]
+                    enum: [remove, beep, keep, mark]
                   description: Partial global segment-category action map (issue #565). Merged over the stored global map; a category omitted here keeps its current global action. Every category defaults to remove, so an install upgrades with byte-identical behavior until an action is changed.
                   example: {sponsor: remove, cross_promo: keep, self_promo: beep}
                 communitySyncCategories:
@@ -5769,6 +6306,10 @@ paths:
                 skipSecondPass:
                   type: boolean
                   description: When true, feeds that inherit this setting skip the pass-2 verification scan.
+                transcriptDifferentialEnabled:
+                  type: boolean
+                  description: Default for the upstream-transcript differential; feeds that inherit this setting follow it. Diffs the upstream podcast:transcript against the Whisper transcript to help locate ads.
+                  example: true
                 differentialFetchMode:
                   type: string
                   enum: ['auto', 'on', 'off']
@@ -5778,14 +6319,17 @@ paths:
                   description: Append the generated chapter list to served episode descriptions and the episode API description. Feeds can override per feed.
                   example: false
                 adChaptersEnabled:
-                  type: boolean
-                  description: Publish kept or held ad segments as skippable chapters in the generated chapter list.
+                  type: [boolean, string]
+                  enum: [true, false, 'on', 'off']
+                  deprecated: true
+                  description: Deprecated. Translates into segmentCategoryActions; false or 'off' demotes every mark to keep, true or 'on' is accepted and ignored.
                   example: false
                 adChapterCategories:
                   type: object
                   additionalProperties:
                     type: boolean
-                  description: Partial map of segment category to whether it gets an ad chapter, merged over the stored map.
+                  deprecated: true
+                  description: Deprecated. Translates into segmentCategoryActions; true promotes keep to mark, false demotes mark to keep; remove and beep stay unchanged.
                   example: {sponsor: true, cross_promo: true}
                 adChaptersIncludeHeld:
                   type: boolean
@@ -5929,10 +6473,9 @@ paths:
                     per-stage provider override set to secondary while this is
                     false falls back to primary. Off by default.
                 secondaryProvider:
-                  type: string
-                  nullable: true
+                  type: [string, 'null']
                   description: Secondary provider type. Empty or null clears it.
-                  enum: [anthropic, openai-compatible, ollama, openrouter, '']
+                  enum: [anthropic, openai-compatible, ollama, openrouter, '', null]
                   example: openai-compatible
                 secondaryProviderBaseUrl:
                   type: string
@@ -5943,8 +6486,7 @@ paths:
                     override back to the default.
                   example: http://localhost:11434/v1
                 secondaryProviderApiKey:
-                  type: string
-                  nullable: true
+                  type: [string, 'null']
                   description: API key for the secondary provider. Omit to leave unchanged; null or empty to clear.
                 providerRequestsPerMin:
                   type: integer
@@ -5987,6 +6529,161 @@ paths:
                     estimate is reserved at dispatch and reconciled to actual usage on
                     completion.
                   example: 250000
+                providerBEnabled:
+                  type: boolean
+                  description: Alias of secondaryProviderEnabled (Provider A/B rename, #806).
+                providerB:
+                  type: [string, 'null']
+                  description: Alias of secondaryProvider.
+                  enum: [anthropic, openai-compatible, ollama, openrouter, '', null]
+                providerBBaseUrl:
+                  type: string
+                  description: Alias of secondaryProviderBaseUrl.
+                providerBApiKey:
+                  type: [string, 'null']
+                  description: Alias of secondaryProviderApiKey.
+                providerBRequestsPerMin:
+                  type: integer
+                  minimum: 0
+                  description: Alias of secondaryProviderRequestsPerMin.
+                providerBRequestsPerDay:
+                  type: integer
+                  minimum: 0
+                  description: Alias of secondaryProviderRequestsPerDay.
+                providerBTokensPerMin:
+                  type: integer
+                  minimum: 0
+                  description: Alias of secondaryProviderTokensPerMin.
+                providerATimeoutSeconds:
+                  anyOf:
+                    - type: integer
+                      minimum: 10
+                      maximum: 3600
+                    - type: 'null'
+                    - type: string
+                      const: ''
+                  description: Request timeout for Provider A. Null or blank clears it to the provider-type default; omitted leaves it unchanged.
+                providerAMaxRetries:
+                  anyOf:
+                    - type: integer
+                      minimum: 0
+                      maximum: 10
+                    - type: 'null'
+                    - type: string
+                      const: ''
+                  description: Max retries for Provider A. Null or blank clears it to the provider-type default; omitted leaves it unchanged.
+                providerBTimeoutSeconds:
+                  anyOf:
+                    - type: integer
+                      minimum: 10
+                      maximum: 3600
+                    - type: 'null'
+                    - type: string
+                      const: ''
+                  description: Request timeout for Provider B. Null or blank clears it to the provider-type default; omitted leaves it unchanged.
+                providerBMaxRetries:
+                  anyOf:
+                    - type: integer
+                      minimum: 0
+                      maximum: 10
+                    - type: 'null'
+                    - type: string
+                      const: ''
+                  description: Max retries for Provider B. Null or blank clears it to the provider-type default; omitted leaves it unchanged.
+                failoverLlmEnabled:
+                  type: boolean
+                  description: Enable or disable the shared LLM failover provider. Off by default.
+                failoverLlmProvider:
+                  type: [string, 'null']
+                  enum: [anthropic, openai-compatible, ollama, openrouter, '', null]
+                  description: LLM failover provider type. Empty or null clears it.
+                failoverLlmBaseUrl:
+                  type: string
+                  description: Base URL for the LLM failover provider; requests are SSRF-validated.
+                failoverLlmApiKey:
+                  type: [string, 'null']
+                  description: API key for the LLM failover provider. Omit to leave unchanged; null or empty to clear.
+                failoverLlmTimeoutSeconds:
+                  anyOf:
+                    - type: integer
+                      minimum: 10
+                      maximum: 3600
+                    - type: 'null'
+                    - type: string
+                      const: ''
+                  description: Request timeout for the LLM failover provider. Null or blank clears it to the provider-type default; omitted leaves it unchanged.
+                failoverLlmMaxRetries:
+                  anyOf:
+                    - type: integer
+                      minimum: 0
+                      maximum: 10
+                    - type: 'null'
+                    - type: string
+                      const: ''
+                  description: Max retries for the LLM failover provider. Null or blank clears it to the provider-type default; omitted leaves it unchanged.
+                failoverLlmDetectionModel:
+                  type: string
+                  description: Model the LLM failover provider uses for ad detection.
+                failoverLlmReviewModel:
+                  type: string
+                  description: Model the LLM failover provider uses for review. Blank inherits the detection model.
+                failoverLlmVerificationModel:
+                  type: string
+                  description: Model the LLM failover provider uses for verification. Blank inherits the detection model.
+                failoverLlmChaptersModel:
+                  type: string
+                  description: Model the LLM failover provider uses for chapters. Blank inherits the detection model.
+                failoverWhisperEnabled:
+                  type: boolean
+                  description: Enable or disable the transcriber failover provider. Off by default.
+                failoverWhisperBackend:
+                  type: string
+                  enum: [local, openai-api]
+                  description: Transcriber failover backend.
+                failoverWhisperModel:
+                  type: string
+                  description: Local model name for the transcriber failover, when its backend is local.
+                failoverWhisperApiBaseUrl:
+                  type: string
+                  description: Base URL for the transcriber failover API backend, SSRF-validated.
+                failoverWhisperApiKey:
+                  type: [string, 'null']
+                  description: API key for the transcriber failover API backend. Omit to leave unchanged; null or empty to clear.
+                failoverWhisperApiModel:
+                  type: string
+                  description: Model name for the transcriber failover API backend.
+                failoverWhisperApiTimeoutSeconds:
+                  type: integer
+                  minimum: 30
+                  maximum: 3600
+                  description: Request timeout for the transcriber failover API backend.
+                failoverWhisperMaxAttempts:
+                  anyOf:
+                    - type: integer
+                      minimum: 1
+                      maximum: 10
+                    - type: 'null'
+                    - type: string
+                      const: ''
+                  description: Upload attempts for the failover transcriber, including the first upload. Null or blank inherits whisperMaxAttempts; omit to leave unchanged.
+                failoverWhisperLanguage:
+                  type: string
+                  description: Language for the transcriber failover. Empty means same as the active transcriber; otherwise 'auto' or a 2-3 letter code.
+                failoverProbeIntervalMinutes:
+                  type: integer
+                  minimum: 1
+                  maximum: 60
+                  description: Minutes between health probes of a failover target.
+                failoverRecoveryProbes:
+                  type: integer
+                  minimum: 1
+                  maximum: 10
+                  description: Consecutive healthy probes needed before an automatic failover recovers.
+                whisperMaxAttempts:
+                  type: integer
+                  minimum: 1
+                  maximum: 10
+                  description: Max attempts for a single whisper API transcription request before giving up.
                 detectionTemperature:
                   type: number
                   description: Temperature (0.0-2.0) for the first-pass ad detection LLM call.
@@ -5996,13 +6693,11 @@ paths:
                   description: Maximum response tokens (128-32768) for first-pass ad detection.
                   example: 4096
                 detectionReasoningBudget:
-                  type: integer
-                  nullable: true
+                  type: [integer, 'null']
                   description: Anthropic extended-thinking token budget (1024-65536). Only valid when llmProvider is anthropic.
                 detectionReasoningLevel:
-                  type: string
-                  nullable: true
-                  enum: [none, low, medium, high]
+                  type: [string, 'null']
+                  enum: [none, low, medium, high, null]
                   description: Reasoning effort level for non-Anthropic providers. Rejected when llmProvider is anthropic.
                 verificationTemperature:
                   type: number
@@ -6011,13 +6706,11 @@ paths:
                   type: integer
                   description: Maximum response tokens (128-32768) for the verification pass.
                 verificationReasoningBudget:
-                  type: integer
-                  nullable: true
+                  type: [integer, 'null']
                   description: Anthropic-only reasoning budget for verification pass.
                 verificationReasoningLevel:
-                  type: string
-                  nullable: true
-                  enum: [none, low, medium, high]
+                  type: [string, 'null']
+                  enum: [none, low, medium, high, null]
                   description: Reasoning effort level for verification pass (non-Anthropic).
                 reviewerTemperature:
                   type: number
@@ -6026,13 +6719,11 @@ paths:
                   type: integer
                   description: Maximum response tokens (128-32768) for the reviewer.
                 reviewerReasoningBudget:
-                  type: integer
-                  nullable: true
+                  type: [integer, 'null']
                   description: Anthropic-only reasoning budget for the reviewer.
                 reviewerReasoningLevel:
-                  type: string
-                  nullable: true
-                  enum: [none, low, medium, high]
+                  type: [string, 'null']
+                  enum: [none, low, medium, high, null]
                   description: Reasoning effort level for the reviewer (non-Anthropic).
                 chapterBoundaryTemperature:
                   type: number
@@ -6041,13 +6732,11 @@ paths:
                   type: integer
                   description: Maximum response tokens (128-32768) for chapter boundary detection.
                 chapterBoundaryReasoningBudget:
-                  type: integer
-                  nullable: true
+                  type: [integer, 'null']
                   description: Anthropic-only reasoning budget for chapter boundary detection.
                 chapterBoundaryReasoningLevel:
-                  type: string
-                  nullable: true
-                  enum: [none, low, medium, high]
+                  type: [string, 'null']
+                  enum: [none, low, medium, high, null]
                   description: Reasoning effort level for chapter boundary detection (non-Anthropic).
                 chapterTargetSeconds:
                   type: integer
@@ -6078,27 +6767,22 @@ paths:
                   type: integer
                   description: Maximum response tokens (128-32768) for chapter title generation.
                 chapterTitleReasoningBudget:
-                  type: integer
-                  nullable: true
+                  type: [integer, 'null']
                   description: Anthropic-only reasoning budget for chapter title generation.
                 chapterTitleReasoningLevel:
-                  type: string
-                  nullable: true
-                  enum: [none, low, medium, high]
+                  type: [string, 'null']
+                  enum: [none, low, medium, high, null]
                   description: Reasoning effort level for chapter title generation (non-Anthropic).
                 ollamaNumCtx:
-                  type: integer
-                  nullable: true
+                  type: [integer, 'null']
                   description: Ollama context window in tokens (512-131072). Only valid when llmProvider is ollama.
                 windowSizeSeconds:
-                  type: integer
-                  nullable: true
+                  type: [integer, 'null']
                   minimum: 120
                   maximum: 1800
                   description: Detection-window duration in seconds. Must be strictly greater than windowOverlapSeconds.
                 windowOverlapSeconds:
-                  type: integer
-                  nullable: true
+                  type: [integer, 'null']
                   minimum: 0
                   maximum: 1770
                   description: Overlap between consecutive detection windows in seconds. Must be less than windowSizeSeconds.
@@ -6261,7 +6945,7 @@ paths:
       tags:
         - Settings
       summary: Reset a single prompt
-      description: Reset one prompt (system, verification, review, resurrect, or chapter) and its override to defaults
+      description: Reset one prompt (system, verification, review, resurrect, chapter, or pattern_cleanup) and its override, when it has one, to defaults
       operationId: resetSinglePrompt
       parameters:
         - name: name
@@ -6270,7 +6954,7 @@ paths:
           description: Prompt to reset
           schema:
             type: string
-            enum: [system, verification, review, resurrect, chapter]
+            enum: [system, verification, review, resurrect, chapter, pattern_cleanup]
       responses:
         '200':
           description: Prompt reset to default
@@ -6304,10 +6988,16 @@ paths:
         - name: slot
           in: query
           required: false
-          description: Which credential slot to preview `provider` with. `secondary` uses the secondary provider slot's own API key and base URL instead of the primary slot's; only meaningful together with `provider`.
+          description: >-
+            Which credential slot to preview `provider` with. `secondary`
+            uses the secondary provider slot's own API key and base URL
+            instead of the primary slot's; `failover` likewise uses the LLM
+            failover slot's own key and base URL. `a`/`b` are accepted as
+            aliases of `primary`/`secondary`. Only meaningful together with
+            `provider`.
           schema:
             type: string
-            enum: [primary, secondary]
+            enum: [primary, secondary, failover, a, b]
             default: primary
       responses:
         '200':
@@ -6347,9 +7037,12 @@ paths:
               properties:
                 slot:
                   type: string
-                  enum: [primary, secondary]
+                  enum: [primary, secondary, failover, a, b]
                   default: primary
-                  description: Credential slot to refresh. secondary requires a configured secondary provider.
+                  description: >-
+                    Credential slot to refresh. secondary/failover require a
+                    configured secondary/failover provider. `a`/`b` are
+                    accepted as aliases of `primary`/`secondary`.
       responses:
         '200':
           description: Refreshed model list
@@ -6575,11 +7268,13 @@ paths:
                         type: string
                         format: date
                   stable:
-                    $ref: '#/components/schemas/ReleaseInfo'
-                    nullable: true
+                    anyOf:
+                      - $ref: '#/components/schemas/ReleaseInfo'
+                      - type: 'null'
                   edge:
-                    $ref: '#/components/schemas/ReleaseInfo'
-                    nullable: true
+                    anyOf:
+                      - $ref: '#/components/schemas/ReleaseInfo'
+                      - type: 'null'
                   channel:
                     type: string
                     enum: [stable, edge]
@@ -6645,12 +7340,10 @@ paths:
                           type: integer
                           description: Number of API calls made with this model
                         inputCostPerMtok:
-                          type: number
-                          nullable: true
+                          type: [number, 'null']
                           description: Input cost per million tokens (USD)
                         outputCostPerMtok:
-                          type: number
-                          nullable: true
+                          type: [number, 'null']
                           description: Output cost per million tokens (USD)
 
   /system/model-pricing:
@@ -6683,10 +7376,10 @@ paths:
                       type: object
                       properties:
                         matchKey:
-                          type: string
+                          type: [string, 'null']
                           description: Normalized model key for pricing lookups
                         rawModelId:
-                          type: string
+                          type: [string, 'null']
                           description: Original model identifier from pricing source
                         displayName:
                           type: string
@@ -7207,13 +7900,11 @@ paths:
                       description:
                         type: string
                       firstEvent:
-                        type: string
+                        type: [string, 'null']
                         format: date-time
-                        nullable: true
                       lastEvent:
-                        type: string
+                        type: [string, 'null']
                         format: date-time
-                        nullable: true
                       version:
                         type: string
         '400':
@@ -7793,7 +8484,9 @@ paths:
                       - Queue Resumed
                       - Service Offline
                       - Service Reachable
-                  description: List of event types to subscribe to. `Auth Failure` fires on credential errors (invalid or expired API key). `Limit Exceeded` fires when the provider rejects a request because a spend or usage limit is exhausted (monthly key limit, out of credits). `Rate Limit Structural` fires when one detection-window request exceeds the provider's per-minute token cap. `Feed Refresh Failed` fires after several consecutive failures to fetch a podcast's origin RSS feed. `Update Available` fires when the daily update check finds a newer release on the selected channel. `Cue Template Quiet` fires when an enabled cue template on a cue_only feed stops matching recent episodes. `Queue Held` fires when a provider rate limit pauses the queue; `Queue Resumed` when that hold clears. `Service Offline` fires when an episode defers because the LLM or Whisper endpoint is unreachable; `Service Reachable` when the probe finds it back up.
+                      - Failover Triggered
+                      - Failover Cancelled
+                  description: List of event types to subscribe to. `Auth Failure` fires on credential errors (invalid or expired API key). `Limit Exceeded` fires when the provider rejects a request because a spend or usage limit is exhausted (monthly key limit, out of credits). `Rate Limit Structural` fires when one detection-window request exceeds the provider's per-minute token cap. `Feed Refresh Failed` fires after several consecutive failures to fetch a podcast's origin RSS feed. `Update Available` fires when the daily update check finds a newer release on the selected channel. `Cue Template Quiet` fires when an enabled cue template on a cue_only feed stops matching recent episodes. `Queue Held` fires when a provider rate limit pauses the queue; `Queue Resumed` when that hold clears. `Service Offline` fires when an episode defers because the LLM or Whisper endpoint is unreachable; `Service Reachable` when the probe finds it back up. `Failover Triggered` fires when a target switches to its failover provider; `Failover Cancelled` when it switches back.
                 enabled:
                   type: boolean
                   description: Whether the webhook is active
@@ -7801,8 +8494,7 @@ paths:
                   type: string
                   description: Optional shared secret for HMAC signature verification
                 payloadTemplate:
-                  type: string
-                  nullable: true
+                  type: [string, 'null']
                   description: Optional custom payload template
                 contentType:
                   type: string
@@ -7845,8 +8537,7 @@ paths:
                 secret:
                   type: string
                 payloadTemplate:
-                  type: string
-                  nullable: true
+                  type: [string, 'null']
                 contentType:
                   type: string
       responses:
@@ -7952,8 +8643,7 @@ paths:
                     type: string
                     description: Rendered template preview (when valid)
                   error:
-                    type: string
-                    nullable: true
+                    type: [string, 'null']
                     description: Error message (when invalid)
         '429':
           description: Rate limit exceeded
@@ -8630,7 +9320,7 @@ paths:
                       type: object
                       properties:
                         id: { type: integer }
-                        sponsor: { type: string, nullable: true }
+                        sponsor: {type: [string, 'null']}
                         reasons:
                           type: array
                           items: { type: string }
@@ -9182,6 +9872,53 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /settings/pattern-cleanup:
+    put:
+      summary: Update pattern cleanup (Experiments) settings
+      tags: [Settings]
+      operationId: updatePatternCleanupSettings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                enabled:
+                  type: boolean
+                cron:
+                  type: string
+                  description: Valid 5-field cron expression in UTC.
+                batchSize:
+                  type: integer
+                  minimum: 1
+                  maximum: 200
+                unusedDays:
+                  type: integer
+                  minimum: 7
+                  maximum: 3650
+                provider:
+                  type: [string, 'null']
+                  description: >-
+                    'primary'/'secondary' (or the 'a'/'b' aliases) or
+                    'same_as_detection'; blank or null clears the override so
+                    detection's slot is inherited.
+                model:
+                  type: [string, 'null']
+                  maxLength: 200
+                  description: Blank or null inherits the detection model.
+      responses:
+        '200':
+          description: Updated settings
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PatternCleanupSettings' }
+        '400':
+          description: Malformed or empty request object, invalid field type, invalid cron, out-of-range value, unknown provider slot, or model too long
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /community-patterns/sync:
     post:
       summary: Force a community-pattern sync now
@@ -9370,8 +10107,7 @@ paths:
                   type: string
                   description: Required when promoting to network scope
                 scoreThreshold:
-                  type: number
-                  nullable: true
+                  type: [number, 'null']
                   minimum: 0.30
                   maximum: 0.99
                   description: >
@@ -9698,8 +10434,7 @@ paths:
                         end:
                           type: number
                         prominenceDb:
-                          type: number
-                          nullable: true
+                          type: [number, 'null']
         '404':
           description: Feed or original audio not found
 
@@ -9750,17 +10485,13 @@ paths:
                           type: string
                           enum: [template, spectral, loud_spot]
                         label:
-                          type: string
-                          nullable: true
+                          type: [string, 'null']
                         cueType:
-                          type: string
-                          nullable: true
+                          type: [string, 'null']
                         score:
-                          type: number
-                          nullable: true
+                          type: [number, 'null']
                         prominenceDb:
-                          type: number
-                          nullable: true
+                          type: [number, 'null']
         '404':
           description: Feed not found
 
@@ -9837,33 +10568,27 @@ paths:
                           enum: [recurring, intro, outro]
                           description: recurring (repeats within the episode), or intro/outro (shared across sibling episodes)
                         count:
-                          type: integer
-                          nullable: true
+                          type: [integer, 'null']
                           description: Recurring candidates only -- times the sound recurs within the episode
                         episodeMatches:
-                          type: integer
-                          nullable: true
+                          type: [integer, 'null']
                           description: Intro/outro candidates only -- how many sibling episodes share the segment
                         suggestedType:
-                          type: string
-                          nullable: true
-                          enum: [show_intro, show_outro, ad_break_boundary, ad_break_start, ad_break_end, content_transition]
+                          type: [string, 'null']
+                          enum: [show_intro, show_outro, ad_break_boundary, ad_break_start, ad_break_end, content_transition, null]
                           description: Capture-type hint; intro/outro get show_intro/show_outro; recurring gets ad-affinity type or null
                         adBoundaryHits:
-                          type: integer
-                          nullable: true
+                          type: [integer, 'null']
                           description: Recurring candidates only -- how many occurrences landed near a known ad boundary
                         boundaryAffinity:
-                          type: number
+                          type: [number, 'null']
                           format: float
                           minimum: 0
                           maximum: 1
-                          nullable: true
                           description: adBoundaryHits / count; null when no ad history was available
                         affinitySource:
-                          type: string
-                          nullable: true
-                          enum: [episode, siblings]
+                          type: [string, 'null']
+                          enum: [episode, siblings, null]
                           description: Whether affinity was computed from the scanned episode's own ad history or from sibling episodes
         '404':
           description: Feed or original audio not found
@@ -9904,8 +10629,7 @@ paths:
                   type: number
                   description: End of the span to dismiss (seconds)
                 label:
-                  type: string
-                  nullable: true
+                  type: [string, 'null']
                   description: Optional human-readable label for the dismissal
       responses:
         '201':
@@ -9918,8 +10642,7 @@ paths:
                   id:
                     type: integer
                   label:
-                    type: string
-                    nullable: true
+                    type: [string, 'null']
                   startS:
                     type: number
                   endS:
@@ -9963,8 +10686,7 @@ paths:
                         id:
                           type: integer
                         label:
-                          type: string
-                          nullable: true
+                          type: [string, 'null']
                         sourceEpisodeId:
                           type: string
                         startS:
@@ -10079,8 +10801,7 @@ paths:
                             templateId:
                               type: integer
                             label:
-                              type: string
-                              nullable: true
+                              type: [string, 'null']
                             hint:
                               type: string
                               enum: [raise_threshold, recapture]
@@ -10148,8 +10869,7 @@ paths:
                         enum: [high, partial, low]
                         description: high when signal is clearly above the effect floor; partial when signal is below the effect floor; low when no clear gap was found.
                       suggested:
-                        type: number
-                        nullable: true
+                        type: [number, 'null']
                         description: Proposed threshold (0-1), or null on low confidence.
                       noiseCeiling:
                         type: number
@@ -10167,8 +10887,7 @@ paths:
                         type: number
                         description: Lowest confidence at which a cue can affect a cut on this install.
                       effectFloorWarning:
-                        type: string
-                        nullable: true
+                        type: [string, 'null']
                         enum: [signal-below-floor, null]
                         description: signal-below-floor when the signal cluster sits below the effect floor; null otherwise.
                       scoresN:
@@ -10402,8 +11121,7 @@ paths:
                     type: number
                     description: Mean peak ZNCC score of the proposed window. Present when ready.
                   baselineMeanPeakScore:
-                    type: number
-                    nullable: true
+                    type: [number, 'null']
                     description: >
                       Mean peak score of the original window. Present when ready;
                       null when the original window falls outside the live
@@ -10616,6 +11334,113 @@ components:
         keptPct:
           type: number
           description: 100 * adsKept / adsProposed over yield rows, 0.0 when nothing was proposed.
+    FailoverTargetState:
+      type: object
+      description: Current failover state of one target (#806).
+      properties:
+        active:
+          type: boolean
+          description: True while this target is running on its failover configuration.
+        source:
+          type:
+            - string
+            - 'null'
+          enum: [auto, manual, probe, null]
+          description: What last changed the active state; null while inactive.
+        since:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: When the current state began; null while inactive.
+        reason:
+          type:
+            - string
+            - 'null'
+          description: Free-text reason recorded with the last trigger; null while inactive.
+        configured:
+          type: boolean
+          description: Whether this target has a failover configuration to switch to.
+        enabled:
+          type: boolean
+          description: Whether the original target is in use. Always true for llm-a and transcriber; llm-b is true only while Provider B is enabled with a provider type.
+    FailoverProbe:
+      type: object
+      description: Most recent health probe of one failover-related endpoint (#806).
+      properties:
+        reachable:
+          type:
+            - boolean
+            - 'null'
+          description: Null before the first probe.
+        status:
+          type:
+            - integer
+            - 'null'
+          description: HTTP status code of the last probe, when a response was received.
+        detail:
+          type: string
+          description: Human-readable outcome of the last probe.
+        checkedAt:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: When the last probe ran; null before the first probe.
+        healthyStreak:
+          type: integer
+          description: Consecutive healthy probes; resets to 0 on any unhealthy probe.
+        failedStreak:
+          type: integer
+          description: Consecutive unhealthy probes; resets to 0 on any healthy probe.
+    FailoverEvent:
+      type: object
+      description: One manual, automatic, or probe-driven failover state change (#806).
+      properties:
+        id:
+          type: integer
+        target:
+          type: string
+          enum: [llm-a, llm-b, transcriber]
+        action:
+          type: string
+          enum: [trigger, cancel]
+        source:
+          type: string
+          enum: [auto, manual, probe]
+        reason:
+          type:
+            - string
+            - 'null'
+        createdAt:
+          type: string
+          format: date-time
+    FailoverOverview:
+      type: object
+      description: GET /failover response body (#806).
+      properties:
+        targets:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/FailoverTargetState'
+          description: Keyed by target name (llm-a, llm-b, transcriber).
+        probes:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/FailoverProbe'
+          description: Keyed by probe name (llm-a, llm-b, llm-failover, transcriber, transcriber-failover).
+        policy:
+          type: object
+          properties:
+            probeIntervalMinutes:
+              type: integer
+            recoveryProbes:
+              type: integer
+              description: Consecutive healthy probes needed before an automatic failover recovers.
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/FailoverEvent'
     ConnectionTestResult:
       type: object
       properties:
@@ -10694,8 +11519,7 @@ components:
           enum: [ad_break_boundary, ad_break_start, ad_break_end, show_intro, show_outro, content_transition]
           default: ad_break_boundary
         sourceEpisodeId:
-          type: string
-          nullable: true
+          type: [string, 'null']
         sourceOffsetS:
           type: number
         durationS:
@@ -10709,15 +11533,13 @@ components:
           enum: [podcast, network]
           default: podcast
         networkId:
-          type: string
-          nullable: true
+          type: [string, 'null']
         enabled:
           type: boolean
         createdAt:
           type: string
         createdBy:
-          type: string
-          nullable: true
+          type: [string, 'null']
         owned:
           type: boolean
           description: >
@@ -10759,8 +11581,7 @@ components:
             whenever the create route returns so the UI can display a consistent
             hint without a separate config fetch. Absent on list rows.
         scoreThreshold:
-          type: number
-          nullable: true
+          type: [number, 'null']
           minimum: 0.30
           maximum: 0.99
           description: >
@@ -10769,8 +11590,7 @@ components:
             fall back to the per-feed override or global setting.
             Minimum 0.30 (noise floor; sub-floor values pass noise as matches).
         lastMatchAt:
-          type: string
-          nullable: true
+          type: [string, 'null']
           description: Timestamp of this template's most recent above-threshold match. Null when it has never matched.
         matchedEpisodes:
           type: integer
@@ -10797,17 +11617,13 @@ components:
         enabled: { type: boolean }
         cron:    { type: string }
         lastRun:
-          type: string
-          nullable: true
+          type: [string, 'null']
         lastError:
-          type: string
-          nullable: true
+          type: [string, 'null']
         manifestVersion:
-          type: string
-          nullable: true
+          type: [string, 'null']
         lastSummary:
-          type: string
-          nullable: true
+          type: [string, 'null']
           description: JSON-encoded summary of the last sync (counts + manifest version)
         categories:
           type: array
@@ -10852,17 +11668,15 @@ components:
         exists:
           type: boolean
           description: False when no file is on disk, in which case cuts render as silence.
-        sizeBytes: { type: integer, nullable: true }
+        sizeBytes: {type: [integer, 'null']}
         updatedAt:
-          type: integer
-          nullable: true
+          type: [integer, 'null']
           description: Unix mtime, used by the UI to bust the preview cache.
         durationSeconds:
-          type: number
-          nullable: true
+          type: [number, 'null']
           description: Every cut becomes this long.
-        channels: { type: integer, nullable: true }
-        sampleRateHz: { type: integer, nullable: true }
+        channels: {type: [integer, 'null']}
+        sampleRateHz: {type: [integer, 'null']}
     DatabaseBackupSettings:
       type: object
       properties:
@@ -10881,16 +11695,13 @@ components:
           type: integer
           description: Number of backup files to keep (1 = overwrite mode, >1 = rotate mode).
         lastRun:
-          type: string
-          nullable: true
+          type: [string, 'null']
           description: ISO 8601 timestamp of the last completed backup run, or null.
         lastError:
-          type: string
-          nullable: true
+          type: [string, 'null']
           description: Error message from the most recent failed backup run, or null.
         lastSummary:
-          type: string
-          nullable: true
+          type: [string, 'null']
           description: JSON-encoded DatabaseBackupRunSummary from the last successful run, or null.
 
     DatabaseBackupRunSummary:
@@ -10918,6 +11729,224 @@ components:
         finishedAt:
           type: string
           description: ISO 8601 UTC timestamp when the backup completed.
+
+    PatternCleanupSettings:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+        cron:
+          type: string
+          description: Five-field cron expression in UTC.
+        batchSize:
+          type: integer
+          minimum: 1
+          maximum: 200
+        unusedDays:
+          type: integer
+          minimum: 7
+          maximum: 3650
+        provider:
+          type: string
+          description: >-
+            Credential slot ('primary', 'secondary', or 'same_as_detection'),
+            or blank to inherit detection's slot. 'a'/'b' are accepted as
+            aliases for primary/secondary on write.
+        model:
+          type: string
+          maxLength: 200
+          description: Blank inherits the detection model.
+
+    PatternCleanupStatus:
+      allOf:
+        - $ref: '#/components/schemas/PatternCleanupSettings'
+        - type: object
+          properties:
+            inProgress:
+              type: boolean
+              description: Whether another run currently holds the cleanup lock.
+            lastRun:
+              type: [string, 'null']
+              description: >-
+                ISO 8601 UTC start of the newest run row, including one still
+                running. Enabling the schedule does not change it.
+            lastError:
+              type: [string, 'null']
+              description: Error of the newest finished run, if it failed.
+            lastSummary:
+              anyOf:
+                - $ref: '#/components/schemas/PatternCleanupRun'
+                - type: 'null'
+              description: The newest finished run (completed or failed).
+            pending:
+              type: object
+              properties:
+                total:
+                  type: integer
+                byKind:
+                  type: object
+                  additionalProperties:
+                    type: integer
+
+    PatternCleanupRun:
+      type: object
+      properties:
+        id:
+          type: integer
+        startedAt:
+          type: string
+        finishedAt:
+          type: [string, 'null']
+        status:
+          type: string
+          enum: [running, completed, failed]
+        forced:
+          type: boolean
+        trigger:
+          type: string
+          enum: [schedule, manual]
+        model:
+          type: [string, 'null']
+          description: Configured cleanup model captured at run start, before failover overrides.
+        provider:
+          type: [string, 'null']
+          description: Configured cleanup provider captured at run start, not actual request usage.
+        credentialSlot:
+          type: [string, 'null']
+          description: Configured credential slot captured at run start, before failover overrides.
+        reviewedCount:
+          type: integer
+        suggestedCount:
+          type: integer
+        skippedCount:
+          type: integer
+        errorCount:
+          type: integer
+          description: Number of patterns whose review or storage failed. Repeated call failures can stop the run.
+        error:
+          type: [string, 'null']
+          description: Set only when the whole run failed (e.g. rate limited).
+
+    PatternCleanupSuggestion:
+      type: object
+      properties:
+        id:
+          type: integer
+        runId:
+          type: [integer, 'null']
+        patternId:
+          type: integer
+        kind:
+          type: string
+          enum: [trim, split, rename, retire, flag]
+        status:
+          type: string
+          enum: [pending, approved, rejected, undone]
+        confidence:
+          type: [number, 'null']
+          minimum: 0
+          maximum: 1
+        reasons:
+          type: array
+          items:
+            type: string
+        payload:
+          type: object
+          description: >-
+            Shape depends on kind: trim {text, sponsor?}; split {pieces: [{text,
+            sponsor}]}; rename {sponsor}; retire {unusedDays, lastMatchedAt,
+            confirmationCount}; flag {falsePositiveCount, confirmationCount,
+            contaminated, contaminationReason, recommended, trimText?, sponsor?}.
+            A trim's optional sponsor applies a sponsor correction in the
+            same approval as the text edit.
+        before:
+          type: [object, 'null']
+          description: Snapshot of the pattern at suggestion time, used to undo an approval.
+          properties:
+            textTemplate:
+              type: [string, 'null']
+            sponsor:
+              type: [string, 'null']
+            sponsorId:
+              type: [integer, 'null']
+            isActive:
+              type: boolean
+            introVariants:
+              type: array
+              items: { type: string }
+            outroVariants:
+              type: array
+              items: { type: string }
+            sourceContext:
+              type: string
+              description: Optional retained source transcript around the reviewed pattern, with its span marked by double brackets. Absent when unavailable.
+        applied:
+          type: [object, 'null']
+          description: >-
+            Saved approval result, including the post-approval state used
+            to refuse undo after later edits. Older approvals may lack snapshots.
+          properties:
+            newPatternIds:
+              type: array
+              items: { type: integer }
+            disabledPatternId:
+              type: [integer, 'null']
+            appliedAt:
+              type: string
+              format: date-time
+            appliedSeq:
+              type: integer
+              format: int64
+              description: Orders approvals on one pattern for undo conflict checks.
+            text:
+              type: string
+            sponsorId:
+              type: integer
+            after:
+              type: object
+              description: Post-approval values of fields owned by this change.
+              properties:
+                isActive:
+                  type: boolean
+            newPatternStates:
+              type: array
+              description: Post-approval snapshots of split children.
+              items:
+                type: object
+                properties:
+                  id: { type: integer }
+                  fields:
+                    type: object
+                    properties:
+                      isActive: { type: boolean }
+        createdAt:
+          type: string
+        reviewedAt:
+          type: [string, 'null']
+        pattern:
+          type: object
+          description: Present on the suggestions list; omitted on approve/reject/undo responses.
+          properties:
+            id:
+              type: integer
+            sponsor:
+              type: [string, 'null']
+            scope:
+              type: string
+            networkId:
+              type: [string, 'null']
+            podcastTitle:
+              type: [string, 'null']
+            isActive:
+              type: boolean
+            confirmationCount:
+              type: integer
+            falsePositiveCount:
+              type: integer
+            lastMatchedAt:
+              type: [string, 'null']
+            createdAt:
+              type: string
 
     AdDistribution:
       type: object
@@ -11276,21 +12305,15 @@ components:
             - null
           description: Per-feed override for listing generated chapters in served episode descriptions. null follows the global chaptersInNotes setting.
         adChaptersEnabled:
-          type:
-            - string
-            - 'null'
-          enum:
-            - 'on'
-            - 'off'
-            - null
-          description: Per-feed override for publishing kept ad segments as skippable chapters. null follows the global adChaptersEnabled setting.
+          type: boolean
+          deprecated: true
+          description: Deprecated. Derived from the feed's resolved segment actions; true when any category resolves to mark.
         adChapterCategories:
-          type:
-            - object
-            - 'null'
+          type: object
           additionalProperties:
             type: boolean
-          description: Per-feed override mapping each segment category to whether it gets an ad chapter. null follows the global adChapterCategories setting.
+          deprecated: true
+          description: Deprecated. Derived from the feed's resolved segment actions; true for each category that resolves to mark.
         queuePriority:
           type: string
           enum:
@@ -11515,7 +12538,7 @@ components:
             - 'null'
           additionalProperties:
             type: string
-            enum: [remove, beep, keep]
+            enum: [remove, beep, keep, mark]
           description: Per-feed segment-category action overrides (issue #565). Only the overridden categories are present; a category absent here inherits the global default. Null when the feed has no overrides.
         detectShowSegments:
           type:
@@ -11532,6 +12555,11 @@ components:
             - boolean
             - 'null'
           description: Whether the pass-2 verification scan of the cut audio is skipped for this feed. Null follows the global skipSecondPass setting.
+        transcriptDifferential:
+          type:
+            - boolean
+            - 'null'
+          description: Per-feed override for upstream-transcript differential. True enables and false disables it for this feed; null follows the global transcriptDifferentialEnabled setting.
         latestEpisodes:
           type: array
           items:
@@ -11636,9 +12664,8 @@ components:
             - 'null'
           description: Original duration in seconds
         newDuration:
-          type: number
+          type: [number, 'null']
           description: Duration after ad removal in seconds
-          nullable: true
         adsRemoved:
           type: integer
           description: Rendered cuts in the output audio. Markers merged into one cut count once.
@@ -11658,12 +12685,10 @@ components:
           type: boolean
           description: True when this episode has a processed output on record, independent of its current status. A completed episode queued again reverts to status pending, so clients use this rather than status to choose between a Process and a Reprocess label.
         artworkUrl:
-          type: string
-          nullable: true
+          type: [string, 'null']
           description: Episode cover declared by the publisher. Null when the episode declares none, or when the URL is not https and would be blocked as mixed content; clients fall back to the feed artwork. A local feed has no publisher, so this instead falls back to /api/v1/feeds/{slug}/episodes/{episode_id}/artwork whenever the episode has a cached cover (an upload or embedded-artwork extraction), and stays null only when it has none.
         error:
-          type: string
-          nullable: true
+          type: [string, 'null']
           description: Failure reason from the most recent processing attempt, present when status is failed or permanently_failed
 
     EpisodeDetail:
@@ -11683,16 +12708,14 @@ components:
               description: Adjacent episodes in the same feed, newest-first order. previous is the newer episode, next the older; either is null at a feed boundary (issue #417).
               properties:
                 previous:
-                  type: object
-                  nullable: true
+                  type: [object, 'null']
                   properties:
                     id:
                       type: string
                     title:
                       type: string
                 next:
-                  type: object
-                  nullable: true
+                  type: [object, 'null']
                   properties:
                     id:
                       type: string
@@ -11715,7 +12738,7 @@ components:
                 $ref: '#/components/schemas/AdMarker'
             keptMarkers:
               type: array
-              description: Segments deliberately left in the audio by a per-category keep action (action_applied=keep, not held for review). Distinct from rejectedAdMarkers, which holds flagged-but-not-kept-on-purpose detections.
+              description: Segments deliberately left in the audio by a Keep or Mark action, not held for review. actionApplied distinguishes keep from mark; rejectedAdMarkers contains detections rejected by the pipeline.
               items:
                 $ref: '#/components/schemas/AdMarker'
             cueDetections:
@@ -11759,6 +12782,43 @@ components:
                   type:
                     - string
                     - 'null'
+            upstreamTranscript:
+              type:
+                - object
+                - 'null'
+              description: >-
+                Diff of this episode's transcript against the publisher's
+                podcast:transcript. null until the stage has stored a result.
+                status none means the stage did not run (no transcript link, or
+                the feed or global toggle is off); unreliable means the two
+                transcripts matched too little to trust, so no spans are
+                reported. Each span is speech the publisher transcript omits.
+              properties:
+                status:
+                  type: string
+                  enum: [ok, none, unreliable, empty, error]
+                coverage:
+                  type:
+                    - number
+                    - 'null'
+                  description: Fraction of Whisper words matched in the publisher transcript.
+                sourceType:
+                  type:
+                    - string
+                    - 'null'
+                  description: MIME type of the publisher transcript that was compared.
+                spans:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      start:
+                        type: number
+                      end:
+                        type: number
+                      offsetConfirmed:
+                        type: boolean
+                        description: The publisher transcript's timestamps jump by the span's length across it.
             spliceCalibration:
               type:
                 - object
@@ -12414,6 +13474,8 @@ components:
                   type: integer
                 differential:
                   type: integer
+                transcriptDifferential:
+                  type: integer
                 llm:
                   type: integer
             detected:
@@ -12466,6 +13528,10 @@ components:
                     - number
                     - 'null'
                 transcriptionSeconds:
+                  type:
+                    - number
+                    - 'null'
+                transcriptDiffSeconds:
                   type:
                     - number
                     - 'null'
@@ -12561,6 +13627,20 @@ components:
                 gpuDeviceName: NVIDIA GPU
                 model: large-v3
                 error: null
+            transcriptDiff:
+              type: object
+              description: Upstream transcript diff outcome for this run. Absent on runs that did not reach the stage.
+              properties:
+                status:
+                  type: string
+                  enum: [ok, none, unreliable, empty, error]
+                coverage:
+                  type:
+                    - number
+                    - 'null'
+                spans:
+                  type: integer
+                  description: Number of spans the publisher transcript omits.
             thinkingNotices:
               type: array
               description: >-
@@ -12570,6 +13650,25 @@ components:
                 is never stored.
               items:
                 $ref: '#/components/schemas/ThinkingCompatibilityNotice'
+            failover:
+              type: object
+              description: >-
+                Present only when this run actually sent requests to a failover
+                configuration. llm lists the original targets whose calls ran on
+                the failover LLM provider; whisper is true when transcription ran
+                on the failover transcriber.
+              required: [llm, whisper]
+              properties:
+                llm:
+                  type: array
+                  items:
+                    type: string
+                    enum: [llm-a, llm-b]
+                whisper:
+                  type: boolean
+              example:
+                llm: [llm-a]
+                whisper: false
 
     ThinkingCompatibilityNotice:
       type: object
@@ -12627,18 +13726,14 @@ components:
         id:
           type: integer
         template_id:
-          type: integer
-          nullable: true
+          type: [integer, 'null']
         label:
-          type: string
-          nullable: true
+          type: [string, 'null']
         cue_type:
-          type: string
-          nullable: true
-          enum: [ad_break_boundary, ad_break_start, ad_break_end, show_intro, show_outro, content_transition]
+          type: [string, 'null']
+          enum: [ad_break_boundary, ad_break_start, ad_break_end, show_intro, show_outro, content_transition, null]
         role:
-          type: string
-          nullable: true
+          type: [string, 'null']
         source:
           type: string
           description: Always 'template'; spectral cues are not recorded
@@ -12647,11 +13742,9 @@ components:
         end_s:
           type: number
         match_score:
-          type: number
-          nullable: true
+          type: [number, 'null']
         confidence:
-          type: number
-          nullable: true
+          type: [number, 'null']
         outcome:
           type: string
           enum: [snap, pair, none, below_threshold]
@@ -12663,18 +13756,16 @@ components:
           type: string
           enum: [pending, confirmed, rejected]
         edge_distance_s:
-          type: number
-          nullable: true
+          type: [number, 'null']
           description: >
             Signed distance (edge - cue) from an above-threshold cue to the
             nearest pre-snap LLM ad edge on its eligible side. NULL for advisory
             (non_ad) cues and for below_threshold rows.
         unused_reason:
-          type: string
-          nullable: true
+          type: [string, 'null']
           enum: [covered, out_of_reach, below_snap_confidence, advisory_role,
                  unpaired, below_pair_confidence, covered_by_existing_ad,
-                 no_partner_in_band, phase_mismatch]
+                 no_partner_in_band, phase_mismatch, null]
           description: >
             For an outcome='none' cue, why it did nothing. NULL for snap / pair /
             below_threshold outcomes.
@@ -12702,17 +13793,13 @@ components:
         pending:
           type: integer
         avgScore:
-          type: number
-          nullable: true
+          type: [number, 'null']
         minScore:
-          type: number
-          nullable: true
+          type: [number, 'null']
         maxScore:
-          type: number
-          nullable: true
+          type: [number, 'null']
         confirmRate:
-          type: number
-          nullable: true
+          type: [number, 'null']
           description: confirmed / (confirmed + rejected), or null if none reviewed
 
     AdMarker:
@@ -12732,24 +13819,26 @@ components:
           type: string
           description: Reason for marking as ad
         sponsor:
-          type: string
-          nullable: true
+          type: [string, 'null']
           description: Sponsor or advertiser name extracted from the ad
         detection_stage:
           type: string
-          enum: [first_pass, claude, fingerprint, text_pattern, language, audio_enforced, verification, dai_differential]
+          enum: [first_pass, claude, fingerprint, text_pattern, language, audio_enforced, verification, dai_differential, transcript_differential, vad_gap, cue_pair, heuristic_preroll, heuristic_postroll, keep_content, manual]
           description: Which detection stage found this ad
           example: first_pass
+        corroborated_by:
+          type: string
+          enum: [transition_pair, template_cue, volume_anomaly, splice_evidence, dai_differential, transcript_differential]
+          description: Independent evidence the validator found for this ad. transcript_differential means the publisher's transcript omits most of the span. Absent when none was found.
         category:
           type: string
           enum: [sponsor, cross_promo, self_promo, interaction, intro, outro, recap]
           description: What kind of content this span is. LLM detection stages emit it directly; fingerprint, text-pattern, and differential stages default to sponsor. An unknown or missing value falls back to sponsor at marker-save time.
           example: sponsor
         actionApplied:
-          type: string
-          nullable: true
-          enum: [remove, beep, keep, null]
-          description: The action resolved for this marker's category at cut time (per-feed override, else global default, else remove). Null for a marker that has not gone through action resolution.
+          type: [string, 'null']
+          enum: [remove, beep, keep, mark, null]
+          description: The action resolved for this marker's category (per-feed override, else global default, else remove). Stored Keep/Mark values reflect current switches between Keep and Mark without recutting; changes involving remove or beep require a recut. Null before action resolution.
           example: remove
         approved:
           type: boolean
@@ -12778,13 +13867,11 @@ components:
               end:
                 type: number
         hold_reason:
-          type: string
-          nullable: true
-          enum: [max_duration, no_cue_evidence, uncorroborated_tail, reviewer_contradiction, reviewer_boundary_conflict, reviewer_inconclusive_bounds, estimated_pattern_bounds, reviewer_reject_conflict, reviewer_failed, no_splice_evidence, verification_miss, verification_kept_conflict, differential_uncorroborated, large_vad_gap_extension, cue_template_unproven, cue_low_confidence, no_transcript_evidence, null]
+          type: [string, 'null']
+          enum: [max_duration, no_cue_evidence, uncorroborated_tail, reviewer_contradiction, reviewer_boundary_conflict, reviewer_inconclusive_bounds, estimated_pattern_bounds, reviewer_reject_conflict, reviewer_failed, no_splice_evidence, verification_miss, verification_kept_conflict, differential_uncorroborated, large_vad_gap_extension, cue_template_unproven, cue_low_confidence, no_transcript_evidence, transcript_differential_unreviewed, null]
           description: Why the marker requires review. reviewer_boundary_conflict means a reviewer proposal crossed protected merged-ad evidence; reviewer_reject_conflict means the reviewer rejected a span backed by measured evidence or a confirmed sponsor; reviewer_failed means the review call failed and no independent evidence backs the bounds.
         reviewer_reasoning:
-          type: string
-          nullable: true
+          type: [string, 'null']
           description: Reviewer explanation when the reviewer evaluated this marker.
         reviewer_verdict:
           type: string
@@ -12839,8 +13926,7 @@ components:
             stats, which the API does not return.
           example: cut
         pass2_hold_review:
-          type: object
-          nullable: true
+          type: [object, 'null']
           description: Set on a held marker when review of a pass-2 span inside it did not release the hold. The hold stays pending; cleared when a later review releases it. Diagnostic only, separate from reviewer_reasoning.
           properties:
             span:
@@ -12857,12 +13943,10 @@ components:
               type: string
               description: Reviewer reasoning, or the abstain reason for an inconclusive review.
         reviewer_proposed_start:
-          type: number
-          nullable: true
+          type: [number, 'null']
           description: Informational reviewer-proposed start on a held marker. It is not applied until a human confirms it.
         reviewer_proposed_end:
-          type: number
-          nullable: true
+          type: [number, 'null']
           description: Informational reviewer-proposed end on a held marker. It is not applied until a human confirms it.
         validation:
           type: object
@@ -12900,31 +13984,28 @@ components:
         feedTitle: { type: string }
         episodeId: { type: string }
         episodeTitle: { type: string }
-        publishDate: { type: string, nullable: true }
+        publishDate: {type: [string, 'null']}
         hasOriginalAudio: { type: boolean }
         processedUrl:
           type: string
           description: Same-origin processed-audio URL (carries the feed auth key when enabled)
         start: { type: number }
         end: { type: number }
-        confidence: { type: number, nullable: true }
-        sponsor: { type: string, nullable: true }
-        reason: { type: string, nullable: true }
-        patternId: { type: integer, nullable: true }
-        detectionStage: { type: string, nullable: true }
+        confidence: {type: [number, 'null']}
+        sponsor: {type: [string, 'null']}
+        reason: {type: [string, 'null']}
+        patternId: {type: [integer, 'null']}
+        detectionStage: {type: [string, 'null']}
         category:
-          type: string
-          nullable: true
+          type: [string, 'null']
           description: Segment category, or null when no stage classified the marker
           enum: [sponsor, cross_promo, self_promo, interaction, intro, outro, recap, null]
         actionApplied:
-          type: string
-          nullable: true
-          description: Action the category resolved to for this marker
-          enum: [remove, beep, keep, null]
+          type: [string, 'null']
+          description: Action resolved for this marker. Stored Keep/Mark values reflect current switches between Keep and Mark without recutting; changes involving remove or beep require a recut.
+          enum: [remove, beep, keep, mark, null]
         reviewerVerdict:
-          type: string
-          nullable: true
+          type: [string, 'null']
           description: >-
             Ad reviewer verdict on this marker, or null when the reviewer did
             not run. inconclusive means the reviewer abstained: the marker keeps
@@ -12934,12 +14015,10 @@ components:
             originals, and neither records reviewerOriginalStart/End.
           enum: [confirmed, adjust, reject, resurrect, inconclusive, failure, null]
         reviewerOriginalStart:
-          type: number
-          nullable: true
+          type: [number, 'null']
           description: Start of the span before the reviewer moved it; present only when the reviewer moved the span
         reviewerOriginalEnd:
-          type: number
-          nullable: true
+          type: [number, 'null']
           description: End of the span before the reviewer moved it; present only when the reviewer moved the span
         reviewerMoved:
           type: boolean
@@ -12948,10 +14027,9 @@ components:
             reviewer or by a human approving a trimmed boundary. Use this
             instead of inferring a move from reviewerVerdict/reviewerOriginalStart/End.
         holdReason:
-          type: string
-          nullable: true
+          type: [string, 'null']
           description: Why the detection is held for review; null unless status is pending
-          enum: [max_duration, no_cue_evidence, uncorroborated_tail, reviewer_contradiction, reviewer_boundary_conflict, reviewer_inconclusive_bounds, estimated_pattern_bounds, reviewer_reject_conflict, reviewer_failed, no_splice_evidence, verification_miss, verification_kept_conflict, differential_uncorroborated, large_vad_gap_extension, cue_template_unproven, cue_low_confidence, no_transcript_evidence, null]
+          enum: [max_duration, no_cue_evidence, uncorroborated_tail, reviewer_contradiction, reviewer_boundary_conflict, reviewer_inconclusive_bounds, estimated_pattern_bounds, reviewer_reject_conflict, reviewer_failed, no_splice_evidence, verification_miss, verification_kept_conflict, differential_uncorroborated, large_vad_gap_extension, cue_template_unproven, cue_low_confidence, no_transcript_evidence, transcript_differential_unreviewed, null]
         status:
           type: string
           enum: [accepted, rejected, pending]
@@ -12971,20 +14049,16 @@ components:
           description: Human-readable model name
           example: Claude Opus 4.5
         created:
-          type: string
+          type: [string, 'null']
           format: date-time
-          nullable: true
         inputCostPerMtok:
-          type: number
-          nullable: true
+          type: [number, 'null']
           description: Input cost per million tokens (USD), present when pricing is known
         outputCostPerMtok:
-          type: number
-          nullable: true
+          type: [number, 'null']
           description: Output cost per million tokens (USD), present when pricing is known
         pricingSource:
-          type: string
-          nullable: true
+          type: [string, 'null']
           description: Pricing source, including operator when a configured override applies
 
     ModelPricingOverride:
@@ -13155,6 +14229,14 @@ components:
               type: string
             isDefault:
               type: boolean
+        patternCleanupPrompt:
+          type: object
+          description: System prompt for the pattern cleanup review of learned patterns.
+          properties:
+            value:
+              type: string
+            isDefault:
+              type: boolean
         systemPromptOverride:
           type: object
           description: |
@@ -13252,6 +14334,54 @@ components:
               type: string
             isDefault:
               type: boolean
+        patternCleanupEnabled:
+          type: object
+          description: Whether the scheduled pattern cleanup review runs (Experiments).
+          properties:
+            value:
+              type: boolean
+            isDefault:
+              type: boolean
+        patternCleanupCron:
+          type: object
+          description: Five-field cron expression (UTC) for the pattern cleanup schedule. Default `0 4 * * 0`.
+          properties:
+            value:
+              type: string
+            isDefault:
+              type: boolean
+        patternCleanupBatchSize:
+          type: object
+          description: Learned patterns reviewed per cleanup run, 1 to 200. Default 25.
+          properties:
+            value:
+              type: integer
+            isDefault:
+              type: boolean
+        patternCleanupUnusedDays:
+          type: object
+          description: Days without a match before cleanup suggests retiring a pattern, 7 to 3650. Default 90.
+          properties:
+            value:
+              type: integer
+            isDefault:
+              type: boolean
+        patternCleanupProvider:
+          type: object
+          description: 'Routing slot for pattern cleanup, one of `primary`, `secondary`, or `same_as_detection`. Null when unset, which inherits detectionProvider.'
+          properties:
+            value:
+              type: [string, 'null']
+            isDefault:
+              type: boolean
+        patternCleanupModel:
+          type: object
+          description: Model for pattern cleanup. Null when unset, which inherits the detection model.
+          properties:
+            value:
+              type: [string, 'null']
+            isDefault:
+              type: boolean
         whisperModel:
           type: object
           properties:
@@ -13301,6 +14431,14 @@ components:
             value:
               type: integer
               description: Seconds to wait for each remote Whisper transcription request.
+            isDefault:
+              type: boolean
+        transcribeMaxChunkSeconds:
+          type: object
+          description: Max duration, in seconds, of each transcription chunk.
+          properties:
+            value:
+              type: integer
             isDefault:
               type: boolean
         transcribeConcurrentChunks:
@@ -13879,7 +15017,7 @@ components:
               type: object
               additionalProperties:
                 type: string
-                enum: [remove, beep, keep]
+                enum: [remove, beep, keep, mark]
             isDefault:
               type: boolean
         communitySyncCategories:
@@ -13989,16 +15127,13 @@ components:
             isDefault:
               type: boolean
         feedAuthKey:
-          type: string
-          nullable: true
+          type: [string, 'null']
           description: Global feed auth key (64 hex chars) carried as ?key= on feed/episode URLs and embedded in the badged cover path token; null until first enable.
         opmlModifiedUrl:
-          type: string
-          nullable: true
+          type: [string, 'null']
           description: Copyable public URL for importing modified (ad-free) feeds by URL; null when feed auth is disabled.
         opmlOriginalUrl:
-          type: string
-          nullable: true
+          type: [string, 'null']
           description: Copyable public URL for importing original (upstream) feeds by URL; null when feed auth is disabled.
         minCutConfidence:
           type: object
@@ -14042,6 +15177,14 @@ components:
               type: boolean
             isDefault:
               type: boolean
+        transcriptDifferentialEnabled:
+          type: object
+          description: Default for the upstream-transcript differential for feeds that inherit this setting.
+          properties:
+            value:
+              type: boolean
+            isDefault:
+              type: boolean
         differentialFetchMode:
           type: object
           description: Default cross-fetch mode for feeds that inherit the global setting.
@@ -14061,7 +15204,8 @@ components:
               type: boolean
         adChaptersEnabled:
           type: object
-          description: Publish kept or held ad segments as skippable chapters in the generated chapter list.
+          deprecated: true
+          description: Deprecated. Derived from segmentCategoryActions; true when any category resolves to mark.
           properties:
             value:
               type: boolean
@@ -14069,7 +15213,8 @@ components:
               type: boolean
         adChapterCategories:
           type: object
-          description: Map of segment category to whether it gets an ad chapter.
+          deprecated: true
+          description: Deprecated. Derived from segmentCategoryActions; true for each category that resolves to mark.
           properties:
             value:
               type: object
@@ -14212,8 +15357,7 @@ components:
           type: object
           properties:
             value:
-              type: string
-              nullable: true
+              type: [string, 'null']
               description: Secondary provider type (anthropic, openrouter, openai-compatible, ollama), or null when unset
             isDefault:
               type: boolean
@@ -14293,6 +15437,261 @@ components:
               minimum: 0
             isDefault:
               type: boolean
+        providerBEnabled:
+          type: object
+          description: Alias of secondaryProviderEnabled.
+          properties:
+            value:
+              type: boolean
+            isDefault:
+              type: boolean
+        providerB:
+          type: object
+          description: Alias of secondaryProvider.
+          properties:
+            value:
+              type: [string, 'null']
+            isDefault:
+              type: boolean
+        providerBBaseUrl:
+          type: object
+          description: Alias of secondaryProviderBaseUrl.
+          properties:
+            value:
+              type: string
+            isDefault:
+              type: boolean
+        providerBApiKeyConfigured:
+          type: boolean
+          description: Alias of secondaryProviderApiKeyConfigured (read-only).
+        providerBRequestsPerMin:
+          type: object
+          description: Alias of secondaryProviderRequestsPerMin.
+          properties:
+            value:
+              type: integer
+              minimum: 0
+            isDefault:
+              type: boolean
+        providerBRequestsPerDay:
+          type: object
+          description: Alias of secondaryProviderRequestsPerDay.
+          properties:
+            value:
+              type: integer
+              minimum: 0
+            isDefault:
+              type: boolean
+        providerBTokensPerMin:
+          type: object
+          description: Alias of secondaryProviderTokensPerMin.
+          properties:
+            value:
+              type: integer
+              minimum: 0
+            isDefault:
+              type: boolean
+        providerATimeoutSeconds:
+          type: object
+          description: Request timeout for Provider A. Null value means the provider-type default.
+          properties:
+            value:
+              type: [integer, 'null']
+            isDefault:
+              type: boolean
+        providerAMaxRetries:
+          type: object
+          description: Max retries for Provider A. Null value means the provider-type default.
+          properties:
+            value:
+              type: [integer, 'null']
+            isDefault:
+              type: boolean
+        providerBTimeoutSeconds:
+          type: object
+          description: Request timeout for Provider B. Null value means the provider-type default.
+          properties:
+            value:
+              type: [integer, 'null']
+            isDefault:
+              type: boolean
+        providerBMaxRetries:
+          type: object
+          description: Max retries for Provider B. Null value means the provider-type default.
+          properties:
+            value:
+              type: [integer, 'null']
+            isDefault:
+              type: boolean
+        failoverLlmEnabled:
+          type: object
+          description: Whether the shared LLM failover provider (#806) is on.
+          properties:
+            value:
+              type: boolean
+            isDefault:
+              type: boolean
+        failoverLlmProvider:
+          type: object
+          description: LLM failover provider type, or null when unset.
+          properties:
+            value:
+              type: [string, 'null']
+            isDefault:
+              type: boolean
+        failoverLlmBaseUrl:
+          type: object
+          description: Base URL for the LLM failover provider.
+          properties:
+            value:
+              type: string
+            isDefault:
+              type: boolean
+        failoverLlmApiKeyConfigured:
+          type: boolean
+          description: Whether an LLM failover API key is configured (read-only; the key itself is never returned)
+        failoverLlmTimeoutSeconds:
+          type: object
+          description: Request timeout for the LLM failover provider. Null value means the provider-type default.
+          properties:
+            value:
+              type: [integer, 'null']
+            isDefault:
+              type: boolean
+        failoverLlmMaxRetries:
+          type: object
+          description: Max retries for the LLM failover provider. Null value means the provider-type default.
+          properties:
+            value:
+              type: [integer, 'null']
+            isDefault:
+              type: boolean
+        failoverLlmDetectionModel:
+          type: object
+          description: Model the LLM failover provider uses for ad detection.
+          properties:
+            value:
+              type: string
+            isDefault:
+              type: boolean
+        failoverLlmReviewModel:
+          type: object
+          description: Model the LLM failover provider uses for review. Blank inherits the detection model.
+          properties:
+            value:
+              type: string
+            isDefault:
+              type: boolean
+        failoverLlmVerificationModel:
+          type: object
+          description: Model the LLM failover provider uses for verification. Blank inherits the detection model.
+          properties:
+            value:
+              type: string
+            isDefault:
+              type: boolean
+        failoverLlmChaptersModel:
+          type: object
+          description: Model the LLM failover provider uses for chapters. Blank inherits the detection model.
+          properties:
+            value:
+              type: string
+            isDefault:
+              type: boolean
+        failoverWhisperEnabled:
+          type: object
+          description: Whether the transcriber failover provider (#806) is on.
+          properties:
+            value:
+              type: boolean
+            isDefault:
+              type: boolean
+        failoverWhisperBackend:
+          type: object
+          description: Transcriber failover backend.
+          properties:
+            value:
+              type: string
+              enum: [local, openai-api]
+            isDefault:
+              type: boolean
+        failoverWhisperModel:
+          type: object
+          description: Local model name for the transcriber failover, when its backend is local.
+          properties:
+            value:
+              type: string
+            isDefault:
+              type: boolean
+        failoverWhisperApiBaseUrl:
+          type: object
+          description: Base URL for the transcriber failover API backend.
+          properties:
+            value:
+              type: string
+            isDefault:
+              type: boolean
+        failoverWhisperApiKeyConfigured:
+          type: boolean
+          description: Whether a transcriber failover API key is configured (read-only; the key itself is never returned)
+        failoverWhisperApiModel:
+          type: object
+          description: Model name for the transcriber failover API backend.
+          properties:
+            value:
+              type: string
+            isDefault:
+              type: boolean
+        failoverWhisperApiTimeoutSeconds:
+          type: object
+          description: Request timeout for the transcriber failover API backend.
+          properties:
+            value:
+              type: integer
+            isDefault:
+              type: boolean
+        failoverWhisperMaxAttempts:
+          type: object
+          description: Failover transcriber upload attempts; null inherits whisperMaxAttempts.
+          properties:
+            value:
+              type: [integer, 'null']
+              minimum: 1
+              maximum: 10
+            isDefault:
+              type: boolean
+        failoverWhisperLanguage:
+          type: object
+          description: Language for the transcriber failover. Empty means same as the active transcriber.
+          properties:
+            value:
+              type: string
+            isDefault:
+              type: boolean
+        failoverProbeIntervalMinutes:
+          type: object
+          description: Minutes between health probes of a failover target.
+          properties:
+            value:
+              type: integer
+            isDefault:
+              type: boolean
+        failoverRecoveryProbes:
+          type: object
+          description: Consecutive healthy probes needed before an automatic failover recovers.
+          properties:
+            value:
+              type: integer
+            isDefault:
+              type: boolean
+        whisperMaxAttempts:
+          type: object
+          description: Max attempts for a single whisper API transcription request before giving up.
+          properties:
+            value:
+              type: integer
+            isDefault:
+              type: boolean
         podcastSearchReady:
           type: boolean
           description: >-
@@ -14319,12 +15718,10 @@ components:
             properties:
               value:
                 description: Resolved value (env > DB > default). Type depends on field; nullable for reasoning budgets/levels and ollamaNumCtx.
-                nullable: true
               isDefault:
                 type: boolean
               envOverride:
-                type: string
-                nullable: true
+                type: [string, 'null']
                 description: Environment variable currently overriding this setting (read-only in the UI), or null.
         stageTunableDefaults:
           type: object
@@ -14339,6 +15736,8 @@ components:
               type: string
             chapterPrompt:
               type: string
+            patternCleanupPrompt:
+              type: string
             systemPromptOverride:
               type: string
               description: Per-pass override for the first pass; empty clears it.
@@ -14352,11 +15751,11 @@ components:
               type: string
               description: Per-pass override for the resurrect pass; empty clears it.
             claudeModel:
-              type: string
+              type: [string, 'null']
             verificationModel:
-              type: string
+              type: [string, 'null']
             chaptersModel:
-              type: string
+              type: [string, 'null']
             whisperModel:
               type: string
             whisperBackend:
@@ -14416,6 +15815,58 @@ components:
               type: integer
             secondaryProviderTokensPerMin:
               type: integer
+            providerATimeoutSeconds:
+              type: [integer, 'null']
+            providerAMaxRetries:
+              type: [integer, 'null']
+            providerBTimeoutSeconds:
+              type: [integer, 'null']
+            providerBMaxRetries:
+              type: [integer, 'null']
+            failoverLlmEnabled:
+              type: boolean
+            failoverLlmProvider:
+              type: [string, 'null']
+            failoverLlmBaseUrl:
+              type: string
+            failoverLlmTimeoutSeconds:
+              type: [integer, 'null']
+            failoverLlmMaxRetries:
+              type: [integer, 'null']
+            failoverLlmDetectionModel:
+              type: string
+            failoverLlmReviewModel:
+              type: string
+            failoverLlmVerificationModel:
+              type: string
+            failoverLlmChaptersModel:
+              type: string
+            failoverWhisperEnabled:
+              type: boolean
+            failoverWhisperBackend:
+              type: string
+              enum: [local, openai-api]
+            failoverWhisperModel:
+              type: string
+            failoverWhisperApiBaseUrl:
+              type: string
+            failoverWhisperApiModel:
+              type: string
+            failoverWhisperApiTimeoutSeconds:
+              type: integer
+            failoverWhisperMaxAttempts:
+              type: [integer, 'null']
+            failoverWhisperLanguage:
+              type: string
+            failoverProbeIntervalMinutes:
+              type: integer
+              example: 5
+            failoverRecoveryProbes:
+              type: integer
+              example: 3
+            whisperMaxAttempts:
+              type: integer
+              example: 2
             autoProcessEnabled:
               type: boolean
             maxFeedEpisodes:
@@ -14451,7 +15902,7 @@ components:
               type: object
               additionalProperties:
                 type: string
-                enum: [remove, beep, keep]
+                enum: [remove, beep, keep, mark]
             communitySyncCategories:
               type: array
               items:
@@ -14565,8 +16016,7 @@ components:
               type: string
               description: Transcription backend in use (local or openai-api)
             whisperApiHost:
-              type: string
-              nullable: true
+              type: [string, 'null']
               description: scheme://host of the remote whisper endpoint, or null when transcription is local
             baseUrl:
               type: string
@@ -14732,6 +16182,20 @@ components:
             instanceCount:
               type: integer
               description: API backend only, and present only when probed is true.
+        failover:
+          type: object
+          description: Same shapes as GET /failover, minus events (#806).
+          properties:
+            targets:
+              type: object
+              additionalProperties:
+                $ref: '#/components/schemas/FailoverTargetState'
+              description: Keyed by target name (llm-a, llm-b, transcriber).
+            probes:
+              type: object
+              additionalProperties:
+                $ref: '#/components/schemas/FailoverProbe'
+              description: Keyed by probe name (llm-a, llm-b, llm-failover, transcriber, transcriber-failover).
         security:
           type: object
           properties:
@@ -14792,9 +16256,8 @@ components:
         version:
           type: string
         releaseDate:
-          type: string
+          type: [string, 'null']
           format: date
-          nullable: true
         url:
           type: string
         notes:
@@ -15177,6 +16640,36 @@ components:
         lastUpdated:
           type: number
           description: Unix timestamp of the last status change
+        failover:
+          type: object
+          description: >-
+            Failover state (#806), read through the same 5-second cache as
+            GET /failover; never probes on this read path.
+          properties:
+            active:
+              type: array
+              items:
+                type: string
+                enum: [llm-a, llm-b, transcriber]
+              description: Target names currently running on their failover configuration.
+            targets:
+              type: object
+              description: Keyed by target name (llm-a, llm-b, transcriber).
+              additionalProperties:
+                type: object
+                properties:
+                  active:
+                    type: boolean
+                  source:
+                    type:
+                      - string
+                      - 'null'
+                    enum: [auto, manual, probe, null]
+                  since:
+                    type:
+                      - string
+                      - 'null'
+                    format: date-time
 
     QueueHold:
       type: object
@@ -15548,6 +17041,8 @@ components:
               - Queue Resumed
               - Service Offline
               - Service Reachable
+              - Failover Triggered
+              - Failover Cancelled
         smtpHost:
           type: string
         smtpPort:
@@ -15728,8 +17223,7 @@ components:
         status:
           type: integer
         details:
-          type: object
-          nullable: true
+          type: [object, 'null']
 
   responses:
     BadRequest:

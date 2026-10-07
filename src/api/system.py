@@ -17,6 +17,7 @@ from api import (
     api, limiter, log_request, json_response, error_response,
     get_database, get_storage, _get_version, _start_time,
 )
+from api.failover import probes_view, targets_view
 import transcriber
 from config import WHISPER_BACKEND_API, resolve_whisper_device
 from database.settings import registry_default
@@ -48,9 +49,8 @@ def _server_start_time() -> float:
     return shared if shared is not None else _start_time
 
 
-# Repo root (same file layout as main_app.routes.ROOT_DIR): parents[2]
-# resolves /app from /app/src/api/system.py on the shipped image, and
-# the equivalent checkout root in dev.
+# Repo root: parents[2] resolves /app from /app/src/api/system.py on the
+# shipped image, and the equivalent checkout root in dev.
 _ROOT_DIR = Path(__file__).resolve().parents[2]
 
 
@@ -206,6 +206,7 @@ def get_system_status():
         # Reports the configured backend, since the local reading says
         # nothing when transcription runs on a remote API.
         'transcriber': transcriber.get_transcriber_health(),
+        'failover': {'targets': targets_view(), 'probes': probes_view()},
     })
 
 

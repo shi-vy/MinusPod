@@ -12,7 +12,7 @@ import { Pin } from './ad-editor/Pin';
 import { usePeaks } from './ad-editor/usePeaks';
 import { usePeakSlice } from './ad-editor/usePeakSlice';
 import { useWaveformWindow } from './ad-editor/useWaveformWindow';
-import TextSelectionPanel from './ad-editor/TextSelectionPanel';
+import TextSelectionPanel, { type TextRun, runKey } from './ad-editor/TextSelectionPanel';
 import TransportBar from './ad-editor/TransportBar';
 import ZoomControl from './ad-editor/ZoomControl';
 import { edgeBtn, ghostBtn, primaryBtn } from './ad-editor/controlStyles';
@@ -31,6 +31,7 @@ import {
   SEGMENT_CATEGORIES,
   SEGMENT_CATEGORY_DESCRIPTIONS,
   SEGMENT_CATEGORY_LABELS,
+  isKeepLike,
   type SegmentCategory,
 } from '../utils/segmentCategory';
 import { badgeBase, tint } from './badgeStyles';
@@ -77,6 +78,11 @@ export interface AdCreateSubmit {
   category: SegmentCategory | null;
 }
 
+type RunStatus = 'pending' | 'saved' | 'failed';
+
+// Same key format TextSelectionPanel uses, so saved-run lookups agree.
+const runStatusKey = runKey;
+
 interface Props {
   item: AdReviewItem;
   onClose: () => void;
@@ -102,7 +108,12 @@ interface Props {
   // editable sponsor + text_template fields, and a different submit
   // signature via onCreate.
   mode?: 'review' | 'create';
-  onCreate?: (s: AdCreateSubmit) => void;
+  // `meta.silent` marks a multi-span run: the host defers its closing side
+  // effects until onCreateDone fires once every run has saved.
+  onCreate?: (s: AdCreateSubmit, meta?: { silent?: boolean }) => Promise<void> | void;
+  // Fires once after a multi-span submit's last run saves. Single-run create
+  // closes from its own onCreate call instead.
+  onCreateDone?: () => void;
   // Optional: surface a "+ Add new ad" entry inside the modal so the
   // user can switch into create mode without closing the modal first.
   onAddNew?: () => void;
@@ -145,7 +156,7 @@ function AdReviewModal({
   item, onClose, onSubmit, onSkip, hasNext = false,
   audioMode = 'original', onAudioModeChange, hasOriginal = true,
   processedAudioUrl, episodeDuration,
-  mode = 'review', onCreate, onAddNew, boundsWindow,
+  mode = 'review', onCreate, onCreateDone, onAddNew, boundsWindow,
   hideConfirm = false, onSplitSaved,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);   // waveform host
@@ -285,6 +296,81 @@ function AdReviewModal({
   // audio-mode transcript-span fetch from clobbering the user's chosen text
   // when they toggle back to audio for fine-tuning.
   const textTemplateFromSelectionRef = useRef(false);
+  // Multi-span: frozen runs plus the current one, from TextSelectionPanel.
+  // Saved identities stay available when the selection changes shape.
+  const [runs, setRuns] = useState<TextRun[]>([]);
+  const [runStatusByKey, setRunStatusByKey] = useState(() => new Map<string, RunStatus>());
+  const [multiSubmitting, setMultiSubmitting] = useState(false);
+  // React-recommended "adjust state when a prop changes without an effect"
+  // (see matchSearchKey/currentMatch in TextSelectionPanel): reset during
+  // render instead of in a useEffect, which would cascade an extra render.
+  const [wasTextModeActive, setWasTextModeActive] = useState(textModeActive);
+  if (wasTextModeActive !== textModeActive) {
+    setWasTextModeActive(textModeActive);
+    if (!textModeActive) setRuns([]);
+  }
+  const orderedRuns = useMemo(() => [...runs].sort((a, b) => a.start - b.start), [runs]);
+  const runStatuses = orderedRuns.map((run) => runStatusByKey.get(runStatusKey(run)));
+  const singleRunStatus = runStatusByKey.get(runStatusKey({
+    start: adStart,
+    end: adEnd,
+    text: textTemplateInput,
+  }));
+  const showRunStatuses = runStatuses.some((status) => status !== undefined);
+  const isMultiSpan = orderedRuns.length > 1;
+  const hasSavedRun = [...runStatusByKey.values()].includes('saved');
+  const lockMultiFields = multiSubmitting || hasSavedRun;
+  const savedRunKeys = useMemo(
+    () => new Set([...runStatusByKey].filter(([, status]) => status === 'saved').map(([key]) => key)),
+    [runStatusByKey],
+  );
+  const shortRun = isMultiSpan
+    ? orderedRuns.find((r) => r.text.trim().length < 50)
+    : undefined;
+
+  // One `create` correction per run, in time order. Stops on the first
+  // failure; already-saved runs are not re-submitted, and the modal stays
+  // open with each run's outcome visible.
+  const submitRuns = async () => {
+    if (!onCreate) return;
+    setMultiSubmitting(true);
+    const statuses: RunStatus[] = orderedRuns.map((run) => (
+      runStatusByKey.get(runStatusKey(run)) === 'saved' ? 'saved' : 'pending'
+    ));
+    setRunStatusByKey((previous) => {
+      const next = new Map(previous);
+      orderedRuns.forEach((run, i) => {
+        if (statuses[i] !== 'saved') next.set(runStatusKey(run), 'pending');
+      });
+      return next;
+    });
+    for (let i = 0; i < orderedRuns.length; i++) {
+      if (statuses[i] === 'saved') continue;
+      const run = orderedRuns[i];
+      const key = runStatusKey(run);
+      try {
+        await onCreate({
+          kind: 'create',
+          start: run.start,
+          end: run.end,
+          sponsor: sponsorInput.trim(),
+          textTemplate: run.text.trim(),
+          scope: scopeInput,
+          reason: reasonInput,
+          category: categoryInput === '' ? null : categoryInput,
+        }, { silent: true });
+        statuses[i] = 'saved';
+        setRunStatusByKey((previous) => new Map(previous).set(key, 'saved'));
+      } catch {
+        statuses[i] = 'failed';
+        setRunStatusByKey((previous) => new Map(previous).set(key, 'failed'));
+        setMultiSubmitting(false);
+        return;
+      }
+    }
+    setMultiSubmitting(false);
+    onCreateDone?.();
+  };
 
   // Create mode is always against original audio (you can't mark a new ad
   // on already-cut audio). Review mode honors the parent's audioMode.
@@ -771,10 +857,10 @@ function AdReviewModal({
   // With Confirm hidden (Detected Ads), an unmoved-boundary save would emit
   // a plain confirm the host discards, so the button and C shortcut go inert.
   const confirmInert = hideConfirm && !boundariesMoved;
-  // A keep marker's fate is decided by its category, and the corrections
-  // endpoint refuses a verdict on one. Offering Save and Not an ad here only
-  // produced a 409, so the category picker is the action instead.
-  const keptByCategory = item.actionApplied === 'keep';
+  // A keep or mark marker's fate is decided by its category, and the
+  // corrections endpoint refuses a verdict on one. Offering Save and Not an
+  // ad here only produced a 409, so the category picker is the action instead.
+  const keptByCategory = isKeepLike(item.actionApplied);
 
   const handleConfirm = () => {
     // Guards the C shortcut too; the buttons are hidden but the key is not.
@@ -819,12 +905,17 @@ function AdReviewModal({
     const handler = (e: KeyboardEvent) => {
       // The split editor is on top; its own handlers own the keyboard.
       if (showSplit) return;
+      if (multiSubmitting) return;
       const target = e.target as HTMLElement | null;
       const inField =
         target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA');
       if (inField && e.key !== 'Escape') return;
 
-      if (e.key === 'Escape') { e.preventDefault(); onClose(); return; }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        onClose();
+        return;
+      }
       if (e.key === ' ')      { e.preventDefault(); togglePlay(); return; }
       if (e.key === ',')      { e.preventDefault(); panBack(); return; }
       if (e.key === '.')      { e.preventDefault(); panForward(); return; }
@@ -842,7 +933,7 @@ function AdReviewModal({
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [onClose, sponsorInput, adStart, adEnd, item.start, item.end, showSplit]);
+  }, [onClose, sponsorInput, adStart, adEnd, item.start, item.end, showSplit, multiSubmitting]);
 
   // ------------------------------------------------------------------
   // Style helpers -- explicit hover treatments so buttons clearly
@@ -895,7 +986,7 @@ function AdReviewModal({
                   <button
                     type="button"
                     onClick={() => onAudioModeChange('processed')}
-                    className={`px-2 py-1 text-xs transition-colors ${
+                    className={`px-2 py-1 text-xs transition-colors max-sm:min-h-11 ${
                       audioMode === 'processed'
                         ? 'bg-primary text-primary-foreground'
                         : 'bg-background text-muted-foreground hover:bg-secondary'
@@ -908,7 +999,7 @@ function AdReviewModal({
                     type="button"
                     disabled={!hasOriginal}
                     onClick={() => onAudioModeChange('original')}
-                    className={`px-2 py-1 text-xs transition-colors ${
+                    className={`px-2 py-1 text-xs transition-colors max-sm:min-h-11 ${
                       audioMode === 'original' && hasOriginal
                         ? 'bg-primary text-primary-foreground'
                         : 'bg-background text-muted-foreground hover:bg-secondary'
@@ -928,7 +1019,7 @@ function AdReviewModal({
                   onClick={onAddNew}
                   aria-label="Add new ad"
                   title="Add new ad"
-                  className={`inline-flex items-center gap-1 px-2 py-1 text-xs rounded-md ${btnPrimary} transition-colors ${focusRing}`}
+                  className={`inline-flex items-center gap-1 px-2 py-1 text-xs rounded-md ${btnPrimary} transition-colors ${focusRing} max-sm:min-h-11 max-sm:min-w-11`}
                 >
                   <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
@@ -938,7 +1029,8 @@ function AdReviewModal({
               )}
               <button
                 onClick={onClose}
-                className={`p-1 rounded ${btnGhost} transition-colors ${focusRing}`}
+                disabled={mode === 'create' && multiSubmitting}
+                className={`p-1 rounded ${btnGhost} transition-colors ${focusRing} max-sm:min-h-11 max-sm:min-w-11`}
                 aria-label="Close"
               >
                 <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -978,7 +1070,7 @@ function AdReviewModal({
               labelClassName=""
             />
             <button type="button" onClick={resetView}
-              className={`px-2 py-1 rounded ${ghostBtn} ${focusRing}`}
+              className={`px-2 py-1 rounded ${ghostBtn} ${focusRing} max-sm:min-h-11`}
               title="Reset waveform window + ad bounds to defaults">↻ Reset</button>
           </div>
         </div>
@@ -1026,8 +1118,9 @@ function AdReviewModal({
             <div className="inline-flex rounded-md border border-input overflow-hidden" role="group">
               <button
                 type="button"
+                disabled={multiSubmitting}
                 onClick={() => setInputMode('audio')}
-                className={`px-3 py-1.5 text-xs transition-colors ${
+                className={`px-3 py-1.5 text-xs transition-colors max-sm:min-h-11 ${
                   inputMode === 'audio'
                     ? 'bg-primary text-primary-foreground'
                     : 'bg-background text-muted-foreground hover:bg-secondary'
@@ -1038,8 +1131,9 @@ function AdReviewModal({
               </button>
               <button
                 type="button"
+                disabled={multiSubmitting}
                 onClick={() => setInputMode('text')}
-                className={`px-3 py-1.5 text-xs transition-colors ${
+                className={`px-3 py-1.5 text-xs transition-colors max-sm:min-h-11 ${
                   inputMode === 'text'
                     ? 'bg-primary text-primary-foreground'
                     : 'bg-background text-muted-foreground hover:bg-secondary'
@@ -1066,6 +1160,9 @@ function AdReviewModal({
               setTextTemplateInput(text);
               textTemplateFromSelectionRef.current = true;
             }}
+            onRunsChange={setRuns}
+            savedKeys={savedRunKeys}
+            disabled={multiSubmitting}
             playbackRate={playbackRate}
             setPlaybackRate={setPlaybackRate}
           />
@@ -1257,6 +1354,7 @@ function AdReviewModal({
             <span>Selection:</span>
             <input
               ref={startInputRef}
+              disabled={lockMultiFields}
               type="text"
               inputMode="decimal"
               value={startInput}
@@ -1265,11 +1363,12 @@ function AdReviewModal({
               onChange={(e) => setStartInput(e.target.value)}
               onBlur={commitStartInput}
               onKeyDown={timeInputKeyDown(adStart, setStartInput)}
-              className={`w-20 px-1.5 py-0.5 rounded border bg-background text-success font-medium text-center tabular-nums focus:outline-hidden focus:ring-2 focus:ring-ring ${inputBorderClass}`}
+              className={`w-20 px-1.5 py-0.5 rounded border bg-background text-success font-medium text-center tabular-nums focus:outline-hidden focus:ring-2 focus:ring-ring max-sm:min-h-11 ${inputBorderClass}`}
             />
             <span>-</span>
             <input
               ref={endInputRef}
+              disabled={lockMultiFields}
               type="text"
               inputMode="decimal"
               value={endInput}
@@ -1278,7 +1377,7 @@ function AdReviewModal({
               onChange={(e) => setEndInput(e.target.value)}
               onBlur={commitEndInput}
               onKeyDown={timeInputKeyDown(adEnd, setEndInput)}
-              className={`w-20 px-1.5 py-0.5 rounded border bg-background text-destructive font-medium text-center tabular-nums focus:outline-hidden focus:ring-2 focus:ring-ring ${inputBorderClass}`}
+              className={`w-20 px-1.5 py-0.5 rounded border bg-background text-destructive font-medium text-center tabular-nums focus:outline-hidden focus:ring-2 focus:ring-ring max-sm:min-h-11 ${inputBorderClass}`}
             />
             <span className="text-xs">({Math.round((adEnd - adStart) * 10) / 10}s)</span>
             {boundariesMoved && !boundaryError && (
@@ -1353,6 +1452,11 @@ function AdReviewModal({
         {/* Sponsor prompt + (in create mode) text-template + scope */}
         {mode === 'create' ? (
           <div className="px-4 sm:px-6 py-3 sm:py-4 border-t border-border bg-secondary/30 space-y-3">
+            {hasSavedRun && (
+              <p className="text-xs text-muted-foreground">
+                A span is already saved, so shared pattern details stay locked for the remaining spans.
+              </p>
+            )}
             <label className="block text-sm font-medium text-foreground">
               Sponsor name
               <div className="mt-1">
@@ -1360,6 +1464,8 @@ function AdReviewModal({
                   value={sponsorInput}
                   onChange={setSponsorInput}
                   sponsors={sponsorOptions}
+                  disabled={lockMultiFields}
+                  inputClassName="max-sm:min-h-11"
                 />
               </div>
             </label>
@@ -1371,7 +1477,8 @@ function AdReviewModal({
               <select
                 value={categoryInput}
                 onChange={(e) => setCategoryInput(e.target.value as SegmentCategory | '')}
-                className={`mt-1 w-full ${selectBase}`}
+                disabled={lockMultiFields}
+                className={`mt-1 w-full ${selectBase} max-sm:min-h-11`}
               >
                 <option value="">Uncategorized (counts as Sponsor)</option>
                 {SEGMENT_CATEGORIES.map((c) => (
@@ -1381,36 +1488,65 @@ function AdReviewModal({
                 ))}
               </select>
             </label>
-            <label className="block text-sm font-medium text-foreground">
-              Text template
-              <span className="ml-2 text-xs font-normal text-muted-foreground">
-                (filled from the transcript; edit before save)
-              </span>
-              <textarea
-                value={textTemplateInput}
-                onChange={(e) => setTextTemplateInput(e.target.value)}
-                rows={4}
-                className="mt-1 w-full px-3 py-1.5 rounded-lg border border-input bg-background text-foreground focus:outline-hidden focus:ring-2 focus:ring-ring text-xs font-mono"
-              />
-              <div className={`text-xs mt-1 ${textTemplateInput.trim().length < 50 ? 'text-destructive' : 'text-muted-foreground'}`}>
-                {textTemplateInput.trim().length} / 50 chars min
-              </div>
-            </label>
+            {isMultiSpan ? (
+              <p className="text-xs text-muted-foreground">
+                Each span uses the transcript text you selected.
+              </p>
+            ) : (
+              <label className="block text-sm font-medium text-foreground">
+                Text template
+                <span className="ml-2 text-xs font-normal text-muted-foreground">
+                  (filled from the transcript; edit before save)
+                </span>
+                <textarea
+                  value={textTemplateInput}
+                  onChange={(e) => setTextTemplateInput(e.target.value)}
+                  rows={4}
+                  disabled={lockMultiFields}
+                  className="mt-1 w-full px-3 py-1.5 rounded-lg border border-input bg-background text-foreground focus:outline-hidden focus:ring-2 focus:ring-ring text-xs font-mono max-sm:min-h-11"
+                />
+                <div className={`text-xs mt-1 ${textTemplateInput.trim().length < 50 ? 'text-destructive' : 'text-muted-foreground'}`}>
+                  {textTemplateInput.trim().length} / 50 chars min
+                </div>
+              </label>
+            )}
             <label className="block text-sm">
               <span className="block mb-1 text-muted-foreground">Reason (optional)</span>
               <input
                 type="text" value={reasonInput}
                 onChange={(e) => setReasonInput(e.target.value)}
+                disabled={lockMultiFields}
                 placeholder="Why this is an ad"
-                className="w-full px-3 py-1.5 rounded border border-border bg-background text-foreground text-sm"
+                className="w-full px-3 py-1.5 rounded border border-border bg-background text-foreground text-sm max-sm:min-h-11"
               />
             </label>
             <Checkbox
               checked={scopeInput === 'global'}
               onChange={(v) => setScopeInput(v ? 'global' : 'podcast')}
+              disabled={lockMultiFields}
               label="Apply across all podcasts (global pattern)"
               labelClassName="text-sm"
             />
+            {isMultiSpan && shortRun && (
+              <p className="text-xs text-destructive">
+                The {formatTime(shortRun.start)} - {formatTime(shortRun.end)} span is only{' '}
+                {shortRun.text.trim().length} characters; each span needs at least 50.
+              </p>
+            )}
+            {showRunStatuses && (
+              <ul className="space-y-0.5 text-xs text-muted-foreground">
+                {orderedRuns.map((run, i) => (
+                  <li key={`${run.start.toFixed(3)}-${run.end.toFixed(3)}`}>
+                    {formatTime(run.start)} - {formatTime(run.end)}:{' '}
+                    {runStatuses[i] === 'saved'
+                      ? 'Saved'
+                      : runStatuses[i] === 'failed'
+                        ? 'Failed to save'
+                        : 'Not submitted'}
+                  </li>
+                ))}
+              </ul>
+            )}
           </div>
         ) : showSponsorPrompt ? (
           <div className="px-4 sm:px-6 py-3 sm:py-4 border-t border-border bg-secondary/30">
@@ -1424,7 +1560,7 @@ function AdReviewModal({
               id="sponsor" type="text" value={sponsorInput}
               onChange={(e) => setSponsorInput(e.target.value)}
               placeholder="e.g. BetterHelp, Squarespace, Progressive"
-              className="w-full px-3 py-1.5 rounded-lg border border-input bg-background text-foreground focus:outline-hidden focus:ring-2 focus:ring-ring text-sm"
+              className="w-full px-3 py-1.5 rounded-lg border border-input bg-background text-foreground focus:outline-hidden focus:ring-2 focus:ring-ring text-sm max-sm:min-h-11"
             />
           </div>
         ) : (
@@ -1455,7 +1591,7 @@ function AdReviewModal({
                   setReviewCategory(next ?? '');
                   onSubmit({ kind: 'recategorize', category: next });
                 }}
-                className={selectBase}
+                className={`${selectBase} max-w-full max-sm:min-h-11`}
               >
                 <option value="">Uncategorized (counts as Sponsor)</option>
                 {SEGMENT_CATEGORIES.map((c) => (
@@ -1464,7 +1600,7 @@ function AdReviewModal({
                   </option>
                 ))}
               </select>
-              <span>Decides whether this span is cut, beeped, or left in.</span>
+              <span>Decides whether this span is cut, beeped, kept, or marked as a chapter.</span>
             </label>
           </div>
         )}
@@ -1477,32 +1613,46 @@ function AdReviewModal({
                 Save creates a new ad pattern tagged as `created_by=user`.
               </div>
               <div className="flex items-center gap-2">
-                <button type="button" onClick={onClose}
-                  className={`px-4 py-1.5 rounded-lg ${ghostBtn} text-sm ${focusRing}`}>
+                <button type="button" onClick={onClose} disabled={multiSubmitting}
+                  className={`px-4 py-1.5 rounded-lg ${ghostBtn} text-sm ${focusRing} max-sm:min-h-11`}>
                   Cancel
                 </button>
                 <button
                   type="button"
                   disabled={
                     !sponsorInput.trim() ||
-                    textTemplateInput.trim().length < 50 ||
-                    boundaryError !== null
+                    multiSubmitting ||
+                    (isMultiSpan
+                      ? shortRun !== undefined
+                      : singleRunStatus !== 'saved' &&
+                        (textTemplateInput.trim().length < 50 || boundaryError !== null))
                   }
                   onClick={() => {
                     if (!onCreate) return;
-                    onCreate({
-                      kind: 'create',
-                      start: adStart,
-                      end: adEnd,
-                      sponsor: sponsorInput.trim(),
-                      textTemplate: textTemplateInput.trim(),
-                      scope: scopeInput,
-                      reason: reasonInput,
-                      category: categoryInput === '' ? null : categoryInput,
-                    });
+                    if (!isMultiSpan) {
+                      if (singleRunStatus === 'saved') {
+                        onCreateDone?.();
+                        return;
+                      }
+                      const result = onCreate({
+                        kind: 'create',
+                        start: adStart,
+                        end: adEnd,
+                        sponsor: sponsorInput.trim(),
+                        textTemplate: textTemplateInput.trim(),
+                        scope: scopeInput,
+                        reason: reasonInput,
+                        category: categoryInput === '' ? null : categoryInput,
+                      });
+                      if (result && typeof (result as Promise<void>).catch === 'function') {
+                        (result as Promise<void>).catch(() => {});
+                      }
+                      return;
+                    }
+                    void submitRuns();
                   }}
-                  className={`px-4 py-1.5 rounded-lg ${primaryBtn} text-sm ${focusRing}`}>
-                  Save
+                  className={`px-4 py-1.5 rounded-lg ${primaryBtn} text-sm ${focusRing} max-sm:min-h-11`}>
+                  {isMultiSpan ? `Mark ad (${orderedRuns.length} spans)` : singleRunStatus === 'saved' ? 'Done' : 'Save'}
                 </button>
               </div>
             </>
@@ -1512,7 +1662,7 @@ function AdReviewModal({
                 <button
                   type="button"
                   onClick={() => setShowSplit(true)}
-                  className={`h-9 px-2 sm:px-4 rounded-lg ${ghostBtn} text-sm whitespace-nowrap ${focusRing}`}
+                  className={`h-9 px-2 sm:px-4 rounded-lg ${ghostBtn} text-sm whitespace-nowrap ${focusRing} max-sm:min-h-11`}
                   title="Split this ad block into separate ads"
                 >
                   Split
@@ -1532,14 +1682,14 @@ function AdReviewModal({
                   "& Next" labels on sm: where there's room. */}
               <div className="flex items-stretch gap-1.5 sm:gap-2 w-full sm:w-auto">
                 <button type="button" onClick={onSkip}
-                  className={`flex-1 sm:flex-none sm:min-w-[7rem] basis-0 h-9 px-2 sm:px-4 rounded-lg ${ghostBtn} text-sm text-center whitespace-nowrap ${focusRing}`}
+                  className={`flex-1 sm:flex-none sm:min-w-[7rem] basis-0 h-9 px-2 sm:px-4 rounded-lg ${ghostBtn} text-sm text-center whitespace-nowrap ${focusRing} max-sm:min-h-11`}
                   title={hasNext ? 'Skip and advance to the next ad (S)' : 'Skip (S)'}>
                   <span className="sm:hidden">Skip</span>
                   <span className="hidden sm:inline">{hasNext ? 'Skip & Next' : 'Skip'}</span>
                 </button>
                 {!keptByCategory && (
                   <button type="button" onClick={handleReject}
-                    className={`flex-1 sm:flex-none sm:min-w-[7rem] basis-0 h-9 px-2 sm:px-4 rounded-lg ${destructiveBtn} text-sm text-center whitespace-nowrap ${focusRing}`}
+                    className={`flex-1 sm:flex-none sm:min-w-[7rem] basis-0 h-9 px-2 sm:px-4 rounded-lg ${destructiveBtn} text-sm text-center whitespace-nowrap ${focusRing} max-sm:min-h-11`}
                     title="Mark as not an ad (R)">
                     <span className="sm:hidden">Not an ad</span>
                     <span className="hidden sm:inline">{hasNext ? 'Not an ad & Next' : 'Not an ad'}</span>
@@ -1548,7 +1698,7 @@ function AdReviewModal({
                 {!keptByCategory && (
                   <button type="button" onClick={handleConfirm}
                     disabled={boundaryError !== null || confirmInert}
-                    className={`flex-1 sm:flex-none sm:min-w-[7rem] basis-0 h-9 px-2 sm:px-4 rounded-lg ${primaryBtn} text-sm text-center whitespace-nowrap ${focusRing}`}
+                    className={`flex-1 sm:flex-none sm:min-w-[7rem] basis-0 h-9 px-2 sm:px-4 rounded-lg ${primaryBtn} text-sm text-center whitespace-nowrap ${focusRing} max-sm:min-h-11`}
                     title={boundaryError
                       ?? (confirmInert
                         ? 'Already cut. Move a boundary to save an adjustment.'

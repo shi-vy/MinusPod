@@ -38,6 +38,11 @@ import {
   type ProvidersResponse,
 } from '../api/providers';
 import AIModelsSection from './settings/AIModelsSection';
+import FailoverSection from './settings/FailoverSection';
+import { cancelFailover, failoverQueryKey, getFailover, probeFailover, triggerFailover, type FailoverTargetName } from '../api/failover';
+import { sectionVisible, useCollapsibleOpen } from '../components/CollapsibleSection';
+
+const FAILOVER_STORAGE_KEY = 'settings-section-failover';
 import StageTunablesSection from './settings/StageTunablesSection';
 import TranscriptionSection from './settings/TranscriptionSection';
 import AudioSection from './settings/AudioSection';
@@ -54,6 +59,7 @@ import ExperimentsSection from './settings/ExperimentsSection';
 import AdReviewerSection from './settings/AdReviewerSection';
 import AudioCueDetectionSection from './settings/AudioCueDetectionSection';
 import PositionalPriorSection from './settings/PositionalPriorSection';
+import PatternCleanupSection from './settings/PatternCleanupSection';
 import CommunityPatternsSection from './settings/CommunityPatternsSection';
 import DatabaseBackupSection from './settings/DatabaseBackupSection';
 import OutboundRequestsSection from './settings/OutboundRequestsSection';
@@ -81,7 +87,9 @@ function SettingsGroupHeader({ title }: { title: string }) {
   );
 }
 
-type SettingScalar = string | number | boolean;
+// null covers the int-or-blank provider overrides (#806), where blank means
+// "inherit the provider type's default" rather than an unset field.
+type SettingScalar = string | number | boolean | null;
 
 type StageKey = 'detection' | 'verification' | 'chapters' | 'review';
 
@@ -107,7 +115,7 @@ interface FieldSpec {
   // Dispatch<SetStateAction<...>> is assignable)...
   set?: (v: never) => void;
   // ...or a property patch collected into one of the nested state objects.
-  obj?: 'reviewer' | 'audioCue' | 'whisperApi';
+  obj?: 'reviewer' | 'audioCue' | 'whisperApi' | 'failoverLlm' | 'failoverWhisper';
   prop?: string;
 }
 
@@ -131,6 +139,7 @@ function Settings() {
   const [systemPromptOverride, setSystemPromptOverride] = useState('');
   const [verificationPromptOverride, setVerificationPromptOverride] = useState('');
   const [chapterPromptOverride, setChapterPromptOverride] = useState('');
+  const [patternCleanupPrompt, setPatternCleanupPrompt] = useState('');
   // Form state holds no hardcoded defaults: every field is hydrated from the
   // loaded settings (or the backend-provided `settings.defaults.*`) before the
   // form renders (the page returns a loader while `settingsLoading`, and the
@@ -203,7 +212,6 @@ function Settings() {
   const [vttTranscriptsEnabled, setVttTranscriptsEnabled] = useState(false);
   const [chaptersEnabled, setChaptersEnabled] = useState(false);
   const [chaptersInNotes, setChaptersInNotes] = useState(false);
-  const [adChaptersEnabled, setAdChaptersEnabled] = useState(false);
   const [adChaptersIncludeHeld, setAdChaptersIncludeHeld] = useState(false);
   const [adChapterTitleFormat, setAdChapterTitleFormat] = useState('Ad: {label}');
   const [adChapterHeldTitleFormat, setAdChapterHeldTitleFormat] = useState('Possible ad: {label}');
@@ -226,6 +234,7 @@ function Settings() {
   const [differentialHoldMinSeconds, setDifferentialHoldMinSeconds] = useState(10);
   const [daiDifferentialOverridesKeep, setDaiDifferentialOverridesKeep] = useState(true);
   const [spliceVetoEnabled, setSpliceVetoEnabled] = useState(true);
+  const [transcriptDifferentialEnabled, setTranscriptDifferentialEnabled] = useState(true);
   // Neutral placeholder (cast); replaced by hydration before the form renders.
   const [llmProvider, setLlmProvider] = useState<LlmProvider>('' as LlmProvider);
   const [openaiBaseUrl, setOpenaiBaseUrl] = useState('');
@@ -250,7 +259,37 @@ function Settings() {
   const [secondaryProviderRequestsPerDay, setSecondaryProviderRequestsPerDay] = useState(0);
   const [providerTokensPerMin, setProviderTokensPerMin] = useState(0);
   const [secondaryProviderTokensPerMin, setSecondaryProviderTokensPerMin] = useState(0);
+  // Per-provider timeout/retries overrides (#806); null inherits the
+  // provider type's default (see providerDefaults() in LLMProviderSection).
+  const [providerATimeoutSeconds, setProviderATimeoutSeconds] = useState<number | null>(null);
+  const [providerAMaxRetries, setProviderAMaxRetries] = useState<number | null>(null);
+  const [providerBTimeoutSeconds, setProviderBTimeoutSeconds] = useState<number | null>(null);
+  const [providerBMaxRetries, setProviderBMaxRetries] = useState<number | null>(null);
   const [pricingSourceMode, setPricingSourceMode] = useState('auto');
+  // Provider failover (#806); the API keys save separately, like Provider B's.
+  const [failoverLlm, setFailoverLlm] = useState({
+    enabled: false,
+    provider: '' as LlmProvider | '',
+    baseUrl: '',
+    timeoutSeconds: null as number | null,
+    maxRetries: null as number | null,
+    detectionModel: '',
+    reviewModel: '',
+    verificationModel: '',
+    chaptersModel: '',
+  });
+  const [failoverWhisper, setFailoverWhisper] = useState({
+    enabled: false,
+    backend: '' as WhisperBackend,
+    model: '',
+    apiBaseUrl: '',
+    apiModel: '',
+    apiTimeoutSeconds: 600,
+    maxAttempts: null as number | null,
+    language: '',
+  });
+  const [failoverProbeIntervalMinutes, setFailoverProbeIntervalMinutes] = useState(5);
+  const [failoverRecoveryProbes, setFailoverRecoveryProbes] = useState(3);
   const [whisperBackend, setWhisperBackend] = useState<WhisperBackend>('' as WhisperBackend);
   const [whisperApiConfig, setWhisperApiConfig] = useState<WhisperApiConfig>({
     baseUrl: '', model: '',
@@ -261,6 +300,7 @@ function Settings() {
   const [transcribeConcurrentChunks, setTranscribeConcurrentChunks] = useState(4);
   const [transcribeChunkOverlapSeconds, setTranscribeChunkOverlapSeconds] = useState(30);
   const [whisperApiTimeoutSeconds, setWhisperApiTimeoutSeconds] = useState(600);
+  const [whisperMaxAttempts, setWhisperMaxAttempts] = useState(2);
   const [whisperPoolEnabled, setWhisperPoolEnabled] = useState(false);
   const [whisperPoolMaxRequests, setWhisperPoolMaxRequests] = useState(4);
   const [whisperPoolMaxEpisodes, setWhisperPoolMaxEpisodes] = useState(1);
@@ -439,6 +479,32 @@ function Settings() {
   const reviewCatalog = effectiveReviewProvider
     ? reviewFetch
     : { ...reviewFetch, models: detectionCatalog.models };
+  // Fetch standby models and poll failover only while its card is visible.
+  const [failoverOpen, setFailoverOpen] = useCollapsibleOpen(FAILOVER_STORAGE_KEY);
+  const [searchMatches, setSearchMatches] = useState<Set<string> | null>(null);
+  // Settings sits above the search provider, so it applies the shared rule to its own match state.
+  const failoverVisible = sectionVisible(searchMatches, FAILOVER_STORAGE_KEY, failoverOpen);
+  const failoverCatalog = useModelCatalog(
+    failoverLlm.provider, 'failover', catalogsEnabled && failoverLlm.enabled === true && failoverVisible,
+  );
+  const { data: failoverOverview, isLoading: failoverOverviewLoading } = useQuery({
+    queryKey: failoverQueryKey,
+    queryFn: getFailover,
+    enabled: failoverVisible,
+    refetchInterval: 30_000,
+  });
+  // One mutation for trigger, cancel and probe so the card shows a single
+  // pending state and only the latest action's error.
+  const failoverAction = useMutation({
+    mutationFn: ({ kind, target }: { kind: 'trigger' | 'cancel' | 'probe'; target?: FailoverTargetName }): Promise<unknown> => {
+      if (kind === 'probe') return probeFailover();
+      return kind === 'trigger' ? triggerFailover(target!) : cancelFailover(target!);
+    },
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: failoverQueryKey });
+      queryClient.invalidateQueries({ queryKey: ['status'] });
+    },
+  });
 
   const { data: whisperModels } = useQuery({
     queryKey: ['whisperModels'],
@@ -477,10 +543,11 @@ function Settings() {
 
   // Auto-expand and scroll to section when navigated via hash link
   useEffect(() => {
-    if (location.hash === '#podcast-index') {
-      localStorage.setItem('settings-section-podcast-index', 'true');
+    const id = location.hash.slice(1);
+    if (id === 'podcast-index' || id === 'segment-actions') {
+      localStorage.setItem(`settings-section-${id}`, 'true');
       setTimeout(() => {
-        document.getElementById('podcast-index')?.scrollIntoView({ behavior: 'smooth' });
+        document.getElementById(id)?.scrollIntoView({ behavior: 'smooth' });
       }, 100);
     }
   }, [location.hash]);
@@ -548,6 +615,7 @@ function Settings() {
     { key: 'systemPromptOverride', kind: 'str', value: systemPromptOverride, set: setSystemPromptOverride },
     { key: 'verificationPromptOverride', kind: 'str', value: verificationPromptOverride, set: setVerificationPromptOverride },
     { key: 'chapterPromptOverride', kind: 'str', value: chapterPromptOverride, set: setChapterPromptOverride },
+    { key: 'patternCleanupPrompt', kind: 'str', value: patternCleanupPrompt, set: setPatternCleanupPrompt },
     // Ad reviewer (nested `reviewer` state; updatePatterns/minTrimThreshold
     // save via /settings/reviewer and are diffed by reviewerPatternsChanged).
     { key: 'reviewPrompt', kind: 'str', value: reviewer.reviewPrompt, obj: 'reviewer', prop: 'reviewPrompt' },
@@ -579,6 +647,12 @@ function Settings() {
     { key: 'secondaryProviderEnabled', kind: 'val', literal: false, value: secondaryProviderEnabled, set: setSecondaryProviderEnabled },
     { key: 'secondaryProvider', kind: 'str', value: secondaryProvider, set: (v) => setSecondaryProvider(v as LlmProvider | '') },
     { key: 'secondaryProviderBaseUrl', kind: 'str', value: secondaryProviderBaseUrl, set: setSecondaryProviderBaseUrl },
+    // Per-provider timeout/retries overrides (#806); blank (null) inherits
+    // the provider type's default instead of a literal fallback.
+    { key: 'providerATimeoutSeconds', kind: 'val', literal: null, value: providerATimeoutSeconds, set: setProviderATimeoutSeconds },
+    { key: 'providerAMaxRetries', kind: 'val', literal: null, value: providerAMaxRetries, set: setProviderAMaxRetries },
+    { key: 'providerBTimeoutSeconds', kind: 'val', literal: null, value: providerBTimeoutSeconds, set: setProviderBTimeoutSeconds },
+    { key: 'providerBMaxRetries', kind: 'val', literal: null, value: providerBMaxRetries, set: setProviderBMaxRetries },
     { key: 'providerRequestsPerMin', kind: 'val', useDefault: true, literal: 0, value: providerRequestsPerMin, set: setProviderRequestsPerMin },
     { key: 'providerRequestsPerDay', kind: 'val', useDefault: true, literal: 0, value: providerRequestsPerDay, set: setProviderRequestsPerDay },
     { key: 'secondaryProviderRequestsPerMin', kind: 'val', useDefault: true, literal: 0, value: secondaryProviderRequestsPerMin, set: setSecondaryProviderRequestsPerMin },
@@ -586,6 +660,26 @@ function Settings() {
     { key: 'providerTokensPerMin', kind: 'val', useDefault: true, literal: 0, value: providerTokensPerMin, set: setProviderTokensPerMin },
     { key: 'secondaryProviderTokensPerMin', kind: 'val', useDefault: true, literal: 0, value: secondaryProviderTokensPerMin, set: setSecondaryProviderTokensPerMin },
     { key: 'pricingSourceMode', kind: 'str', useDefault: true, value: pricingSourceMode, set: setPricingSourceMode },
+    // Provider failover (#806); timeout/retries blank (null) inherit the type default.
+    { key: 'failoverLlmEnabled', kind: 'val', literal: false, value: failoverLlm.enabled, obj: 'failoverLlm', prop: 'enabled' },
+    { key: 'failoverLlmProvider', kind: 'str', value: failoverLlm.provider, obj: 'failoverLlm', prop: 'provider' },
+    { key: 'failoverLlmBaseUrl', kind: 'str', value: failoverLlm.baseUrl, obj: 'failoverLlm', prop: 'baseUrl' },
+    { key: 'failoverLlmTimeoutSeconds', kind: 'val', literal: null, value: failoverLlm.timeoutSeconds, obj: 'failoverLlm', prop: 'timeoutSeconds' },
+    { key: 'failoverLlmMaxRetries', kind: 'val', literal: null, value: failoverLlm.maxRetries, obj: 'failoverLlm', prop: 'maxRetries' },
+    { key: 'failoverLlmDetectionModel', kind: 'str', value: failoverLlm.detectionModel, obj: 'failoverLlm', prop: 'detectionModel' },
+    { key: 'failoverLlmReviewModel', kind: 'str', value: failoverLlm.reviewModel, obj: 'failoverLlm', prop: 'reviewModel' },
+    { key: 'failoverLlmVerificationModel', kind: 'str', value: failoverLlm.verificationModel, obj: 'failoverLlm', prop: 'verificationModel' },
+    { key: 'failoverLlmChaptersModel', kind: 'str', value: failoverLlm.chaptersModel, obj: 'failoverLlm', prop: 'chaptersModel' },
+    { key: 'failoverWhisperEnabled', kind: 'val', literal: false, value: failoverWhisper.enabled, obj: 'failoverWhisper', prop: 'enabled' },
+    { key: 'failoverWhisperBackend', kind: 'str', useDefault: true, value: failoverWhisper.backend, obj: 'failoverWhisper', prop: 'backend' },
+    { key: 'failoverWhisperModel', kind: 'str', value: failoverWhisper.model, obj: 'failoverWhisper', prop: 'model' },
+    { key: 'failoverWhisperApiBaseUrl', kind: 'str', value: failoverWhisper.apiBaseUrl, obj: 'failoverWhisper', prop: 'apiBaseUrl' },
+    { key: 'failoverWhisperApiModel', kind: 'str', useDefault: true, value: failoverWhisper.apiModel, obj: 'failoverWhisper', prop: 'apiModel' },
+    { key: 'failoverWhisperApiTimeoutSeconds', kind: 'val', literal: 600, value: failoverWhisper.apiTimeoutSeconds, obj: 'failoverWhisper', prop: 'apiTimeoutSeconds' },
+    { key: 'failoverWhisperMaxAttempts', kind: 'val', literal: null, value: failoverWhisper.maxAttempts, obj: 'failoverWhisper', prop: 'maxAttempts' },
+    { key: 'failoverWhisperLanguage', kind: 'str', value: failoverWhisper.language, obj: 'failoverWhisper', prop: 'language' },
+    { key: 'failoverProbeIntervalMinutes', kind: 'val', useDefault: true, literal: 5, value: failoverProbeIntervalMinutes, set: setFailoverProbeIntervalMinutes },
+    { key: 'failoverRecoveryProbes', kind: 'val', useDefault: true, literal: 3, value: failoverRecoveryProbes, set: setFailoverRecoveryProbes },
     // Transcription
     { key: 'whisperBackend', kind: 'str', useDefault: true, value: whisperBackend, set: (v) => setWhisperBackend(v as WhisperBackend) },
     { key: 'whisperApiBaseUrl', kind: 'str', value: whisperApiConfig.baseUrl, obj: 'whisperApi', prop: 'baseUrl' },
@@ -596,6 +690,7 @@ function Settings() {
     { key: 'transcribeConcurrentChunks', kind: 'val', useDefault: true, literal: 4, value: transcribeConcurrentChunks, set: setTranscribeConcurrentChunks },
     { key: 'transcribeChunkOverlapSeconds', kind: 'val', useDefault: true, literal: 30, value: transcribeChunkOverlapSeconds, set: setTranscribeChunkOverlapSeconds },
     { key: 'whisperApiTimeoutSeconds', kind: 'val', useDefault: true, literal: 600, value: whisperApiTimeoutSeconds, set: setWhisperApiTimeoutSeconds },
+    { key: 'whisperMaxAttempts', kind: 'val', useDefault: true, literal: 2, value: whisperMaxAttempts, set: setWhisperMaxAttempts },
     { key: 'whisperPoolEnabled', kind: 'val', useDefault: true, literal: false, value: whisperPoolEnabled, set: setWhisperPoolEnabled },
     { key: 'whisperPoolMaxRequests', kind: 'val', useDefault: true, literal: 4, value: whisperPoolMaxRequests, set: setWhisperPoolMaxRequests },
     { key: 'whisperPoolMaxEpisodes', kind: 'val', useDefault: true, literal: 1, value: whisperPoolMaxEpisodes, set: setWhisperPoolMaxEpisodes },
@@ -618,7 +713,6 @@ function Settings() {
     { key: 'vttTranscriptsEnabled', kind: 'val', useDefault: true, value: vttTranscriptsEnabled, set: setVttTranscriptsEnabled },
     { key: 'chaptersEnabled', kind: 'val', useDefault: true, value: chaptersEnabled, set: setChaptersEnabled },
     { key: 'chaptersInNotes', kind: 'val', useDefault: true, value: chaptersInNotes, set: setChaptersInNotes },
-    { key: 'adChaptersEnabled', kind: 'val', useDefault: true, value: adChaptersEnabled, set: setAdChaptersEnabled },
     { key: 'adChaptersIncludeHeld', kind: 'val', useDefault: true, value: adChaptersIncludeHeld, set: setAdChaptersIncludeHeld },
     { key: 'adChapterTitleFormat', kind: 'str', useDefault: true, value: adChapterTitleFormat, set: setAdChapterTitleFormat },
     { key: 'adChapterHeldTitleFormat', kind: 'str', useDefault: true, value: adChapterHeldTitleFormat, set: setAdChapterHeldTitleFormat },
@@ -644,6 +738,7 @@ function Settings() {
     { key: 'differentialHoldMinSeconds', kind: 'val', useDefault: true, literal: 10, value: differentialHoldMinSeconds, set: setDifferentialHoldMinSeconds },
     { key: 'daiDifferentialOverridesKeep', kind: 'val', useDefault: true, literal: true, value: daiDifferentialOverridesKeep, set: setDaiDifferentialOverridesKeep },
     { key: 'spliceVetoEnabled', kind: 'val', useDefault: true, literal: true, value: spliceVetoEnabled, set: setSpliceVetoEnabled },
+    { key: 'transcriptDifferentialEnabled', kind: 'val', useDefault: true, literal: true, value: transcriptDifferentialEnabled, set: setTranscriptDifferentialEnabled },
     // Audio cue detection (nested `audioCue` state)
     { key: 'audioCueDetectionEnabled', kind: 'val', useDefault: true, value: audioCue.enabled, obj: 'audioCue', prop: 'enabled' },
     { key: 'audioCueFreqMinHz', kind: 'val', useDefault: true, value: audioCue.freqMinHz, obj: 'audioCue', prop: 'freqMinHz' },
@@ -706,8 +801,8 @@ function Settings() {
       // Seed every registered field from its baseline. Flat fields set
       // directly (render-phase setState, same pattern as before); nested
       // fields are collected into per-object patches and applied once.
-      const patches: Record<'reviewer' | 'audioCue' | 'whisperApi', Record<string, SettingScalar | undefined>> = {
-        reviewer: {}, audioCue: {}, whisperApi: {},
+      const patches: Record<NonNullable<FieldSpec['obj']>, Record<string, SettingScalar | undefined>> = {
+        reviewer: {}, audioCue: {}, whisperApi: {}, failoverLlm: {}, failoverWhisper: {},
       };
       for (const f of FIELDS) {
         const v = fieldBaseline(settings, f);
@@ -719,6 +814,8 @@ function Settings() {
       setReviewer((prev) => ({ ...prev, ...(patches.reviewer as Partial<typeof prev>) }));
       setAudioCue((prev) => ({ ...prev, ...(patches.audioCue as Partial<typeof prev>) }));
       setWhisperApiConfig((prev) => ({ ...prev, ...(patches.whisperApi as Partial<typeof prev>) }));
+      setFailoverLlm((prev) => ({ ...prev, ...(patches.failoverLlm as Partial<typeof prev>) }));
+      setFailoverWhisper((prev) => ({ ...prev, ...(patches.failoverWhisper as Partial<typeof prev>) }));
     }
   }
 
@@ -822,8 +919,29 @@ function Settings() {
       queryClient.invalidateQueries({ queryKey: ['whisperCapacity'] });
       // A provider or base URL change lifts a rate-limit hold server-side.
       queryClient.invalidateQueries({ queryKey: ['rateLimitHold'] });
+      // Disabling a failover clears its active state server-side.
+      queryClient.invalidateQueries({ queryKey: failoverQueryKey });
     },
   });
+
+  // Failover keys save through the main PUT, like Provider B's. The account's
+  // unsaved type and URL go with the key so the key and endpoint never split.
+  const saveFailoverKey = async (
+    payload: UpdateSettingsPayload,
+    coPersist: Array<keyof UpdateSettingsPayload> = [],
+  ) => {
+    const changed = computeChangedFields();
+    for (const key of coPersist) {
+      if (key in changed) (payload as Record<string, unknown>)[key] = changed[key];
+    }
+    await updateSettings(payload);
+    queryClient.invalidateQueries({ queryKey: ['settings'] });
+    queryClient.invalidateQueries({ queryKey: failoverQueryKey });
+    await queryClient.invalidateQueries({
+      queryKey: ['models'],
+      predicate: (q) => q.queryKey[2] === 'failover',
+    });
+  };
 
   // Single-field tunable saves (e.g. Ollama context window) commit immediately.
   const tunableMutation = useMutation({
@@ -967,6 +1085,7 @@ function Settings() {
       {/* Settings search: filters the configurable sections below by matching a
           section's title or any of its setting labels (client-side, no backend). */}
       <SearchableSectionGroup
+        onMatchKeysChange={setSearchMatches}
         placeholder="Search settings..."
         ariaLabel="Search settings"
         clearLabel="Clear settings search"
@@ -1022,13 +1141,15 @@ function Settings() {
         onDifferentialFetchModeChange={(v) => tunableMutation.mutate({ differentialFetchMode: v })}
       />
 
-      <SegmentActionsSection
-        segmentCategoryActions={settings?.segmentCategoryActions?.value ?? settings?.defaults?.segmentCategoryActions ?? {}}
-        onSegmentCategoryActionChange={(category, action) =>
-          tunableMutation.mutate({ segmentCategoryActions: { [category]: action } })}
-        detectShowSegments={settings?.detectShowSegments?.value ?? settings?.defaults?.detectShowSegments ?? false}
-        onDetectShowSegmentsChange={(v) => tunableMutation.mutate({ detectShowSegments: v })}
-      />
+      <div id="segment-actions">
+        <SegmentActionsSection
+          segmentCategoryActions={settings?.segmentCategoryActions?.value ?? settings?.defaults?.segmentCategoryActions ?? {}}
+          onSegmentCategoryActionChange={(category, action) =>
+            tunableMutation.mutate({ segmentCategoryActions: { [category]: action } })}
+          detectShowSegments={settings?.detectShowSegments?.value ?? settings?.defaults?.detectShowSegments ?? false}
+          onDetectShowSegmentsChange={(v) => tunableMutation.mutate({ detectShowSegments: v })}
+        />
+      </div>
 
       <LLMProviderSection
         llmProvider={llmProvider}
@@ -1073,6 +1194,14 @@ function Settings() {
         onSecondaryProviderRequestsPerDayChange={setSecondaryProviderRequestsPerDay}
         providerTokensPerMin={providerTokensPerMin}
         onProviderTokensPerMinChange={setProviderTokensPerMin}
+        providerATimeoutSeconds={providerATimeoutSeconds}
+        onProviderATimeoutSecondsChange={setProviderATimeoutSeconds}
+        providerAMaxRetries={providerAMaxRetries}
+        onProviderAMaxRetriesChange={setProviderAMaxRetries}
+        providerBTimeoutSeconds={providerBTimeoutSeconds}
+        onProviderBTimeoutSecondsChange={setProviderBTimeoutSeconds}
+        providerBMaxRetries={providerBMaxRetries}
+        onProviderBMaxRetriesChange={setProviderBMaxRetries}
         primaryAccountChanged={primaryAccountChanged}
         secondaryAccountChanged={secondaryAccountChanged}
         affectedRunsAction={affectedRunsAction}
@@ -1108,6 +1237,39 @@ function Settings() {
         pricingOverrideSavingModel={
           modelPricingMutation.isPending ? modelPricingMutation.variables?.modelId ?? null : null
         }
+      />
+
+      <FailoverSection
+        storageKey={FAILOVER_STORAGE_KEY}
+        onToggle={setFailoverOpen}
+        overview={failoverOverview}
+        overviewLoading={failoverOverviewLoading}
+        onTrigger={(target) => failoverAction.mutate({ kind: 'trigger', target })}
+        onCancel={(target) => failoverAction.mutate({ kind: 'cancel', target })}
+        onProbeNow={() => failoverAction.mutate({ kind: 'probe' })}
+        actionPending={failoverAction.isPending}
+        probePending={failoverAction.isPending && failoverAction.variables?.kind === 'probe'}
+        actionError={failoverAction.error ? getErrorMessage(failoverAction.error, 'Failover action failed') : null}
+        probeIntervalMinutes={failoverProbeIntervalMinutes}
+        onProbeIntervalChange={setFailoverProbeIntervalMinutes}
+        recoveryProbes={failoverRecoveryProbes}
+        onRecoveryProbesChange={setFailoverRecoveryProbes}
+        llm={{ ...failoverLlm, apiKeyConfigured: settings?.failoverLlmApiKeyConfigured ?? false }}
+        onLlmChange={(patch) => setFailoverLlm((prev) => ({ ...prev, ...patch }))}
+        onLlmApiKeySave={(apiKey) => saveFailoverKey(
+          { failoverLlmApiKey: apiKey }, ['failoverLlmProvider', 'failoverLlmBaseUrl'],
+        )}
+        onLlmApiKeyClear={() => saveFailoverKey({ failoverLlmApiKey: '' })}
+        failoverCatalog={failoverCatalog}
+        whisper={{ ...failoverWhisper, apiKeyConfigured: settings?.failoverWhisperApiKeyConfigured ?? false }}
+        activeWhisperMaxAttempts={whisperMaxAttempts}
+        onWhisperChange={(patch) => setFailoverWhisper((prev) => ({ ...prev, ...patch }))}
+        onWhisperApiKeySave={(apiKey) => saveFailoverKey(
+          { failoverWhisperApiKey: apiKey }, ['failoverWhisperApiBaseUrl'],
+        )}
+        onWhisperApiKeyClear={() => saveFailoverKey({ failoverWhisperApiKey: '' })}
+        skipFlacCompression={skipFlacCompression}
+        cryptoReady={providersState?.cryptoReady ?? false}
       />
 
       {settings?.stageTunables && settings?.stageTunableDefaults && (
@@ -1159,6 +1321,8 @@ function Settings() {
         transcribeChunkOverlapSeconds={transcribeChunkOverlapSeconds}
         whisperApiTimeoutSeconds={whisperApiTimeoutSeconds}
         onWhisperApiTimeoutSecondsChange={setWhisperApiTimeoutSeconds}
+        whisperMaxAttempts={whisperMaxAttempts}
+        onWhisperMaxAttemptsChange={setWhisperMaxAttempts}
         onTranscribeChunkOverlapSecondsChange={setTranscribeChunkOverlapSeconds}
         skipFlacCompression={skipFlacCompression}
         onSkipFlacCompressionChange={setSkipFlacCompression}
@@ -1215,6 +1379,8 @@ function Settings() {
         onDaiDifferentialOverridesKeepChange={setDaiDifferentialOverridesKeep}
         spliceVetoEnabled={spliceVetoEnabled}
         onSpliceVetoEnabledChange={setSpliceVetoEnabled}
+        transcriptDifferentialEnabled={transcriptDifferentialEnabled}
+        onTranscriptDifferentialEnabledChange={setTranscriptDifferentialEnabled}
         onDifferentialHoldMinSecondsChange={setDifferentialHoldMinSeconds}
       />
 
@@ -1247,20 +1413,24 @@ function Settings() {
         systemPromptOverride={systemPromptOverride}
         verificationPromptOverride={verificationPromptOverride}
         chapterPromptOverride={chapterPromptOverride}
+        patternCleanupPrompt={patternCleanupPrompt}
         onSystemPromptChange={setSystemPrompt}
         onVerificationPromptChange={setVerificationPrompt}
         onChapterPromptChange={setChapterPrompt}
         onSystemPromptOverrideChange={setSystemPromptOverride}
         onVerificationPromptOverrideChange={setVerificationPromptOverride}
         onChapterPromptOverrideChange={setChapterPromptOverride}
+        onPatternCleanupPromptChange={setPatternCleanupPrompt}
         onResetPrompts={() => resetPromptsMutation.mutate()}
         resetIsPending={resetPromptsMutation.isPending}
         systemPromptIsDefault={settings?.systemPrompt.isDefault}
         verificationPromptIsDefault={settings?.verificationPrompt.isDefault}
         chapterPromptIsDefault={settings?.chapterPrompt.isDefault}
+        patternCleanupPromptIsDefault={settings?.patternCleanupPrompt?.isDefault}
         onResetSystemPrompt={() => resetPromptMutation.mutate('system')}
         onResetVerificationPrompt={() => resetPromptMutation.mutate('verification')}
         onResetChapterPrompt={() => resetPromptMutation.mutate('chapter')}
+        onResetPatternCleanupPrompt={() => resetPromptMutation.mutate('pattern_cleanup')}
       />
 
       <CommunityPatternsSection />
@@ -1277,6 +1447,13 @@ function Settings() {
       <PositionalPriorSection
         enabled={positionalPriorEnabled}
         onChange={setPositionalPriorEnabled}
+      />
+
+      <PatternCleanupSection
+        primaryProvider={llmProvider}
+        secondaryProvider={secondaryProviderEnabled && secondaryProvider ? secondaryProvider : ''}
+        secondaryEnabled={secondaryProviderEnabled}
+        detectionSlot={detectionSlot}
       />
 
       <SettingsGroupHeader title="Output" />
@@ -1303,17 +1480,11 @@ function Settings() {
         onChaptersModeChange={(v) => tunableMutation.mutate({ chaptersMode: v })}
         adChapters={{
           chaptersEnabled,
-          enabled: adChaptersEnabled,
-          categories: settings?.adChapterCategories?.value
-            ?? settings?.defaults?.adChapterCategories ?? {},
           includeHeld: adChaptersIncludeHeld,
           titleFormat: adChapterTitleFormat,
           heldTitleFormat: adChapterHeldTitleFormat,
           resumeTitle: adChapterResumeTitle,
           minConfidence: adChapterMinConfidence,
-          onEnabledChange: setAdChaptersEnabled,
-          onCategoryChange: (category, checked) =>
-            tunableMutation.mutate({ adChapterCategories: { [category]: checked } }),
           onIncludeHeldChange: setAdChaptersIncludeHeld,
           onTitleFormatChange: setAdChapterTitleFormat,
           onHeldTitleFormatChange: setAdChapterHeldTitleFormat,

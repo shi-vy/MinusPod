@@ -34,6 +34,7 @@ from config import (
     WHISPER_API_TIMEOUT_MIN, WHISPER_API_TIMEOUT_MAX,
     WHISPER_POOL_MAX_REQUESTS_RANGE, WHISPER_POOL_MAX_EPISODES_RANGE,
     coerce_bool_setting,
+    apply_ad_chapter_compat, ad_chapter_compat_view,
     MIN_CONTENT_BETWEEN_ADS_SECONDS,
     MAX_AD_DURATION, MAX_AD_DURATION_CONFIRMED,
     get_env_backed_int,
@@ -46,9 +47,7 @@ from config import (
     EPISODE_LOG_RETENTION_DAYS_MIN, EPISODE_LOG_RETENTION_DAYS_MAX,
     USER_AGENT_MAX_LENGTH, validate_user_agent,
     resolve_segment_category_actions_map,
-    resolve_ad_chapter_categories_map,
     valid_ad_chapter_title_format,
-    validate_ad_chapter_categories,
     resolve_community_sync_categories,
     resolve_jit_blocked_user_agents,
 )
@@ -56,6 +55,7 @@ from config import (
 # settings back. Keep it that way: a top-level dependency the other way would
 # break boot (api/__init__ imports settings before podcast_search).
 from api.podcast_search import resolve_search_provider, search_provider_ready
+from api.pattern_cleanup import cleanup_settings_view
 from ad_detector import AdDetector
 from artwork_watermark import BADGE_POSITIONS
 from audio_processor import NORMALIZE_PRESETS
@@ -84,9 +84,11 @@ from llm_client import (
     invalidate_provider_cache, reset_schema_probe_memo,
 )
 from llm_route import (
-    VALID_SLOTS, SAME_AS_DETECTION, SAME_AS_PASS, SLOT_PRIMARY, SLOT_SECONDARY,
-    resolved_stage_slot,
+    ALL_CREDENTIAL_SLOTS, VALID_SLOTS, SAME_AS_DETECTION, SAME_AS_PASS,
+    SLOT_FAILOVER, SLOT_PRIMARY, SLOT_SECONDARY, resolved_stage_slot,
 )
+import failover
+from pattern_cleanup import BATCH_SIZE_RANGE, UNUSED_DAYS_RANGE
 from tools.reviewer_calibration import (
     calibration_revision, trigger_reviewer_calibration,
 )
@@ -118,6 +120,19 @@ VALID_LLM_PROVIDERS = (
     PROVIDER_OPENAI_COMPATIBLE, PROVIDER_OLLAMA,
 )
 PRICING_SOURCE_MODES = ('auto', 'litellm', 'free')
+
+# Provider B payload keys accepted as aliases of the stored secondary_* keys
+# (#806 rename: Primary/Secondary becomes Provider A/Provider B).
+PROVIDER_B_ALIASES = {
+    'providerBEnabled': 'secondaryProviderEnabled',
+    'providerB': 'secondaryProvider',
+    'providerBBaseUrl': 'secondaryProviderBaseUrl',
+    'providerBApiKey': 'secondaryProviderApiKey',
+    'providerBRequestsPerMin': 'secondaryProviderRequestsPerMin',
+    'providerBRequestsPerDay': 'secondaryProviderRequestsPerDay',
+    'providerBTokensPerMin': 'secondaryProviderTokensPerMin',
+}
+SLOT_ALIASES = {'a': 'primary', 'b': 'secondary'}
 
 logger = logging.getLogger('podcast.api')
 
@@ -187,7 +202,7 @@ def _build_settings_payload():
     from database import (
         DEFAULT_SYSTEM_PROMPT, DEFAULT_VERIFICATION_PROMPT,
         DEFAULT_REVIEW_PROMPT, DEFAULT_RESURRECT_PROMPT,
-        DEFAULT_CHAPTER_PROMPT,
+        DEFAULT_CHAPTER_PROMPT, DEFAULT_PATTERN_CLEANUP_PROMPT,
     )
     from config import (
         AUDIO_CUE_FREQ_MIN_HZ, AUDIO_CUE_FREQ_MAX_HZ,
@@ -244,6 +259,9 @@ def _build_settings_payload():
         settings, 'chapters_mode', registry_default('chapters_mode'))
     skip_second_pass = coerce_bool_setting(_setting_value(
         settings, 'skip_second_pass', registry_default('skip_second_pass')))
+    transcript_differential_enabled = coerce_bool_setting(_setting_value(
+        settings, 'transcript_differential_enabled',
+        registry_default('transcript_differential_enabled')))
     differential_fetch_mode = _setting_value(
         settings, 'differential_fetch_mode', registry_default('differential_fetch_mode'))
     chapters_in_notes = coerce_bool_setting(_setting_value(
@@ -382,6 +400,54 @@ def _build_settings_payload():
         settings, 'secondary_provider_base_url',
         registry_default('secondary_provider_base_url'))
     secondary_provider_api_key_configured = bool(db.get_secret('secondary_provider_api_key'))
+
+    # Provider failover settings and per-slot timeout overrides.
+    def _int_or_blank(db_key):
+        raw = _setting_value(settings, db_key)
+        return int(raw) if raw else None
+
+    failover_llm_enabled = coerce_bool_setting(_setting_value(
+        settings, 'failover_llm_enabled', registry_default('failover_llm_enabled')))
+    failover_llm_provider = _setting_value(settings, 'failover_llm_provider')
+    failover_llm_base_url = _setting_value(
+        settings, 'failover_llm_base_url', registry_default('failover_llm_base_url'))
+    failover_llm_timeout_seconds = _int_or_blank('failover_llm_timeout_seconds')
+    failover_llm_max_retries = _int_or_blank('failover_llm_max_retries')
+    failover_llm_detection_model = _setting_value(
+        settings, 'failover_llm_detection_model', registry_default('failover_llm_detection_model'))
+    failover_llm_review_model = _setting_value(
+        settings, 'failover_llm_review_model', registry_default('failover_llm_review_model'))
+    failover_llm_verification_model = _setting_value(
+        settings, 'failover_llm_verification_model',
+        registry_default('failover_llm_verification_model'))
+    failover_llm_chapters_model = _setting_value(
+        settings, 'failover_llm_chapters_model', registry_default('failover_llm_chapters_model'))
+    failover_llm_api_key_configured = bool(db.get_secret('failover_llm_api_key'))
+
+    failover_whisper_enabled = coerce_bool_setting(_setting_value(
+        settings, 'failover_whisper_enabled', registry_default('failover_whisper_enabled')))
+    failover_whisper_backend = _setting_value(
+        settings, 'failover_whisper_backend', registry_default('failover_whisper_backend'))
+    failover_whisper_model = _setting_value(
+        settings, 'failover_whisper_model', registry_default('failover_whisper_model'))
+    failover_whisper_api_base_url = _setting_value(
+        settings, 'failover_whisper_api_base_url', registry_default('failover_whisper_api_base_url'))
+    failover_whisper_api_model = _setting_value(
+        settings, 'failover_whisper_api_model', registry_default('failover_whisper_api_model'))
+    failover_whisper_api_timeout_seconds = _int_setting('failover_whisper_api_timeout_seconds')
+    failover_whisper_max_attempts = _int_setting('failover_whisper_max_attempts')
+    failover_whisper_language = _setting_value(
+        settings, 'failover_whisper_language', registry_default('failover_whisper_language'))
+    failover_whisper_api_key_configured = bool(db.get_secret('failover_whisper_api_key'))
+
+    failover_probe_interval_minutes = _int_setting('failover_probe_interval_minutes')
+    failover_recovery_probes = _int_setting('failover_recovery_probes')
+
+    provider_a_timeout_seconds = _int_or_blank('llm_timeout_seconds')
+    provider_a_max_retries = _int_or_blank('llm_max_retries')
+    provider_b_timeout_seconds = _int_or_blank('secondary_llm_timeout_seconds')
+    provider_b_max_retries = _int_or_blank('secondary_llm_max_retries')
+    whisper_max_attempts = _int_setting('whisper_max_attempts')
 
     podcast_index_api_key = _setting_value(settings, 'podcast_index_api_key', '') or os.environ.get('PODCAST_INDEX_API_KEY', '')
 
@@ -548,6 +614,8 @@ def _build_settings_payload():
     review_prompt = _setting_value(settings, 'review_prompt', DEFAULT_REVIEW_PROMPT) or DEFAULT_REVIEW_PROMPT
     resurrect_prompt = _setting_value(settings, 'resurrect_prompt', DEFAULT_RESURRECT_PROMPT) or DEFAULT_RESURRECT_PROMPT
     chapter_prompt = _setting_value(settings, 'chapter_prompt', DEFAULT_CHAPTER_PROMPT) or DEFAULT_CHAPTER_PROMPT
+    pattern_cleanup_prompt = (_setting_value(settings, 'pattern_cleanup_prompt')
+                              or DEFAULT_PATTERN_CLEANUP_PROMPT)
 
     # Audio cue detection experiment (#350)
     audio_cue_enabled = str(_setting_value(
@@ -563,9 +631,9 @@ def _build_settings_payload():
     splice_veto_enabled = coerce_bool_setting(_setting_value(
         settings, 'splice_veto_enabled', registry_default('splice_veto_enabled')))
 
-    ad_chapters_enabled = coerce_bool_setting(_str_setting('ad_chapters_enabled'))
-    ad_chapter_categories = resolve_ad_chapter_categories_map(
-        _str_setting('ad_chapter_categories'))
+    # Compatibility fields (spec 1.4): derived from segment_category_actions,
+    # not their own retired settings.
+    ad_chapters_enabled, ad_chapter_categories = ad_chapter_compat_view(segment_category_actions)
     ad_chapters_include_held = coerce_bool_setting(
         _str_setting('ad_chapters_include_held'))
     ad_chapter_title_format = _str_setting('ad_chapter_title_format')
@@ -610,7 +678,7 @@ def _build_settings_payload():
     silence_snap_min_duration = _cue_num('silence_snap_min_duration_seconds', SILENCE_SNAP_MIN_DURATION_SECONDS)
     silence_snap_max_distance = _cue_num('silence_snap_max_distance_seconds', SILENCE_SNAP_MAX_DISTANCE_SECONDS)
 
-    return {
+    payload = {
         'systemPrompt': _sv('system_prompt', _setting_value(settings, 'system_prompt', DEFAULT_SYSTEM_PROMPT) or DEFAULT_SYSTEM_PROMPT),
         'verificationPrompt': _sv('verification_prompt', _setting_value(settings, 'verification_prompt', DEFAULT_VERIFICATION_PROMPT) or DEFAULT_VERIFICATION_PROMPT),
         'enableAdReview': _sv('enable_ad_review', enable_ad_review),
@@ -620,6 +688,7 @@ def _build_settings_payload():
         'reviewPrompt': _sv('review_prompt', review_prompt),
         'resurrectPrompt': _sv('resurrect_prompt', resurrect_prompt),
         'chapterPrompt': _sv('chapter_prompt', chapter_prompt),
+        'patternCleanupPrompt': _sv('pattern_cleanup_prompt', pattern_cleanup_prompt),
         'systemPromptOverride': _sv('system_prompt_override', _setting_value(settings, 'system_prompt_override', '') or ''),
         'verificationPromptOverride': _sv('verification_prompt_override', _setting_value(settings, 'verification_prompt_override', '') or ''),
         'reviewPromptOverride': _sv('review_prompt_override', _setting_value(settings, 'review_prompt_override', '') or ''),
@@ -681,10 +750,12 @@ def _build_settings_payload():
         'chaptersMode': _sv('chapters_mode', chapters_mode),
         'chaptersInNotes': _sv('chapters_in_notes', chapters_in_notes),
         'skipSecondPass': _sv('skip_second_pass', skip_second_pass),
+        'transcriptDifferentialEnabled': _sv(
+            'transcript_differential_enabled', transcript_differential_enabled),
         'differentialFetchMode': _sv(
             'differential_fetch_mode', differential_fetch_mode),
-        'adChaptersEnabled': _sv('ad_chapters_enabled', ad_chapters_enabled),
-        'adChapterCategories': _sv('ad_chapter_categories', ad_chapter_categories),
+        'adChaptersEnabled': _sv('segment_category_actions', ad_chapters_enabled),
+        'adChapterCategories': _sv('segment_category_actions', ad_chapter_categories),
         'adChaptersIncludeHeld': _sv('ad_chapters_include_held', ad_chapters_include_held),
         'adChapterTitleFormat': _sv('ad_chapter_title_format', ad_chapter_title_format),
         'adChapterHeldTitleFormat': _sv(
@@ -693,6 +764,15 @@ def _build_settings_payload():
         'adChapterMinConfidence': _sv('ad_chapter_min_confidence', ad_chapter_min_confidence),
         'chaptersModel': _sv('chapters_model', chapters_model),
         'chaptersProvider': _sv('chapters_provider', chapters_provider),
+        'patternCleanupEnabled': _sv(
+            'pattern_cleanup_enabled', coerce_bool_setting(_str_setting('pattern_cleanup_enabled'))),
+        'patternCleanupCron': _sv('pattern_cleanup_cron', _str_setting('pattern_cleanup_cron')),
+        'patternCleanupBatchSize': _sv(
+            'pattern_cleanup_batch_size', _int_setting('pattern_cleanup_batch_size')),
+        'patternCleanupUnusedDays': _sv(
+            'pattern_cleanup_unused_days', _int_setting('pattern_cleanup_unused_days')),
+        'patternCleanupProvider': _sv('pattern_cleanup_provider'),
+        'patternCleanupModel': _sv('pattern_cleanup_model'),
         'minCutConfidence': _sv('min_cut_confidence', min_cut_confidence),
         'llmProvider': _sv('llm_provider', llm_provider),
         'omitTemperature': _sv('omit_temperature', omit_temperature),
@@ -715,6 +795,37 @@ def _build_settings_payload():
         'providerTokensPerMin': _sv('provider_tokens_per_min', provider_tokens_per_min),
         'secondaryProviderTokensPerMin': _sv(
             'secondary_provider_tokens_per_min', secondary_provider_tokens_per_min),
+        # Provider failover (#806).
+        'failoverLlmEnabled': _sv('failover_llm_enabled', failover_llm_enabled),
+        'failoverLlmProvider': _sv('failover_llm_provider', failover_llm_provider),
+        'failoverLlmBaseUrl': _sv('failover_llm_base_url', failover_llm_base_url),
+        'failoverLlmTimeoutSeconds': _sv('failover_llm_timeout_seconds', failover_llm_timeout_seconds),
+        'failoverLlmMaxRetries': _sv('failover_llm_max_retries', failover_llm_max_retries),
+        'failoverLlmDetectionModel': _sv('failover_llm_detection_model', failover_llm_detection_model),
+        'failoverLlmReviewModel': _sv('failover_llm_review_model', failover_llm_review_model),
+        'failoverLlmVerificationModel': _sv(
+            'failover_llm_verification_model', failover_llm_verification_model),
+        'failoverLlmChaptersModel': _sv('failover_llm_chapters_model', failover_llm_chapters_model),
+        'failoverLlmApiKeyConfigured': failover_llm_api_key_configured,
+        'failoverWhisperEnabled': _sv('failover_whisper_enabled', failover_whisper_enabled),
+        'failoverWhisperBackend': _sv('failover_whisper_backend', failover_whisper_backend),
+        'failoverWhisperModel': _sv('failover_whisper_model', failover_whisper_model),
+        'failoverWhisperApiBaseUrl': _sv(
+            'failover_whisper_api_base_url', failover_whisper_api_base_url),
+        'failoverWhisperApiModel': _sv('failover_whisper_api_model', failover_whisper_api_model),
+        'failoverWhisperApiTimeoutSeconds': _sv(
+            'failover_whisper_api_timeout_seconds', failover_whisper_api_timeout_seconds),
+        'failoverWhisperMaxAttempts': _sv('failover_whisper_max_attempts', failover_whisper_max_attempts),
+        'failoverWhisperLanguage': _sv('failover_whisper_language', failover_whisper_language),
+        'failoverWhisperApiKeyConfigured': failover_whisper_api_key_configured,
+        'failoverProbeIntervalMinutes': _sv(
+            'failover_probe_interval_minutes', failover_probe_interval_minutes),
+        'failoverRecoveryProbes': _sv('failover_recovery_probes', failover_recovery_probes),
+        'providerATimeoutSeconds': _sv('llm_timeout_seconds', provider_a_timeout_seconds),
+        'providerAMaxRetries': _sv('llm_max_retries', provider_a_max_retries),
+        'providerBTimeoutSeconds': _sv('secondary_llm_timeout_seconds', provider_b_timeout_seconds),
+        'providerBMaxRetries': _sv('secondary_llm_max_retries', provider_b_max_retries),
+        'whisperMaxAttempts': _sv('whisper_max_attempts', whisper_max_attempts),
         'podcastIndexApiKeyConfigured': bool(podcast_index_api_key),
         # value is resolved, not raw: unset falls back to PodcastIndex when
         # its credentials exist (pre-option installs keep their behavior),
@@ -801,14 +912,23 @@ def _build_settings_payload():
             payload_key: STAGE_TUNABLE_DEFAULTS[db_key]
             for payload_key, db_key, _ in STAGE_TUNABLE_PAYLOAD_KEYS
         },
-        # Every per-setting default derives from SETTINGS_REGISTRY;
-        # openrouterBaseUrl is a fixed constant, not a setting.
-        'defaults': {
-            **{spec.payload_key: registry_get_default(key)
-               for key, spec in SETTINGS_REGISTRY.items() if spec.payload_key},
-            'openrouterBaseUrl': OPENROUTER_BASE_URL,
-        }
     }
+
+    # Provider A/B rename (#806): emit the Provider B alias spellings as
+    # copies of the secondary_* values for one release.
+    for alias, canonical in PROVIDER_B_ALIASES.items():
+        if canonical in payload and not alias.endswith('ApiKey'):
+            payload[alias] = payload[canonical]
+    payload['providerBApiKeyConfigured'] = payload['secondaryProviderApiKeyConfigured']
+
+    # Every per-setting default derives from SETTINGS_REGISTRY;
+    # openrouterBaseUrl is a fixed constant, not a setting.
+    payload['defaults'] = {
+        **{spec.payload_key: registry_get_default(key)
+           for key, spec in SETTINGS_REGISTRY.items() if spec.payload_key},
+        'openrouterBaseUrl': OPENROUTER_BASE_URL,
+    }
+    return payload
 
 
 @api.route('/settings', methods=['GET'])
@@ -895,6 +1015,19 @@ def update_ad_detection_settings():
 
     db = get_database()
 
+    # Provider A/B rename aliases (#806): normalise before any validation
+    # or applier phase sees the payload.
+    for alias, canonical in PROVIDER_B_ALIASES.items():
+        if alias in data and canonical not in data:
+            data[canonical] = data.pop(alias)
+    stage_provider_keys = (
+        'detectionProvider', 'verificationProvider', 'chaptersProvider', 'reviewProvider')
+    for key in stage_provider_keys:
+        if key in data and data[key] is not None and not isinstance(data[key], str):
+            return error_response(f'{key} must be a string or null', 400)
+        if isinstance(data.get(key), str) and data[key] in SLOT_ALIASES:
+            data[key] = SLOT_ALIASES[data[key]]
+
     if 'adAddressingMode' in data:
         value = str(data['adAddressingMode'] or '').strip().lower()
         if value not in ('timestamps', 'segment_ids', 'random'):
@@ -904,6 +1037,10 @@ def update_ad_detection_settings():
     processing_error = _validate_processing_defaults_payload(data)
     if processing_error is not None:
         return processing_error
+
+    failover_error = _validate_failover_settings_payload(data)
+    if failover_error is not None:
+        return failover_error
 
     provider_error = _validate_provider_payload(data)
     if provider_error is not None:
@@ -924,6 +1061,10 @@ def update_ad_detection_settings():
         # Secondary first: the primary phase's model-prune guard resolves
         # stage slots against secondary state this same PUT may be setting.
         _apply_secondary_provider_fields,
+        _apply_failover_llm_fields,
+        _apply_failover_whisper_fields,
+        _apply_failover_policy_fields,
+        _apply_provider_timeout_fields,
         _apply_provider_fields,
         _apply_whisper_fields,
         _apply_vad_gap_fields,
@@ -997,6 +1138,9 @@ def _validate_processing_defaults_payload(data):
             return error_response('chaptersMode must be auto, generate, or off', 400)
     if 'skipSecondPass' in data and not isinstance(data['skipSecondPass'], bool):
         return error_response('skipSecondPass must be a boolean', 400)
+    if ('transcriptDifferentialEnabled' in data
+            and not isinstance(data['transcriptDifferentialEnabled'], bool)):
+        return error_response('transcriptDifferentialEnabled must be a boolean', 400)
     if 'spliceVetoEnabled' in data and not isinstance(data['spliceVetoEnabled'], bool):
         return error_response('spliceVetoEnabled must be a boolean', 400)
     if 'differentialFetchMode' in data:
@@ -1048,6 +1192,7 @@ def _apply_prompt_fields(db, data):
         ('reviewPrompt', 'review_prompt', 'review prompt'),
         ('resurrectPrompt', 'resurrect_prompt', 'resurrect prompt'),
         ('chapterPrompt', 'chapter_prompt', 'chapter prompt'),
+        ('patternCleanupPrompt', 'pattern_cleanup_prompt', 'pattern cleanup prompt'),
     ):
         if payload_key in data:
             if not str(data[payload_key] or '').strip():
@@ -1473,6 +1618,13 @@ def _apply_processing_flags(db, data):
                        'true' if data['skipSecondPass'] else 'false',
                        is_default=False)
 
+    if 'transcriptDifferentialEnabled' in data:
+        if not isinstance(data['transcriptDifferentialEnabled'], bool):
+            return error_response('transcriptDifferentialEnabled must be a boolean', 400)
+        db.set_setting('transcript_differential_enabled',
+                       'true' if data['transcriptDifferentialEnabled'] else 'false',
+                       is_default=False)
+
     if 'differentialFetchMode' in data:
         value = str(data['differentialFetchMode'] or '').strip().lower()
         if value not in ('auto', 'on', 'off'):
@@ -1570,18 +1722,33 @@ def _apply_segment_category_actions(db, data):
     return None
 
 
-def _apply_ad_chapter_fields(db, data):
-    """Persist the ad chapter settings; the category map merges over the stored map.
+def _translate_ad_chapter_compat(db, data):
+    """Translate adChaptersEnabled/adChapterCategories into segment_category_actions
+    (spec 1.4). (new_map_or_None, error); None means neither field was present."""
+    if 'adChaptersEnabled' not in data and 'adChapterCategories' not in data:
+        return None, None
 
-    An empty title string resets that field to its default, matching the
-    contract _apply_user_agent_fields uses for the other free-text settings.
+    merged = resolve_segment_category_actions_map(db.get_setting('segment_category_actions'))
+    changes, error = apply_ad_chapter_compat(merged, data)
+    if error:
+        return None, error
+    merged.update(changes)
+    return merged, None
+
+
+def _apply_ad_chapter_fields(db, data):
+    """Persist the ad chapter settings.
+
+    adChaptersEnabled/adChapterCategories no longer have their own settings;
+    they translate into segment_category_actions (spec 1.4). An empty title
+    string resets that field to its default, matching the contract
+    _apply_user_agent_fields uses for the other free-text settings.
     """
     # Validate every field first so a bad value leaves nothing half-written.
     writes = []
-    for key, setting in (('adChaptersEnabled', 'ad_chapters_enabled'),
-                         ('adChaptersIncludeHeld', 'ad_chapters_include_held')):
-        if key in data:
-            writes.append((setting, 'true' if coerce_bool_setting(data[key]) else 'false'))
+    if 'adChaptersIncludeHeld' in data:
+        writes.append(('ad_chapters_include_held',
+                       'true' if coerce_bool_setting(data['adChaptersIncludeHeld']) else 'false'))
 
     for key, setting in (('adChapterTitleFormat', 'ad_chapter_title_format'),
                          ('adChapterHeldTitleFormat', 'ad_chapter_held_title_format'),
@@ -1606,15 +1773,11 @@ def _apply_ad_chapter_fields(db, data):
             return error_response('adChapterMinConfidence must be between 0 and 1', 400)
         writes.append(('ad_chapter_min_confidence', str(float(value))))
 
-    merged = None
-    if 'adChapterCategories' in data:
-        value = data['adChapterCategories']
-        error = validate_ad_chapter_categories(value)
-        if error:
-            return error_response(error, 400)
-        merged = resolve_ad_chapter_categories_map(db.get_setting('ad_chapter_categories'))
-        merged.update(value)
-        writes.append(('ad_chapter_categories', json.dumps(merged)))
+    actions, error = _translate_ad_chapter_compat(db, data)
+    if error:
+        return error_response(error, 400)
+    if actions is not None:
+        writes.append(('segment_category_actions', json.dumps(actions)))
 
     for setting, value in writes:
         # Only the title fields can be blank here, and blank means reset.
@@ -1623,8 +1786,8 @@ def _apply_ad_chapter_fields(db, data):
             logger.info(f"Reset {setting} to the default")
         else:
             db.set_setting(setting, value, is_default=False)
-    if merged is not None:
-        logger.info(f"Updated ad chapter categories: {merged}")
+    if actions is not None:
+        logger.info(f"Updated segment category actions via ad chapter compatibility fields: {actions}")
     return None
 
 
@@ -1877,6 +2040,64 @@ def _validate_provider_payload(data):
         error = _base_url_error(data['whisperApiBaseUrl'], 'whisper API base URL')
         if error is not None:
             return error
+    if data.get('failoverLlmProvider') and data['failoverLlmProvider'] not in VALID_LLM_PROVIDERS:
+        return error_response(
+            f'failoverLlmProvider must be one of: {", ".join(VALID_LLM_PROVIDERS)}', 400)
+    if 'failoverLlmBaseUrl' in data:
+        value = data['failoverLlmBaseUrl']
+        if not isinstance(value, str):
+            return error_response('failoverLlmBaseUrl must be a string', 400)
+        if value.strip():
+            error = _base_url_error(value, 'failover LLM base URL')
+            if error is not None:
+                return error
+    if data.get('failoverWhisperApiBaseUrl'):
+        error = _base_url_error(data['failoverWhisperApiBaseUrl'], 'failover whisper API base URL')
+        if error is not None:
+            return error
+    return None
+
+
+def _validate_failover_settings_payload(data):
+    for key in ('failoverLlmEnabled', 'failoverWhisperEnabled'):
+        if key in data and not isinstance(data[key], bool):
+            return error_response(f'{key} must be a boolean', 400)
+
+    optional_integers = (
+        'failoverLlmTimeoutSeconds', 'failoverLlmMaxRetries',
+        'failoverWhisperMaxAttempts',
+        'providerATimeoutSeconds', 'providerAMaxRetries',
+        'providerBTimeoutSeconds', 'providerBMaxRetries',
+    )
+    for key in optional_integers:
+        if key not in data or data[key] is None or data[key] == '':
+            continue
+        if type(data[key]) is not int:
+            return error_response(f'{key} must be an integer or blank', 400)
+
+    for key in ('failoverWhisperApiTimeoutSeconds',
+                'failoverProbeIntervalMinutes', 'failoverRecoveryProbes',
+                'whisperMaxAttempts'):
+        if key in data and type(data[key]) is not int:
+            return error_response(f'{key} must be an integer', 400)
+
+    string_fields = (
+        'failoverLlmBaseUrl', 'failoverLlmDetectionModel', 'failoverLlmReviewModel',
+        'failoverLlmVerificationModel', 'failoverLlmChaptersModel',
+        'failoverWhisperBackend', 'failoverWhisperModel', 'failoverWhisperApiModel',
+        'failoverWhisperLanguage',
+    )
+    for key in string_fields:
+        if key in data and not isinstance(data[key], str):
+            return error_response(f'{key} must be a string', 400)
+
+    nullable_strings = (
+        'failoverLlmProvider', 'failoverLlmApiKey', 'failoverWhisperApiBaseUrl',
+        'failoverWhisperApiKey',
+    )
+    for key in nullable_strings:
+        if key in data and data[key] is not None and not isinstance(data[key], str):
+            return error_response(f'{key} must be a string or null', 400)
     return None
 
 
@@ -2031,6 +2252,8 @@ def _apply_secondary_provider_fields(db, data):
         value = 'true' if bool(data['secondaryProviderEnabled']) else 'false'
         db.set_setting('secondary_provider_enabled', value, is_default=False)
         logger.info(f"Updated secondary_provider_enabled to: {value}")
+        if value == 'false':
+            _after_commit(lambda: failover.cancel(failover.TARGET_LLM_SECONDARY, source='manual'))
         changed = True
 
     if 'secondaryProvider' in data:
@@ -2074,6 +2297,179 @@ def _apply_secondary_provider_fields(db, data):
                 db, 'secondary provider settings changed', known,
                 credential_slot='secondary'),
             bucket='holds')
+    return None
+
+
+# Blank overrides clear the row to its inherited value.
+_INT_OR_BLANK_FIELDS = {
+    'failoverWhisperMaxAttempts': ('failover_whisper_max_attempts', 1, 10),
+    'failoverLlmTimeoutSeconds': ('failover_llm_timeout_seconds', 10, 3600),
+    'failoverLlmMaxRetries': ('failover_llm_max_retries', 0, 10),
+    'providerATimeoutSeconds': ('llm_timeout_seconds', 10, 3600),
+    'providerAMaxRetries': ('llm_max_retries', 0, 10),
+    'providerBTimeoutSeconds': ('secondary_llm_timeout_seconds', 10, 3600),
+    'providerBMaxRetries': ('secondary_llm_max_retries', 0, 10),
+}
+
+
+def _apply_int_or_blank(db, data, payload_key):
+    """Write an optional int; None or '' clears the row. Returns an error response or None."""
+    db_key, lo, hi = _INT_OR_BLANK_FIELDS[payload_key]
+    value = data[payload_key]
+    if value is None or value == '':
+        db.clear_setting(db_key)
+        return None
+    if type(value) is not int:
+        return error_response(f'{payload_key} must be an integer or blank', 400)
+    n = value
+    if not lo <= n <= hi:
+        return error_response(f'{payload_key} must be between {lo} and {hi}', 400)
+    db.set_setting(db_key, str(n), is_default=False)
+    return None
+
+
+def _apply_provider_timeout_fields(db, data):
+    """Persist the per-slot Provider A / Provider B timeout and retry overrides (#806)."""
+    for payload_key in ('providerATimeoutSeconds', 'providerAMaxRetries',
+                        'providerBTimeoutSeconds', 'providerBMaxRetries'):
+        if payload_key in data:
+            err = _apply_int_or_blank(db, data, payload_key)
+            if err is not None:
+                return err
+    return None
+
+
+def _apply_failover_llm_fields(db, data):
+    """Persist LLM failover settings and clear active state when disabled."""
+    changed = False
+    if 'failoverLlmEnabled' in data:
+        enabled = data['failoverLlmEnabled']
+        db.set_setting('failover_llm_enabled', 'true' if enabled else 'false', is_default=False)
+        if not enabled:
+            for target in (failover.TARGET_LLM_PRIMARY, failover.TARGET_LLM_SECONDARY):
+                _after_commit(lambda t=target: failover.cancel(t, source='manual'))
+        changed = True
+    if 'failoverLlmProvider' in data:
+        value = data['failoverLlmProvider']
+        if value:
+            db.set_setting('failover_llm_provider', value, is_default=False)
+        else:
+            db.clear_setting('failover_llm_provider')
+        changed = True
+    if 'failoverLlmBaseUrl' in data:
+        value = (data['failoverLlmBaseUrl'] or '').strip()
+        if value:
+            db.set_setting('failover_llm_base_url', value, is_default=False)
+        else:
+            db.clear_setting('failover_llm_base_url')
+        changed = True
+    for payload_key, db_key in (
+            ('failoverLlmDetectionModel', 'failover_llm_detection_model'),
+            ('failoverLlmReviewModel', 'failover_llm_review_model'),
+            ('failoverLlmVerificationModel', 'failover_llm_verification_model'),
+            ('failoverLlmChaptersModel', 'failover_llm_chapters_model')):
+        if payload_key in data:
+            value = data[payload_key]
+            if not isinstance(value, str) or len(value) > 200:
+                return error_response(f'{payload_key} must be a string of at most 200 characters', 400)
+            db.set_setting(db_key, value.strip(), is_default=False)
+            changed = True
+    for payload_key in ('failoverLlmTimeoutSeconds', 'failoverLlmMaxRetries'):
+        if payload_key in data:
+            err = _apply_int_or_blank(db, data, payload_key)
+            if err is not None:
+                return err
+            changed = True
+    if 'failoverLlmApiKey' in data:
+        try:
+            set_or_clear_secret(db, 'failover_llm_api_key', data['failoverLlmApiKey'])
+        except SecretWriteRejected:
+            return error_response('provider_crypto_unavailable', 409)
+        changed = True
+    if changed:
+        _after_commit(invalidate_provider_cache)
+    return None
+
+
+def _apply_failover_whisper_fields(db, data):
+    """Persist transcriber failover settings and clear active state when disabled."""
+    changed = False
+    if 'failoverWhisperMaxAttempts' in data:
+        err = _apply_int_or_blank(db, data, 'failoverWhisperMaxAttempts')
+        if err is not None:
+            return err
+        changed = True
+    if 'failoverWhisperEnabled' in data:
+        enabled = data['failoverWhisperEnabled']
+        db.set_setting('failover_whisper_enabled', 'true' if enabled else 'false', is_default=False)
+        if not enabled:
+            _after_commit(lambda: failover.cancel(failover.TARGET_WHISPER, source='manual'))
+        changed = True
+    if 'failoverWhisperBackend' in data:
+        valid_backends = (WHISPER_BACKEND_LOCAL, WHISPER_BACKEND_API)
+        if data['failoverWhisperBackend'] not in valid_backends:
+            return error_response(
+                f'failoverWhisperBackend must be one of: {", ".join(valid_backends)}', 400)
+        db.set_setting('failover_whisper_backend', data['failoverWhisperBackend'], is_default=False)
+        changed = True
+    if 'failoverWhisperModel' in data:
+        value = data['failoverWhisperModel']
+        if len(value) > 200:
+            return error_response('failoverWhisperModel must be at most 200 characters', 400)
+        db.set_setting('failover_whisper_model', value.strip(), is_default=False)
+        changed = True
+    if 'failoverWhisperApiBaseUrl' in data:
+        # Checked by _validate_provider_payload before the transaction opens.
+        value = (data['failoverWhisperApiBaseUrl'] or '').strip()
+        db.set_setting('failover_whisper_api_base_url', value, is_default=False)
+        changed = True
+    if 'failoverWhisperApiModel' in data:
+        model_val = data['failoverWhisperApiModel'].strip()
+        if not model_val or len(model_val) > 200:
+            return error_response(
+                'failoverWhisperApiModel must be a non-empty string (max 200 chars)', 400)
+        db.set_setting('failover_whisper_api_model', model_val, is_default=False)
+        changed = True
+    if 'failoverWhisperApiTimeoutSeconds' in data:
+        value = data['failoverWhisperApiTimeoutSeconds']
+        if type(value) is not int:
+            return error_response('failoverWhisperApiTimeoutSeconds must be an integer', 400)
+        if not 30 <= value <= 3600:
+            return error_response(
+                'failoverWhisperApiTimeoutSeconds must be between 30 and 3600', 400)
+        db.set_setting('failover_whisper_api_timeout_seconds', str(value), is_default=False)
+        changed = True
+    if 'failoverWhisperLanguage' in data:
+        lang_val = data['failoverWhisperLanguage'].strip().lower()
+        if lang_val and lang_val != 'auto' and not LANGUAGE_CODE_RE.match(lang_val):
+            return error_response(
+                "failoverWhisperLanguage must be '', 'auto', or a 2-3 letter language code", 400)
+        db.set_setting('failover_whisper_language', lang_val, is_default=False)
+        changed = True
+    if 'failoverWhisperApiKey' in data:
+        try:
+            set_or_clear_secret(db, 'failover_whisper_api_key', data['failoverWhisperApiKey'])
+        except SecretWriteRejected:
+            return error_response('provider_crypto_unavailable', 409)
+        changed = True
+    if changed:
+        _after_commit(_refresh_whisper_pool)
+    return None
+
+
+def _apply_failover_policy_fields(db, data):
+    """Persist failover probe and recovery settings."""
+    for payload_key, db_key, lo, hi in (
+            ('failoverProbeIntervalMinutes', 'failover_probe_interval_minutes', 1, 60),
+            ('failoverRecoveryProbes', 'failover_recovery_probes', 1, 10)):
+        if payload_key not in data:
+            continue
+        n = data[payload_key]
+        if type(n) is not int:
+            return error_response(f'{payload_key} must be an integer', 400)
+        if not lo <= n <= hi:
+            return error_response(f'{payload_key} must be between {lo} and {hi}', 400)
+        db.set_setting(db_key, str(n), is_default=False)
     return None
 
 
@@ -2131,6 +2527,15 @@ def _apply_whisper_fields(db, data):
         enabled = coerce_bool_setting(data['skipFlacCompression'])
         db.set_setting('skip_flac_compression', 'true' if enabled else 'false', is_default=False)
         logger.info(f"Updated skip_flac_compression to: {enabled}")
+
+    if 'whisperMaxAttempts' in data:
+        n = data['whisperMaxAttempts']
+        if type(n) is not int:
+            return error_response('whisperMaxAttempts must be an integer', 400)
+        if not 1 <= n <= 10:
+            return error_response('whisperMaxAttempts must be between 1 and 10', 400)
+        db.set_setting('whisper_max_attempts', str(n), is_default=False)
+        logger.info(f"Updated whisper_max_attempts to: {n}")
 
     return None
 
@@ -2852,6 +3257,7 @@ def reset_prompts_only():
     db.reset_setting('review_prompt')
     db.reset_setting('resurrect_prompt')
     db.reset_setting('chapter_prompt')
+    db.reset_setting('pattern_cleanup_prompt')
 
     # Clear per-pass overrides too (empty is the no-override default state).
     for key in ('system_prompt_override', 'verification_prompt_override',
@@ -2870,7 +3276,7 @@ def reset_single_prompt(name):
     from database import (
         DEFAULT_SYSTEM_PROMPT, DEFAULT_VERIFICATION_PROMPT,
         DEFAULT_REVIEW_PROMPT, DEFAULT_RESURRECT_PROMPT,
-        DEFAULT_CHAPTER_PROMPT,
+        DEFAULT_CHAPTER_PROMPT, DEFAULT_PATTERN_CLEANUP_PROMPT,
     )
     defaults = {
         'system': DEFAULT_SYSTEM_PROMPT,
@@ -2878,6 +3284,7 @@ def reset_single_prompt(name):
         'review': DEFAULT_REVIEW_PROMPT,
         'resurrect': DEFAULT_RESURRECT_PROMPT,
         'chapter': DEFAULT_CHAPTER_PROMPT,
+        'pattern_cleanup': DEFAULT_PATTERN_CLEANUP_PROMPT,
     }
     if name not in defaults:
         return error_response('unknown prompt name', 404)
@@ -2885,7 +3292,8 @@ def reset_single_prompt(name):
     db = get_database()
     prompt_key = f'{name}_prompt'
     db.reset_setting(prompt_key)
-    db.set_setting(f'{name}_prompt_override', '', is_default=True)
+    if f'{name}_prompt_override' in SETTINGS_REGISTRY:
+        db.set_setting(f'{name}_prompt_override', '', is_default=True)
     logger.info(f"Reset {prompt_key} to default")
 
     settings = _settings_view(db.get_all_settings())
@@ -2951,6 +3359,15 @@ def _secondary_slot_base_url(db, provider: str) -> str | None:
     return None
 
 
+def _failover_slot_base_url(provider: str) -> str | None:
+    """Non-secret endpoint for a preview client built against the LLM
+    failover slot (#806). Only configurable-endpoint types have one;
+    anthropic/openrouter use their fixed public URL regardless of slot."""
+    if provider in PROVIDERS_NON_ANTHROPIC:
+        return failover.failover_llm_config()['base_url']
+    return None
+
+
 @api.route('/settings/models', methods=['GET'])
 @log_request
 def get_available_models():
@@ -2963,8 +3380,9 @@ def get_available_models():
     """
     provider_override = request.args.get('provider')
     slot = request.args.get('slot', SLOT_PRIMARY)
-    if slot not in VALID_SLOTS:
-        return error_response(f'slot must be one of: {", ".join(VALID_SLOTS)}', 400)
+    slot = SLOT_ALIASES.get(slot, slot)
+    if slot not in ALL_CREDENTIAL_SLOTS:
+        return error_response(f'slot must be one of: {", ".join(ALL_CREDENTIAL_SLOTS)}', 400)
 
     if provider_override:
         if provider_override not in VALID_LLM_PROVIDERS:
@@ -2976,6 +3394,10 @@ def get_available_models():
             client = create_client_for_provider(
                 provider_override, credential_slot=SLOT_SECONDARY,
                 base_url=_secondary_slot_base_url(db, provider_override))
+        elif slot == SLOT_FAILOVER:
+            client = create_client_for_provider(
+                provider_override, credential_slot=SLOT_FAILOVER,
+                base_url=_failover_slot_base_url(provider_override))
         else:
             client = create_client_for_provider(provider_override)
         models = _models_from_client(client, provider_override)
@@ -2997,8 +3419,9 @@ def refresh_models():
     """
     data = request.get_json(silent=True)
     slot = data.get('slot', SLOT_PRIMARY) if isinstance(data, dict) else SLOT_PRIMARY
-    if slot not in VALID_SLOTS:
-        return error_response(f'slot must be one of: {", ".join(VALID_SLOTS)}', 400)
+    slot = SLOT_ALIASES.get(slot, slot)
+    if slot not in ALL_CREDENTIAL_SLOTS:
+        return error_response(f'slot must be one of: {", ".join(ALL_CREDENTIAL_SLOTS)}', 400)
 
     if slot == SLOT_SECONDARY:
         db = get_database()
@@ -3009,6 +3432,15 @@ def refresh_models():
         client = get_client_for_provider(
             provider, base_url=_secondary_slot_base_url(db, provider),
             credential_slot=SLOT_SECONDARY, force_new=True)
+        models = _models_from_client(client, provider)
+    elif slot == SLOT_FAILOVER:
+        provider = failover.failover_llm_config()['provider']
+        if not provider:
+            return error_response(
+                'No failover provider configured; set failoverLlmProvider first', 400)
+        client = get_client_for_provider(
+            provider, base_url=_failover_slot_base_url(provider),
+            credential_slot=SLOT_FAILOVER, force_new=True)
         models = _models_from_client(client, provider)
     else:
         get_llm_client(force_new=True)
@@ -4080,6 +4512,81 @@ def update_db_backup_settings():
 
     # Read back after the commit so the response reflects durable state.
     return get_db_backup_settings()
+
+
+# ========== Pattern cleanup (Experiments) settings ==========
+
+@api.route('/settings/pattern-cleanup', methods=['PUT'])
+@log_request
+def update_pattern_cleanup_settings():
+    """Update pattern cleanup settings; a blank provider inherits detection's slot."""
+    db = get_database()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not data:
+        return error_response('request body must be a non-empty JSON object', 400)
+
+    staged = {}
+    if 'enabled' in data:
+        enabling = data['enabled']
+        if not isinstance(enabling, bool):
+            return error_response('enabled must be a boolean', 400)
+        staged['pattern_cleanup_enabled'] = 'true' if enabling else 'false'
+        was_enabled = db.get_setting_bool('pattern_cleanup_enabled', default=False)
+        if enabling and not was_enabled:
+            # Turning the schedule on waits for the next cron slot, even after a stale run.
+            staged['pattern_cleanup_schedule_anchor'] = utc_now_iso()
+    if 'cron' in data:
+        if not isinstance(data['cron'], str):
+            return error_response('cron must be a string', 400)
+        cron = data['cron'].strip()
+        if not is_valid_expression(cron):
+            return error_response(f'invalid cron expression: {cron}', 400)
+        staged['pattern_cleanup_cron'] = cron
+    if 'batchSize' in data:
+        value = data['batchSize']
+        lo, hi = BATCH_SIZE_RANGE
+        if not isinstance(value, int) or isinstance(value, bool) or value < lo or value > hi:
+            return error_response(f'batchSize must be an integer between {lo} and {hi}', 400)
+        staged['pattern_cleanup_batch_size'] = str(value)
+    if 'unusedDays' in data:
+        value = data['unusedDays']
+        lo, hi = UNUSED_DAYS_RANGE
+        if not isinstance(value, int) or isinstance(value, bool) or value < lo or value > hi:
+            return error_response(f'unusedDays must be an integer between {lo} and {hi}', 400)
+        staged['pattern_cleanup_unused_days'] = str(value)
+    if 'provider' in data:
+        value = data['provider']
+        if value is not None and not isinstance(value, str):
+            return error_response('provider must be a string or null', 400)
+        value = SLOT_ALIASES.get(value, value) if value else value
+        valid = VALID_SLOTS + (SAME_AS_DETECTION,)
+        if not value:
+            staged['pattern_cleanup_provider'] = ''
+        elif value in valid:
+            staged['pattern_cleanup_provider'] = value
+        else:
+            return error_response(f'provider must be one of: {", ".join(valid)}, or blank', 400)
+    if 'model' in data:
+        value = data['model']
+        if value is not None and not isinstance(value, str):
+            return error_response('model must be a string or null', 400)
+        value = (value or '').strip()
+        if len(value) > 200:
+            return error_response('model must be 200 characters or fewer', 400)
+        staged['pattern_cleanup_model'] = value
+
+    try:
+        with db.settings_transaction():
+            for key, value in staged.items():
+                if value:
+                    db.set_setting(key, value, is_default=False)
+                else:
+                    db.clear_setting(key)
+    except sqlite3.Error:
+        logger.exception("Pattern cleanup settings save failed; no field was persisted")
+        return error_response('Settings could not be saved', 500)
+
+    return json_response(cleanup_settings_view(db))
 
 
 @api.route('/community-patterns/sync', methods=['POST'])

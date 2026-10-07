@@ -34,4 +34,19 @@ describe('SegmentActionToggle', () => {
     );
     expect(screen.getByRole('radio', { name: 'Remove' }).className).toContain('bg-muted');
   });
+
+  // The fourth label (Mark) must render in full, never truncated, at 390px.
+  // No width assertion is available in jsdom, so this pins the contract at
+  // the class level instead: four full-text options, none truncating.
+  it('renders all four options full-text, with no truncating class', () => {
+    render(
+      <SegmentActionToggle value="remove" onChange={vi.fn()} ariaLabel="Sponsor action" />,
+    );
+    const radios = screen.getAllByRole('radio');
+    expect(radios).toHaveLength(4);
+    expect(radios.map((r) => r.textContent)).toEqual(['Remove', 'Beep', 'Keep', 'Mark']);
+    for (const radio of radios) {
+      expect(radio.className).not.toMatch(/truncate|text-ellipsis|overflow-hidden/);
+    }
+  });
 });

@@ -1,10 +1,12 @@
 import { apiRequest } from './client';
 import type { LlmProvider, ProviderSlot, WhisperHealthProbe } from './types';
 
-// 'secondary' has no dedicated /settings/providers/secondary REST surface
-// (unlike the others): its key saves/clears through PUT /settings and its
-// test hits /settings/providers/secondary/test-connection directly.
-export type ProviderName = 'anthropic' | 'openai' | 'openrouter' | 'whisper' | 'ollama' | 'secondary';
+// 'secondary' and the two failover accounts have no dedicated
+// /settings/providers/<name> REST surface (unlike the others): their keys
+// save/clear through PUT /settings and their tests hit test-connection directly.
+export type ProviderName =
+  | 'anthropic' | 'openai' | 'openrouter' | 'whisper' | 'ollama' | 'secondary'
+  | 'failover' | 'failover-whisper';
 
 export interface ProviderStatus {
   configured: boolean;
@@ -123,6 +125,28 @@ export function testSecondaryProviderConnection(provider?: LlmProvider | '', bas
   return apiRequest<ConnectionTestResult>('/settings/providers/secondary/test-connection', {
     method: 'POST',
     body,
+  });
+}
+
+// Probes the failover LLM account (#806) using its saved key; provider and
+// baseUrl override the saved type/base URL, same unsaved-draft pattern as
+// testSecondaryProviderConnection above.
+export function testFailoverProviderConnection(provider?: LlmProvider | '', baseUrl?: string) {
+  const body: Record<string, string> = {};
+  if (provider) body.provider = provider;
+  if (baseUrl !== undefined) body.baseUrl = baseUrl;
+  return apiRequest<ConnectionTestResult>('/settings/providers/failover/test-connection', {
+    method: 'POST',
+    body,
+  });
+}
+
+// Probes the failover Whisper account (#806); same unsaved-draft contract
+// as testWhisperConnection, against the failover-whisper endpoint.
+export function testFailoverWhisperConnection(baseUrl: string, model: string, skipFlacCompression: boolean) {
+  return apiRequest<ConnectionTestResult>('/settings/providers/failover-whisper/test-connection', {
+    method: 'POST',
+    body: { baseUrl, model, skipFlacCompression },
   });
 }
 

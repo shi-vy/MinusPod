@@ -225,6 +225,29 @@ class CueTemplateMixin:
         conn.commit()
         return cursor.rowcount > 0
 
+    def retag_network_cue_templates(self, podcast_id: int, network_id: str | None,
+                                    conn=None) -> int:
+        """Re-tag a feed's own network-scope templates to its new effective network
+        (empty demotes them to podcast scope); conn joins the caller's transaction."""
+        own_conn = conn is None
+        if own_conn:
+            conn = self.get_connection()
+        if network_id:
+            cursor = conn.execute(
+                """UPDATE audio_cue_templates SET network_id = ?
+                   WHERE scope = 'network' AND podcast_id = ? AND network_id != ?""",
+                (network_id, podcast_id, network_id),
+            )
+        else:
+            cursor = conn.execute(
+                """UPDATE audio_cue_templates SET scope = 'podcast', network_id = NULL
+                   WHERE scope = 'network' AND podcast_id = ?""",
+                (podcast_id,),
+            )
+        if own_conn:
+            conn.commit()
+        return cursor.rowcount
+
     def promote_cue_template(
         self, template_id: int, scope: str, network_id: str | None = None,
     ) -> bool:

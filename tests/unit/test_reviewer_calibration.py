@@ -85,15 +85,18 @@ class _FakeCalibrationRunner:
 
 @pytest.fixture
 def calibration_runs(monkeypatch):
-    """Fake calibration runner with the module scheduler state reset."""
+    """Reset scheduler and shared database provider state around calibration tests."""
     runner = _FakeCalibrationRunner()
     monkeypatch.setattr(calib_mod, 'run_calibration', runner)
     calib_mod._CALIBRATION_STATE.update(revision=None, route=None, running=False)
-    Database().set_setting('reviewer_calibration_on_change', 'true', is_default=False)
+    db = Database()
+    db.clear_setting('review_provider')
+    db.set_setting('reviewer_calibration_on_change', 'true', is_default=False)
     yield runner
     runner.release.set()
     runner.wait_idle()
     calib_mod._CALIBRATION_STATE.update(revision=None, route=None, running=False)
+    db.clear_setting('review_provider')
 
 
 def _save_settings(client, payload):

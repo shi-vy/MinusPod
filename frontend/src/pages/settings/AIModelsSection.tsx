@@ -1,15 +1,13 @@
 import { useState } from 'react';
-import type { ReactNode } from 'react';
 import type { ClaudeModel, ModelPricingOverride, ModelPricingOverrides } from '../../api/types';
-import { SAME_AS_DETECTION, SLOT_PRIMARY, SLOT_SECONDARY } from '../../api/types';
 import type { ModelCatalog } from '../../hooks/useModelCatalog';
 import CatalogStatus from '../../components/CatalogStatus';
 import CollapsibleSection from '../../components/CollapsibleSection';
 import RefreshModelsButton from './RefreshModelsButton';
 import type { ModelsRefresh } from '../../hooks/useModelsRefresh';
-import { formatModelLabel } from './settingsUtils';
+import ModelSelect from './ModelSelect';
+import StageProviderSelect, { detectionSlotOptions, inheritedSlotOptions } from './StageProviderSelect';
 import { btnSecondary } from '../../components/buttonStyles';
-import { selectBase } from '../../components/fieldStyles';
 import { focusRing } from '../../components/fieldStyles';
 
 interface AIModelsSectionProps {
@@ -71,21 +69,6 @@ function AIModelsSection({
   onPricingOverrideUpdate,
   pricingOverrideSavingModel = null,
 }: AIModelsSectionProps) {
-  // A saved model id the catalog does not list (wrong provider for the stored
-  // tag, renamed model) or no catalog at all (loading, failed probe) would
-  // render the <select> blank, which users read as "the setting was reset".
-  const renderOrphan = (value: string, catalog: ClaudeModel[] | undefined) => {
-    if (!value) return null;
-    if (!catalog) return <option value={value}>{value}</option>;
-    if (catalog.some((m) => m.id === value)) return null;
-    return <option value={value}>{value} (current, not in catalog)</option>;
-  };
-
-  // The catalog only lists what the provider advertises. Proxies, private
-  // deployments, and brand-new model ids need a way in, so each field can
-  // switch to free text. An orphaned value still renders as a list option
-  // above, so the switch stays the user's call rather than an inference.
-  const [typedFields, setTypedFields] = useState<Record<string, boolean>>({});
   // Merge every fetched catalog for pricing lookups: verification/chapters
   // can now be on a different provider than detection, each with its own
   // catalog entry (and price) for the same model id.
@@ -103,128 +86,9 @@ function AIModelsSection({
   ].filter(Boolean)));
 
   // Detection picks primary or secondary directly; verification/chapters
-  // also inherit detection's resolved slot via "Same as detection". Secondary
-  // is listed only while the secondary provider is configured and enabled.
-  const detectionSlotOptions = [
-    { value: SLOT_PRIMARY, label: 'Default (Primary)' },
-    ...(secondaryProviderEnabled ? [{ value: SLOT_SECONDARY, label: 'Secondary' }] : []),
-  ];
-  const inheritedSlotOptions = [
-    { value: SAME_AS_DETECTION, label: 'Same as detection' },
-    { value: SLOT_PRIMARY, label: 'Default (Primary)' },
-    ...(secondaryProviderEnabled ? [{ value: SLOT_SECONDARY, label: 'Secondary' }] : []),
-  ];
-
-  const renderProviderSelect = ({
-    id,
-    label,
-    value,
-    options,
-    onChange,
-  }: {
-    id: string;
-    label: string;
-    value: string;
-    options: Array<{ value: string; label: string }>;
-    onChange: (provider: string) => void;
-  }) => {
-    // A stage saved on the secondary slot before the secondary provider was
-    // turned off keeps that stored value; hiding it would read as Primary
-    // while state and the DB still say secondary.
-    const strandedOnSecondary = value === SLOT_SECONDARY && !secondaryProviderEnabled;
-    const shownOptions = strandedOnSecondary
-      ? [...options, { value: SLOT_SECONDARY, label: 'Secondary (provider off)' }]
-      : options;
-    return (
-      <div>
-        <label htmlFor={id} className="block text-sm font-medium text-foreground mb-2">
-          {label}
-        </label>
-        <select
-          id={id}
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          className={`w-full ${selectBase}`}
-        >
-          {shownOptions.map((o) => (
-            <option key={o.value} value={o.value}>{o.label}</option>
-          ))}
-        </select>
-        {strandedOnSecondary && (
-          <p className="mt-1 text-sm text-warning">
-            Secondary provider is off, so this stage runs on the primary.
-          </p>
-        )}
-      </div>
-    );
-  };
-
-  const renderModelSelect = ({
-    id,
-    label,
-    value,
-    catalog,
-    onChange,
-    description,
-  }: {
-    id: string;
-    label: string;
-    value: string;
-    catalog: ModelCatalog;
-    onChange: (model: string) => void;
-    description: ReactNode;
-  }) => {
-    const notConfigured = !value;
-    const typed = typedFields[id] ?? false;
-    return (
-      <div>
-        <div className="flex items-baseline justify-between gap-3 mb-2">
-          <label htmlFor={id} className="block text-sm font-medium text-foreground">
-            {label}
-          </label>
-          <button
-            type="button"
-            onClick={() => setTypedFields((prev) => ({ ...prev, [id]: !typed }))}
-            className={`text-xs text-primary hover:underline transition-colors rounded ${focusRing}`}
-          >
-            {typed ? 'Choose from list' : 'Type a model ID'}
-          </button>
-        </div>
-        {typed ? (
-          <input
-            type="text"
-            id={id}
-            value={value}
-            onChange={(e) => onChange(e.target.value)}
-            placeholder="Provider's exact model ID"
-            spellCheck={false}
-            autoComplete="off"
-            className={`w-full min-h-[44px] px-3 py-2 rounded-lg border border-input bg-background text-foreground text-sm ${focusRing}`}
-          />
-        ) : (
-        <select
-          id={id}
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          className={`w-full ${selectBase}`}
-        >
-          {notConfigured && <option value="">Not configured</option>}
-          {renderOrphan(value, catalog.models)}
-          {catalog.models?.map((model) => (
-            <option key={model.id} value={model.id}>
-              {formatModelLabel(model)}
-            </option>
-          ))}
-        </select>
-        )}
-        {notConfigured && (
-          <p className="mt-1 text-sm text-muted-foreground">Pick a model before processing episodes.</p>
-        )}
-        <CatalogStatus loading={catalog.isLoading} error={catalog.isError} />
-        <p className="mt-1 text-sm text-muted-foreground">{description}</p>
-      </div>
-    );
-  };
+  // also inherit detection's resolved slot via "Same as detection".
+  const detectionOptions = detectionSlotOptions(secondaryProviderEnabled);
+  const inheritedOptions = inheritedSlotOptions(secondaryProviderEnabled);
 
   return (
     <CollapsibleSection
@@ -246,58 +110,60 @@ function AIModelsSection({
         <CatalogStatus refreshError={modelsRefresh.error} />
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-          {renderProviderSelect({
-            id: 'detectionProvider',
-            label: 'Ad Detection Provider',
-            value: detectionProvider,
-            options: detectionSlotOptions,
-            onChange: onDetectionProviderChange,
-          })}
-          {renderModelSelect({
-            id: 'model',
-            label: 'Ad Detection Model',
-            value: selectedModel,
-            catalog: detectionCatalog,
-            onChange: onSelectedModelChange,
-            description:
-              'Primary model for analyzing transcripts and detecting ads. Set the model here; the OPENAI_MODEL env var only seeds this value while it is unset.',
-          })}
+          <StageProviderSelect
+            id="detectionProvider"
+            label="Ad Detection Provider"
+            value={detectionProvider}
+            options={detectionOptions}
+            onChange={onDetectionProviderChange}
+            secondaryEnabled={secondaryProviderEnabled}
+          />
+          <ModelSelect
+            id="model"
+            label="Ad Detection Model"
+            value={selectedModel}
+            catalog={detectionCatalog}
+            onChange={onSelectedModelChange}
+            description="Primary model for analyzing transcripts and detecting ads. Set the model here; the OPENAI_MODEL env var only seeds this value while it is unset."
+          />
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-          {renderProviderSelect({
-            id: 'verificationProvider',
-            label: 'Verification Provider',
-            value: verificationProvider,
-            options: inheritedSlotOptions,
-            onChange: onVerificationProviderChange,
-          })}
-          {renderModelSelect({
-            id: 'verificationModel',
-            label: 'Verification Model',
-            value: verificationModel,
-            catalog: verificationCatalog,
-            onChange: onVerificationModelChange,
-            description: 'Re-runs detection on processed audio to catch missed ads (can differ for cost optimization)',
-          })}
+          <StageProviderSelect
+            id="verificationProvider"
+            label="Verification Provider"
+            value={verificationProvider}
+            options={inheritedOptions}
+            onChange={onVerificationProviderChange}
+            secondaryEnabled={secondaryProviderEnabled}
+          />
+          <ModelSelect
+            id="verificationModel"
+            label="Verification Model"
+            value={verificationModel}
+            catalog={verificationCatalog}
+            onChange={onVerificationModelChange}
+            description="Re-runs detection on processed audio to catch missed ads (can differ for cost optimization)"
+          />
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-          {renderProviderSelect({
-            id: 'chaptersProvider',
-            label: 'Chapters Provider',
-            value: chaptersProvider,
-            options: inheritedSlotOptions,
-            onChange: onChaptersProviderChange,
-          })}
-          {renderModelSelect({
-            id: 'chaptersModel',
-            label: 'Chapters Model',
-            value: chaptersModel,
-            catalog: chaptersCatalog,
-            onChange: onChaptersModelChange,
-            description: 'Chapter title generation and topic detection (smaller/cheaper models work well)',
-          })}
+          <StageProviderSelect
+            id="chaptersProvider"
+            label="Chapters Provider"
+            value={chaptersProvider}
+            options={inheritedOptions}
+            onChange={onChaptersProviderChange}
+            secondaryEnabled={secondaryProviderEnabled}
+          />
+          <ModelSelect
+            id="chaptersModel"
+            label="Chapters Model"
+            value={chaptersModel}
+            catalog={chaptersCatalog}
+            onChange={onChaptersModelChange}
+            description="Chapter title generation and topic detection (smaller/cheaper models work well)"
+          />
         </div>
 
         {onPricingOverrideUpdate && configuredModelIds.length > 0 && (

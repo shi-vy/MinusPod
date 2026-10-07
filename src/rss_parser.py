@@ -25,7 +25,8 @@ from defusedxml.ElementTree import fromstring as defused_fromstring
 from utils.circuit_breaker import CircuitBreaker, CircuitBreakerOpen
 from utils.episode_paths import episode_public_url
 from utils.feed_guid import compute_feed_guid
-from utils.time import parse_iso_datetime, parse_timestamp
+from utils.text import is_timezone_drift, normalize_title_for_match
+from utils.time import parse_iso_datetime, parse_iso_utc, parse_timestamp
 from utils.url import SSRFError
 from user_agent import feed_user_agent
 from utils.http import safe_url_for_log
@@ -265,6 +266,32 @@ def _podcast_localname(elem) -> str:
         return tag
     end = tag.find("}")
     return tag[end + 1:] if end != -1 else tag
+
+
+# Preference order for picking one podcast:transcript tag among several
+# (2.98.0 transcript differential). Compared case-insensitively.
+_TRANSCRIPT_TYPE_PRIORITY = (
+    'text/vtt', 'application/srt', 'application/x-subrip',
+    'application/json', 'text/plain', 'text/html',
+)
+
+
+def _best_upstream_transcript_tag(tags):
+    """Pick the (url, lowercased type) with the best type rank; http(s) only."""
+    best = None
+    best_rank = len(_TRANSCRIPT_TYPE_PRIORITY)
+    for url, raw_type in tags:
+        if not url or urlparse(url).scheme not in ('http', 'https'):
+            continue
+        norm_type = (raw_type or '').strip().lower()
+        try:
+            rank = _TRANSCRIPT_TYPE_PRIORITY.index(norm_type)
+        except ValueError:
+            rank = len(_TRANSCRIPT_TYPE_PRIORITY)
+        if best is None or rank < best_rank:
+            best = (url, norm_type or None)
+            best_rank = rank
+    return best
 
 
 _ENCLOSURE_PREFIX_RE = re.compile(r'<enclosure url="([^"]+)/episodes/')
@@ -694,6 +721,63 @@ class RSSParser:
         return unknown
 
     @staticmethod
+    def _parse_upstream_transcript_tags(channel):
+        """Preserve all transcript tags, indexed by item position and unambiguous GUID/URL.
+
+        Returns (positional, by_key); positional holds (transcripts, guid, enclosure_url) tuples."""
+        positional: list = []
+        by_key: dict = {}
+        ambiguous_keys: set = set()
+        if channel is None:
+            return positional, by_key
+
+        for item in channel:
+            tag = getattr(item, 'tag', '')
+            if not (isinstance(tag, str) and (tag == 'item' or tag.endswith('}item'))):
+                continue
+            transcripts = []
+            guid_text = None
+            enclosure_url = None
+            for elem in item:
+                elem_tag = getattr(elem, 'tag', '')
+                if elem_tag == 'guid':
+                    guid_text = (elem.text or '').strip()
+                elif elem_tag == 'enclosure':
+                    enclosure_url = elem.get('url')
+                elif _is_podcast_element(elem) and _podcast_localname(elem) == 'transcript':
+                    url = elem.get('url')
+                    if url:
+                        transcripts.append((url, elem.get('type') or ''))
+            positional.append((transcripts, guid_text, enclosure_url))
+            for key in (guid_text, enclosure_url):
+                if not key:
+                    continue
+                if key in ambiguous_keys:
+                    continue
+                if key in by_key:
+                    ambiguous_keys.add(key)
+                    del by_key[key]
+                else:
+                    by_key[key] = transcripts
+        return positional, by_key
+
+    @staticmethod
+    def _positional_alignment_holds(positional, entries) -> bool:
+        """Check raw-item GUIDs and enclosure URLs against feedparser order, not just item count."""
+        for (_, guid_text, enclosure_url), entry in zip(positional, entries, strict=True):
+            entry_guid = entry.get('id') or ''
+            entry_enclosure = ''
+            for enclosure in entry.get('enclosures', []):
+                if 'audio' in enclosure.get('type', ''):
+                    entry_enclosure = enclosure.get('href', '')
+                    break
+            if guid_text and entry_guid and guid_text != entry_guid:
+                return False
+            if enclosure_url and entry_enclosure and enclosure_url != entry_enclosure:
+                return False
+        return True
+
+    @staticmethod
     def find_channel_element(feed_content):
         """The <channel> element from raw feed bytes/str, or None.
 
@@ -1085,11 +1169,29 @@ class RSSParser:
 
         # Process each episode from RSS
         included_episode_ids = set()
-        processed_durations = {
-            ep.get('episode_id'): ep.get('new_duration')
+        processed_meta = {
+            ep.get('episode_id'): ep
             for ep in (extra_episodes or [])
             if ep.get('episode_id')
         }
+        # Catch a leftover discovery-layer duplicate by title and date, but
+        # not an extra_episode already matched to an upstream entry by id.
+        upstream_episode_ids = set()
+        for entry in entries:
+            for enclosure in entry.get('enclosures', []):
+                if 'audio' in enclosure.get('type', ''):
+                    upstream_episode_ids.add(
+                        self.generate_episode_id(enclosure.get('href', ''), entry.get('id')))
+                    break
+        db_title_dates: dict[str, list] = {}
+        for ep in (extra_episodes or []):
+            if ep.get('episode_id') in upstream_episode_ids:
+                continue
+            pub_dt = parse_iso_utc(ep.get('published_at'))
+            title_key = normalize_title_for_match(ep.get('title'))
+            if pub_dt and title_key:
+                db_title_dates.setdefault(title_key, []).append(pub_dt)
+        suppressed_upstream_duplicates = 0
         for entry in entries:
             episode_url = None
             # Find audio URL in enclosures
@@ -1107,6 +1209,9 @@ class RSSParser:
             if processed_only and episode_id not in (processed_episode_ids or set()):
                 continue
             if title_matches_skip_patterns(entry.get('title', ''), hide_title_patterns):
+                continue
+            if db_title_dates and self._matches_db_duplicate(entry, db_title_dates):
+                suppressed_upstream_duplicates += 1
                 continue
             included_episode_ids.add(episode_id)
             modified_url = episode_public_url(self._resolved_base_url(), slug,
@@ -1126,11 +1231,20 @@ class RSSParser:
                 lines.append(f'  <guid>{self._escape_xml(entry.get("id", episode_url))}</guid>')
             lines.append(f'  <pubDate>{self._escape_xml(entry.get("published", ""))}</pubDate>')
 
-            # Modified enclosure URL
-            lines.append(f'  <enclosure url="{modified_url}" type="audio/mpeg" />')
+            # Modified enclosure URL. A processed episode's length is the cut
+            # file's stored byte count; an unprocessed one passes through
+            # whatever usable length upstream declared, never a guess.
+            processed_ep = processed_meta.get(episode_id)
+            processed_size = (processed_ep or {}).get('processed_size_bytes')
+            if processed_size:
+                length_attr = f' length="{int(processed_size)}"'
+            else:
+                upstream_length = self._upstream_enclosure_length(enclosure)
+                length_attr = f' length="{upstream_length}"' if upstream_length else ''
+            lines.append(f'  <enclosure url="{modified_url}" type="audio/mpeg"{length_attr} />')
 
             # Processed enclosures need the duration of the served file.
-            processed_duration = processed_durations.get(episode_id)
+            processed_duration = (processed_ep or {}).get('new_duration')
             try:
                 processed_duration = float(processed_duration)
             except (TypeError, ValueError):
@@ -1190,7 +1304,28 @@ class RSSParser:
         total_episodes = len(included_episode_ids) + appended_count
         modified_rss = '\n'.join(lines)
         logger.info(f"[{slug}] Modified RSS feed with {total_episodes} episodes ({appended_count} appended from DB)")
+        if suppressed_upstream_duplicates:
+            logger.warning(
+                f"[{slug}] Suppressed {suppressed_upstream_duplicates} upstream "
+                "item(s) duplicating an already-included processed episode by "
+                "title and date"
+            )
         return modified_rss
+
+    @staticmethod
+    def _matches_db_duplicate(entry, db_title_dates) -> bool:
+        """True when `entry` shares a normalized title and a timezone-drift
+        published date with a DB-appended episode."""
+        candidates = db_title_dates.get(normalize_title_for_match(entry.get('title', '')))
+        if not candidates:
+            return False
+        try:
+            entry_dt = parsedate_to_datetime(entry.get('published', ''))
+        except (ValueError, TypeError):
+            return False
+        if entry_dt.tzinfo is None:
+            entry_dt = entry_dt.replace(tzinfo=timezone.utc)
+        return any(is_timezone_drift(entry_dt, db_dt) for db_dt in candidates)
 
     def _append_podcasting2_tags(self, lines: list, slug: str, episode_id: str,
                                  storage, feed_auth_key=None,
@@ -1213,6 +1348,33 @@ class RSSParser:
             chapters_url = f"{base_url}/episodes/{slug}/{episode_id}/chapters.json{key_suffix}"
             lines.append(f'  <podcast:chapters url="{chapters_url}" type="application/json+chapters" />')
 
+    @staticmethod
+    def _upstream_enclosure_length(enclosure: dict) -> int | None:
+        """Upstream's declared enclosure length, when it is a usable
+        positive byte count. None for missing, zero, or non-numeric values:
+        the RSS spec requires a real size, never a guess."""
+        try:
+            value = int(enclosure.get('length'))
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    def backfill_processed_size(self, db, storage, slug: str, ep: dict) -> int | None:
+        """Stat and persist a pre-migration row's size once; mutates ``ep``
+        in place. Returns None, without touching the DB, if the file is missing."""
+        size = ep.get('processed_size_bytes')
+        if size:
+            return int(size)
+        try:
+            path = storage.get_episode_path(slug, ep['episode_id'],
+                                            version=ep.get('processed_version'))
+            size = path.stat().st_size
+        except OSError:
+            return None
+        ep['processed_size_bytes'] = size
+        db.upsert_episode(slug, ep['episode_id'], processed_size_bytes=size)
+        return size
+
     def _append_db_episode_item(self, lines: list, slug: str, ep: dict, storage,
                                 feed_auth_key=None, chapter_notes=None) -> None:
         """Append a single <item> for a processed episode from the database."""
@@ -1225,7 +1387,9 @@ class RSSParser:
         lines.append(f'  <title>{self._escape_xml(ep.get("title") or "Unknown")}</title>')
         if description:
             lines.append(f'  <description><![CDATA[{self._escape_cdata(description)}]]></description>')
-        lines.append(f'  <enclosure url="{modified_url}" type="audio/mpeg" />')
+        size = ep.get('processed_size_bytes')
+        length_attr = f' length="{int(size)}"' if size else ''
+        lines.append(f'  <enclosure url="{modified_url}" type="audio/mpeg"{length_attr} />')
         lines.append(f'  <guid isPermaLink="false">{ep_id}</guid>')
         if ep.get('published_at'):
             lines.append(f'  <pubDate>{self._format_rfc2822(ep["published_at"])}</pubDate>')
@@ -1628,7 +1792,7 @@ class RSSParser:
         return seconds if seconds > 0 else None
 
     def extract_episodes(self, feed_content: str, parsed_feed=None,
-                         source: str = None) -> list[dict]:
+                         source: str = None, channel=None) -> list[dict]:
         """Extract episode information from feed.
 
         Args:
@@ -1638,14 +1802,26 @@ class RSSParser:
                 does not pay the parse cost three times.
             source: Feed identifier named in a parse warning from the fallback
                 re-parse below.
+            channel: Optional pre-parsed <channel> element from find_channel_element.
         """
         feed = (parsed_feed if parsed_feed is not None
                 else self.parse_feed(feed_content, source=source))
         if not feed:
             return []
 
+        if channel is None:
+            channel = self.find_channel_element(feed_content)
+        transcript_positional, transcript_tags_by_key = \
+            self._parse_upstream_transcript_tags(channel)
+        # Position is the primary match (immune to duplicate guids); the keyed
+        # fallback applies when the raw item count disagrees with feedparser's,
+        # or a count match turns out coincidental (guid/enclosure disagree).
+        transcripts_by_position = (
+            len(transcript_positional) == len(feed.entries)
+            and self._positional_alignment_holds(transcript_positional, feed.entries))
+
         episodes = []
-        for entry in feed.entries:
+        for entry_index, entry in enumerate(feed.entries):
             episode_url = None
             for enclosure in entry.get('enclosures', []):
                 if 'audio' in enclosure.get('type', ''):
@@ -1686,6 +1862,20 @@ class RSSParser:
                     if candidate and urlparse(candidate).scheme in ('http', 'https'):
                         upstream_chapters_url = candidate
 
+                # Upstream podcast:transcript (2.98.0 transcript differential):
+                # best type among this entry's raw-XML tags.
+                upstream_transcript_url = None
+                upstream_transcript_type = None
+                if transcripts_by_position:
+                    transcript_tags = transcript_positional[entry_index][0]
+                else:
+                    transcript_tags = (transcript_tags_by_key.get(entry.get('id', ''))
+                                        or transcript_tags_by_key.get(episode_url))
+                if transcript_tags:
+                    best = _best_upstream_transcript_tag(transcript_tags)
+                    if best:
+                        upstream_transcript_url, upstream_transcript_type = best
+
                 # Map per-episode iTunes categories to vocabulary tags.
                 ep_tags: list[str] = []
                 try:
@@ -1710,6 +1900,8 @@ class RSSParser:
                     'episode_number': episode_number,
                     'rss_duration': rss_duration,
                     'upstream_chapters_url': upstream_chapters_url,
+                    'upstream_transcript_url': upstream_transcript_url,
+                    'upstream_transcript_type': upstream_transcript_type,
                     'tags': ep_tags,
                 })
 

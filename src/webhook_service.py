@@ -12,9 +12,9 @@ from dataclasses import dataclass
 from jinja2 import TemplateError
 from jinja2.sandbox import SandboxedEnvironment
 
-from config import HTTP_MAX_REDIRECTS_API, HTTP_TIMEOUT_PROBE
-from database import Database
-from database.settings import registry_current_value, registry_default
+from config import FAILOVER_API_TARGET_NAMES, HTTP_MAX_REDIRECTS_API, HTTP_TIMEOUT_PROBE
+import database
+import database.settings as db_settings
 from utils.http import safe_url_for_log
 from utils.safe_http import URLTrust, safe_post
 from utils.time import format_duration, utc_now_iso, local_now_iso, local_iso
@@ -35,6 +35,8 @@ EVENT_QUEUE_HELD = 'Queue Held'
 EVENT_QUEUE_RESUMED = 'Queue Resumed'
 EVENT_SERVICE_OFFLINE = 'Service Offline'
 EVENT_SERVICE_REACHABLE = 'Service Reachable'
+EVENT_FAILOVER_TRIGGERED = 'Failover Triggered'
+EVENT_FAILOVER_CANCELLED = 'Failover Cancelled'
 VALID_EVENTS = {
     EVENT_EPISODE_PROCESSED,
     EVENT_EPISODE_FAILED,
@@ -48,7 +50,12 @@ VALID_EVENTS = {
     EVENT_QUEUE_RESUMED,
     EVENT_SERVICE_OFFLINE,
     EVENT_SERVICE_REACHABLE,
+    EVENT_FAILOVER_TRIGGERED,
+    EVENT_FAILOVER_CANCELLED,
 }
+
+# Maps the API-facing failover target names to webhook/email payload values,
+# kept local to avoid importing failover (which imports this module).
 
 _sandbox_env = SandboxedEnvironment()
 
@@ -58,11 +65,11 @@ def get_notification_timezone(db=None) -> str:
     or UTC. Never raises: a DB/settings failure must not cost a notification."""
     try:
         if db is None:
-            db = Database()
-        return registry_current_value(db, 'notification_timezone')
+            db = database.Database()
+        return db_settings.registry_current_value(db, 'notification_timezone')
     except Exception:
         logger.debug("Could not read notification_timezone setting", exc_info=True)
-        return registry_default('notification_timezone')
+        return db_settings.registry_default('notification_timezone')
 
 
 def _timestamp_fields() -> dict:
@@ -181,6 +188,16 @@ _ALERT_SAMPLE_CONTEXTS = {
     EVENT_SERVICE_REACHABLE: {
         'service': 'llm',
         'requeued': 3,
+    },
+    EVENT_FAILOVER_TRIGGERED: {
+        'target': 'llm-a',
+        'source': 'auto',
+        'reason': 'HTTP 503',
+    },
+    EVENT_FAILOVER_CANCELLED: {
+        'target': 'llm-a',
+        'source': 'manual',
+        'reason': '',
     },
 }
 
@@ -336,8 +353,7 @@ def _prepare_and_dispatch(webhook_config, context, add_test_flag=False,
 def load_webhooks(db=None):
     """Load webhooks list from DB settings."""
     if db is None:
-        from database import Database  # deferred to avoid circular imports
-        db = Database()
+        db = database.Database()
     raw = db.get_setting('webhooks')
     if not raw:
         return []
@@ -410,7 +426,7 @@ _ALERT_DEDUP_SECS = 300  # 5 minutes
 _ALERT_BURST_SECS = 60   # Cross-key cap when dedup_key is used
 
 
-def _fire_alert_event(event, context, log_detail, dedup_key=None):
+def _fire_alert_event(event, context, log_detail, dedup_key=None, dedup=True):
     """Dispatch an operator alert to webhooks and email with a 5-minute
     dedup, keyed per event (or per `dedup_key` when alerts for the same
     event must not suppress each other, e.g. per-feed failures). Keyed
@@ -421,14 +437,15 @@ def _fire_alert_event(event, context, log_detail, dedup_key=None):
 
     Returns True when the alert was dispatched, False when suppressed --
     callers that alert on a one-shot state transition use this to retry
-    later instead of losing the alert."""
+    later instead of losing the alert. ``dedup=False`` sends every call, for
+    events that are already one per state transition."""
     key = dedup_key or event
     now = time.time()
     with _alert_lock:
-        if now - _last_alert_time.get(key, 0.0) < _ALERT_DEDUP_SECS:
+        if dedup and now - _last_alert_time.get(key, 0.0) < _ALERT_DEDUP_SECS:
             logger.debug("%s alert suppressed (dedup window)", event)
             return False
-        if dedup_key is not None and \
+        if dedup and dedup_key is not None and \
                 now - _last_alert_time.get(event, 0.0) < _ALERT_BURST_SECS:
             logger.debug("%s alert suppressed (burst cap)", event)
             return False
@@ -560,6 +577,17 @@ def fire_service_reachable_event(service, requeued):
         dedup_key=f"{EVENT_SERVICE_REACHABLE}:{service}")
 
 
+def fire_failover_event(action: str, target: str, source: str, reason: str | None) -> bool:
+    """Notify operators that a target switched to or from its failover config."""
+    event = EVENT_FAILOVER_TRIGGERED if action == 'trigger' else EVENT_FAILOVER_CANCELLED
+    api_name = next((k for k, v in FAILOVER_API_TARGET_NAMES.items() if v == target), target)
+    return _fire_alert_event(event, {
+        'target': api_name,
+        'source': source,
+        'reason': reason or '',
+    }, f"target={api_name}, source={source}", dedup_key=f"{event}:{target}", dedup=False)
+
+
 def fire_update_available_event(version, channel, release_date, url):
     """Fire an update-available webhook.
 
@@ -614,8 +642,7 @@ def _episode_test_context(event):
     """
     if event == EVENT_EPISODE_PROCESSED:
         try:
-            from database import Database  # deferred to avoid circular imports
-            db = Database()
+            db = database.Database()
             row = db.get_latest_completed_processing()
             if row:
                 payload = WebhookPayload(

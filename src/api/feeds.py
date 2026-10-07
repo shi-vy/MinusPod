@@ -25,22 +25,22 @@ from database.queue import compute_queue_priority
 from processing_queue import ProcessingQueue
 from config import (
     CHAPTERS_IN_NOTES_VALUES,
-    AD_CHAPTERS_OVERRIDE_VALUES,
     FEED_REFRESH_FAILURE_ALERT_THRESHOLD,
     PODPING_HOST_ACTIVE_DAYS,
     VALID_CHAPTERS_MODES,
     SEGMENT_CATEGORIES, SEGMENT_ACTIONS,
     differential_fetch_effective,
+    apply_ad_chapter_compat, ad_chapter_compat_view,
     resolve_differential_fetch_mode,
     resolve_feed_processing_mode,
     resolve_max_ad_duration_confirmed,
+    resolve_segment_category_actions_map,
     PROCESSING_MODE_STANDARD,
     PROCESSING_MODE_CUE_ONLY,
     PROCESSING_MODE_COLUMN_UPDATES,
     CUE_ONLY_SAFETY_VALUES,
     LOW_AD_YIELD_ACTIONS,
     EPISODE_LOGS_VALUES,
-    validate_ad_chapter_categories,
     cue_only_missing_roles,
 )
 from differential_fetcher import is_likely_dai_feed
@@ -433,6 +433,26 @@ def _deserialize_json_map(raw):
     return parsed if isinstance(parsed, dict) else None
 
 
+def _translate_ad_chapter_compat_for_feed(db, pending_override_raw, data):
+    """Translate adChaptersEnabled/adChapterCategories into the feed's
+    segment_category_actions override (spec 1.4). (json_or_None, error);
+    null for either field is a no-op, matching the old per-feed contract."""
+    if 'adChaptersEnabled' not in data and 'adChapterCategories' not in data:
+        return None, None
+
+    global_resolved = resolve_segment_category_actions_map(
+        db.get_setting('segment_category_actions'))
+    resolved = resolve_segment_category_actions_map(
+        pending_override_raw, baseline=global_resolved)
+    override = dict(_deserialize_json_map(pending_override_raw) or {})
+
+    changes, error = apply_ad_chapter_compat(resolved, data, allow_null=True)
+    if error:
+        return None, error
+    override.update(changes)
+    return json.dumps(override), None
+
+
 def _deserialize_title_skip_patterns(raw):
     """Parse the stored title_skip_patterns JSON back for API responses.
 
@@ -523,6 +543,7 @@ _NULLABLE_BOOL_FIELDS = [
     ('ownEpisodeGuids', 'own_episode_guids'),
     ('skipSecondPass', 'skip_second_pass'),
     ('skipTranscription', 'skip_transcription'),
+    ('transcriptDifferential', 'transcript_differential'),
 ]
 
 def _cue_override_fields(podcast) -> dict:
@@ -848,8 +869,10 @@ def _public_feed_url(slug, key):
                              slug, key)
 
 
-def _podcast_base_json(podcast, feed_url) -> dict:
-    """Fields shared by the feed list, detail, and PATCH responses."""
+def _podcast_base_json(podcast, feed_url, db, global_actions=None) -> dict:
+    """Build shared feed response fields, optionally reusing global actions."""
+    resolved_actions = db.resolve_segment_actions(podcast['slug'], podcast, global_actions=global_actions)
+    ad_chapters_enabled, ad_chapter_categories = ad_chapter_compat_view(resolved_actions)
     return {
         'slug': podcast['slug'],
         'feedType': podcast.get('feed_type', 'subscribed'),
@@ -874,9 +897,11 @@ def _podcast_base_json(podcast, feed_url) -> dict:
             if podcast.get('differential_fetch_mode') in ('auto', 'on', 'off')
             else 'inherit'),
         'chaptersInNotes': podcast.get('chapters_in_notes'),
-        'adChaptersEnabled': podcast.get('ad_chapters_enabled_override'),
-        'adChapterCategories': _deserialize_json_map(
-            podcast.get('ad_chapter_categories_override')),
+        # Compatibility fields (spec 1.4): derived from the feed's resolved
+        # segment actions, not the retired ad_chapters_enabled_override /
+        # ad_chapter_categories_override columns.
+        'adChaptersEnabled': ad_chapters_enabled,
+        'adChapterCategories': ad_chapter_categories,
         'queuePriority': _serialize_queue_priority(podcast.get('queue_priority')),
         'lowAdYieldAction': podcast.get('low_ad_yield_action'),
         'episodeLogs': podcast.get('episode_logs'),
@@ -980,11 +1005,12 @@ def get_feeds_export_list(db) -> list[dict]:
     """All feeds with override fields, unpaginated, for GET /system/config-export."""
     feed_auth_key = get_feed_auth_key(db)
     podping = _podping_context(db)
+    global_actions = resolve_segment_category_actions_map(db.get_setting('segment_category_actions'))
     feeds = []
     for podcast in db.get_all_podcasts():
         feed_url = _public_feed_url(podcast['slug'], feed_auth_key)
         entry = {
-            **_podcast_base_json(podcast, feed_url),
+            **_podcast_base_json(podcast, feed_url, db, global_actions=global_actions),
             **_podcast_listing_fields(podcast, podping),
             'lastEpisodeDate': podcast.get('last_episode_date'),
             # Upstream RSS URL the instance polls, explicit for bug reports
@@ -1103,6 +1129,7 @@ def list_feeds():
 
     feed_auth_key = get_feed_auth_key(db)
     podping = _podping_context(db)
+    global_actions = resolve_segment_category_actions_map(db.get_setting('segment_category_actions'))
 
     include_latest = request.args.get('includeLatestEpisodes', '').lower() == 'true'
     episodes_per_feed = min(
@@ -1123,7 +1150,7 @@ def list_feeds():
         feed_url = _public_feed_url(podcast['slug'], feed_auth_key)
 
         feed_json = {
-            **_podcast_base_json(podcast, feed_url),
+            **_podcast_base_json(podcast, feed_url, db, global_actions=global_actions),
             **_podcast_listing_fields(podcast, podping),
             'lastEpisodeDate': podcast.get('last_episode_date'),
         }
@@ -1587,24 +1614,29 @@ def import_opml():
     }, 201 if imported else 200)
 
 
-@api.route('/feeds/export-opml', methods=['GET'])
+@api.route('/feeds/export-opml', methods=['GET', 'POST'])
 @log_request
 def export_opml():
-    """Export podcast feeds as an OPML 2.0 download (admin UI).
-
-    Optional ``slugs`` (comma-separated) limits the export to those feeds, in
-    the usual feed order. Slugs that no longer exist are skipped, since a feed
-    can be deleted while the picker is open; 400 if none match.
-    """
+    """Export podcast feeds as an OPML 2.0 download (admin UI)."""
     mode = request.args.get('mode', 'original')
     if mode not in ('original', 'modified'):
         return error_response('mode must be "original" or "modified"', 400)
 
+    if request.method == 'POST':
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return error_response('request body must be a JSON object', 400)
+        slugs_param = payload.get('slugs')
+        if not isinstance(slugs_param, list) or any(not isinstance(slug, str) for slug in slugs_param):
+            return error_response('slugs must be an array of strings', 400)
+        wanted = {slug.strip() for slug in slugs_param if slug.strip()}
+    else:
+        slugs_param = request.args.get('slugs')
+        wanted = {slug.strip() for slug in slugs_param.split(',') if slug.strip()} if slugs_param is not None else None
+
     db = get_database()
     podcasts = db.get_all_podcasts()
-    slugs_param = request.args.get('slugs')
-    if slugs_param is not None:
-        wanted = {s.strip() for s in slugs_param.split(',') if s.strip()}
+    if wanted is not None:
         podcasts = [p for p in podcasts if p['slug'] in wanted]
         if not podcasts:
             return error_response('slugs matched no feeds', 400)
@@ -1702,7 +1734,7 @@ def get_feed(slug):
         [e.get('original_url') for e in recent_episodes])
 
     return json_response({
-        **_podcast_base_json(podcast, feed_url),
+        **_podcast_base_json(podcast, feed_url, db),
         **_podcast_listing_fields(podcast, _podping_context_for_feed(db)),
         'description': podcast.get('description'),
         'daiLikely': dai_likely,
@@ -1885,23 +1917,6 @@ def update_feed(slug):
             return error_response(notes_err, 400)
         updates['chapters_in_notes'] = notes_val
 
-    if 'adChaptersEnabled' in data:
-        ac_val, ac_err = _normalize_override(
-            data['adChaptersEnabled'], AD_CHAPTERS_OVERRIDE_VALUES, 'adChaptersEnabled')
-        if ac_err:
-            return error_response(ac_err, 400)
-        updates['ad_chapters_enabled_override'] = ac_val
-
-    if 'adChapterCategories' in data:
-        cats = data['adChapterCategories']
-        if cats is None:
-            updates['ad_chapter_categories_override'] = None
-        else:
-            error = validate_ad_chapter_categories(cats)
-            if error:
-                return error_response(error, 400)
-            updates['ad_chapter_categories_override'] = json.dumps(cats)
-
     if 'queuePriority' in data:
         qp_val, qp_err = _normalize_queue_priority(data['queuePriority'])
         if qp_err:
@@ -1938,6 +1953,18 @@ def update_feed(slug):
         if actions_err:
             return error_response(actions_err, 400)
         updates['segment_category_actions'] = actions_val
+
+    # Compatibility fields (spec 1.4): translate against whatever override
+    # this request is about to store (the segmentCategoryActions write
+    # above if present, else the feed's current override).
+    pending_override_raw = updates.get(
+        'segment_category_actions', podcast.get('segment_category_actions'))
+    ad_chapter_override, ad_chapter_err = _translate_ad_chapter_compat_for_feed(
+        db, pending_override_raw, data)
+    if ad_chapter_err:
+        return error_response(ad_chapter_err, 400)
+    if ad_chapter_override is not None:
+        updates['segment_category_actions'] = ad_chapter_override
 
     for json_key, db_col, lo, hi in _CUE_FLOAT_OVERRIDE_FIELDS:
         if json_key in data:
@@ -2036,7 +2063,18 @@ def update_feed(slug):
         return error_response('No valid fields to update', 400)
 
     try:
-        db.update_podcast(slug, **updates)
+        if 'network_id_override' in updates or 'network_id' in updates:
+            # Same transaction: a failed retag must not leave the feed on
+            # the new network with stranded templates.
+            with db.transaction(immediate=True) as conn:
+                db.update_podcast(slug, conn=conn, **updates)
+                fresh = db.get_podcast_by_slug(slug)
+                effective_network = (
+                    (fresh.get('network_id_override') or '').strip()
+                    or fresh.get('network_id') or None)
+                db.retag_network_cue_templates(fresh['id'], effective_network, conn=conn)
+        else:
+            db.update_podcast(slug, **updates)
         logger.info(f"Updated feed {slug}: {updates}")
 
         # A priority change re-stamps still-pending queue rows so it takes
@@ -2084,7 +2122,7 @@ def update_feed(slug):
                 logger.warning(f"Feed refresh after settings change failed for {slug}: {e}")
 
         return json_response({
-            **_podcast_base_json(podcast, _public_feed_url(slug, get_feed_auth_key(db))),
+            **_podcast_base_json(podcast, _public_feed_url(slug, get_feed_auth_key(db)), db),
             'networkIdOverride': podcast.get('network_id_override'),
             'languageOverride': podcast.get('language_override'),
         })

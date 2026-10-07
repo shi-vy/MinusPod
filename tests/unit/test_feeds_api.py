@@ -119,6 +119,74 @@ def test_a_reject_override_under_the_ceiling_is_accepted(app_client, seeded_feed
         'maxAdDurationRejectOverride'] == 600
 
 
+def _create_network_template(db, podcast_id, network_id):
+    return db.create_cue_template(
+        podcast_id=podcast_id, cue_type='ad_break_boundary',
+        source_episode_id='ep-1', source_offset_s=1.0, duration_s=0.5,
+        sample_rate=16000, n_coeffs=13, mfcc_blob=b'',
+        scope='network', network_id=network_id,
+    )
+
+
+def test_patch_network_id_override_retags_owned_network_templates(app_client, seeded_feed):
+    """Changing networkIdOverride must move this feed's own network-scope
+    templates to the new network, so siblings there inherit them too."""
+    slug = seeded_feed['slug']
+    db = seeded_feed['db']
+    podcast_id = db.get_podcast_by_slug(slug)['id']
+    tid = _create_network_template(db, podcast_id, 'old-network')
+    _authed(app_client)
+    headers = _csrf_headers(app_client)
+
+    resp = app_client.patch(f'/api/v1/feeds/{slug}',
+                            json={'networkIdOverride': 'new-network'}, headers=headers)
+
+    assert resp.status_code == 200
+    row = db.get_cue_template(tid)
+    assert row['scope'] == 'network'
+    assert row['network_id'] == 'new-network'
+
+
+def test_patch_clearing_network_id_override_demotes_network_templates(app_client, seeded_feed):
+    """Clearing the override with no auto-detected network leaves the
+    template with nowhere to point, so it demotes to podcast scope."""
+    slug = seeded_feed['slug']
+    db = seeded_feed['db']
+    podcast_id = db.get_podcast_by_slug(slug)['id']
+    db.update_podcast(slug, network_id_override='old-network')
+    tid = _create_network_template(db, podcast_id, 'old-network')
+    _authed(app_client)
+    headers = _csrf_headers(app_client)
+
+    resp = app_client.patch(f'/api/v1/feeds/{slug}',
+                            json={'networkIdOverride': None}, headers=headers)
+
+    assert resp.status_code == 200
+    row = db.get_cue_template(tid)
+    assert row['scope'] == 'podcast'
+    assert row['network_id'] is None
+
+
+def test_patch_network_id_override_rolls_back_if_retag_fails(app_client, seeded_feed, monkeypatch):
+    """The podcast update and the template retag share one transaction, so a
+    failed retag must not leave the feed's network changed."""
+    slug = seeded_feed['slug']
+    db = seeded_feed['db']
+    db.update_podcast(slug, network_id_override='old-network')
+
+    def _boom(*a, **k):
+        raise RuntimeError('boom')
+    monkeypatch.setattr(db, 'retag_network_cue_templates', _boom)
+    _authed(app_client)
+    headers = _csrf_headers(app_client)
+
+    resp = app_client.patch(f'/api/v1/feeds/{slug}',
+                            json={'networkIdOverride': 'new-network'}, headers=headers)
+
+    assert resp.status_code == 500
+    assert db.get_podcast_by_slug(slug)['network_id_override'] == 'old-network'
+
+
 # -- ownEpisodeGuids (#598) --
 
 @pytest.fixture
@@ -525,3 +593,39 @@ def test_patch_rejects_unknown_chapters_in_notes_value(app_client, seeded_feed):
     resp = app_client.patch(f"/api/v1/feeds/{seeded_feed['slug']}", json={'chaptersInNotes': 'maybe'},
                             headers=_csrf_headers(app_client))
     assert resp.status_code == 400
+
+
+# transcriptDifferential (2.98.0)
+
+def test_the_api_exposes_transcript_differential_as_a_nullable_bool():
+    from api.feeds import _NULLABLE_BOOL_FIELDS
+    assert ('transcriptDifferential', 'transcript_differential') in _NULLABLE_BOOL_FIELDS
+
+
+def test_get_feed_echoes_null_transcript_differential(app_client, seeded_feed):
+    _authed(app_client)
+    resp = app_client.get(f"/api/v1/feeds/{seeded_feed['slug']}")
+    assert resp.status_code == 200
+    assert resp.get_json()['transcriptDifferential'] is None
+
+
+@pytest.mark.parametrize('value', [True, False])
+def test_patch_sets_transcript_differential(app_client, seeded_feed, value):
+    slug = seeded_feed['slug']
+    _authed(app_client)
+    resp = app_client.patch(f'/api/v1/feeds/{slug}', json={'transcriptDifferential': value},
+                            headers=_csrf_headers(app_client))
+    assert resp.status_code == 200
+    assert resp.get_json()['transcriptDifferential'] is value
+    assert bool(seeded_feed['db'].get_podcast_by_slug(slug)['transcript_differential']) is value
+
+
+def test_patch_null_resets_transcript_differential(app_client, seeded_feed):
+    slug = seeded_feed['slug']
+    _authed(app_client)
+    headers = _csrf_headers(app_client)
+    app_client.patch(f'/api/v1/feeds/{slug}', json={'transcriptDifferential': True}, headers=headers)
+    resp = app_client.patch(f'/api/v1/feeds/{slug}', json={'transcriptDifferential': None}, headers=headers)
+    assert resp.status_code == 200
+    assert resp.get_json()['transcriptDifferential'] is None
+    assert seeded_feed['db'].get_podcast_by_slug(slug)['transcript_differential'] is None

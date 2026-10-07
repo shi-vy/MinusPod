@@ -382,6 +382,12 @@ def reset_schema_probe_memo() -> None:
     _SCHEMA_PROBE_ATTEMPTED.clear()
 
 
+def clear_settings_cache() -> None:
+    """Drop cached setting reads without bumping the client config revision."""
+    with _provider_cache_lock:
+        _provider_cache.clear()
+
+
 def invalidate_provider_cache() -> None:
     """Flush the provider settings TTL cache and bump the shared config
     revision so already-built clients rebuild with the new credentials or
@@ -471,6 +477,11 @@ def get_effective_secondary_provider_api_key() -> str | None:
     """Return the secondary-slot API key. DB secret only, no env fallback:
     the secondary slot is not backed by a legacy env var."""
     return _get_cached_secret('secondary_provider_api_key')
+
+
+def get_effective_failover_llm_api_key() -> str | None:
+    """Return the failover-slot LLM API key. DB secret only, like secondary."""
+    return _get_cached_secret('failover_llm_api_key')
 
 
 def _apply_pass_fallback(
@@ -1771,26 +1782,42 @@ class OllamaNativeClient(OpenAICompatibleClient):
 # Provider-aware timeout / retry helpers
 # =============================================================================
 
-def get_llm_timeout() -> float:
-    """Return the LLM request timeout based on the configured provider.
+_TIMEOUT_KEYS = {'primary': 'llm_timeout_seconds', 'secondary': 'secondary_llm_timeout_seconds',
+                 'failover': 'failover_llm_timeout_seconds'}
+_RETRY_KEYS = {'primary': 'llm_max_retries', 'secondary': 'secondary_llm_max_retries',
+               'failover': 'failover_llm_max_retries'}
 
-    Non-Anthropic providers (except OpenRouter, which is a fast cloud API)
-    get a longer timeout since inference may be on-device or routed through
-    a wrapper and significantly slower than the direct Anthropic API.
-    """
-    provider = get_effective_provider()
+
+def _slot_int_setting(key: str) -> int | None:
+    raw = _get_cached_setting(key)
+    try:
+        return int(raw) if raw not in (None, '') else None
+    except (TypeError, ValueError):
+        return None
+
+
+def llm_retries_disabled(credential_slot: str = 'primary') -> bool:
+    """True when the slot's max retries is explicitly 0 (fail fast, no per-window rungs)."""
+    return _slot_int_setting(_RETRY_KEYS.get(credential_slot, 'llm_max_retries')) == 0
+
+
+def get_llm_timeout(provider_key: str | None = None, credential_slot: str = 'primary') -> float:
+    """Per-slot request timeout; blank falls back to the provider-type default."""
+    configured = _slot_int_setting(_TIMEOUT_KEYS.get(credential_slot, 'llm_timeout_seconds'))
+    if configured is not None:
+        return float(configured)
+    provider = provider_key or get_effective_provider()
     if provider in (PROVIDER_ANTHROPIC, PROVIDER_OPENROUTER):
         return LLM_TIMEOUT_DEFAULT
     return LLM_TIMEOUT_LOCAL
 
 
-def get_llm_max_retries() -> int:
-    """Return the max retry count based on the configured provider.
-
-    Non-Anthropic providers (except OpenRouter) use fewer retries since
-    each attempt may be slower than the direct Anthropic API.
-    """
-    provider = get_effective_provider()
+def get_llm_max_retries(provider_key: str | None = None, credential_slot: str = 'primary') -> int:
+    """Per-slot max retries; blank falls back to the provider-type default."""
+    configured = _slot_int_setting(_RETRY_KEYS.get(credential_slot, 'llm_max_retries'))
+    if configured is not None:
+        return configured
+    provider = provider_key or get_effective_provider()
     if provider in (PROVIDER_ANTHROPIC, PROVIDER_OPENROUTER):
         return LLM_RETRY_MAX_RETRIES
     return LLM_RETRY_MAX_RETRIES_LOCAL
@@ -2011,27 +2038,21 @@ def _opencode_headers(base_url: str) -> dict[str, str]:
 
 def _build_client(provider: str, base_url: str | None = None,
                    credential_slot: str = 'primary') -> LLMClient | None:
-    """Build an LLM client for a given provider without caching.
+    """Build an uncached client; secondary and standby credentials never fall back to primary."""
+    def slot_key(primary_getter):
+        if credential_slot == 'secondary':
+            return get_effective_secondary_provider_api_key()
+        if credential_slot == 'failover':
+            return get_effective_failover_llm_api_key()
+        return primary_getter()
 
-    ``base_url`` overrides the DB/env-derived endpoint for non-Anthropic
-    providers (used by per-provider routing); when omitted, the effective
-    setting is used as before. ``credential_slot`` picks which secret to
-    resolve: 'primary' (default) reads the provider type's own key;
-    'secondary' reads secondary_provider_api_key instead, so a secondary
-    slot of the same type as primary never reuses primary's credential. An
-    unset secondary key builds with no/empty key (matching the keyless-local
-    path below) rather than falling back to the primary secret; the auth
-    error then surfaces at call time, not here.
-    """
-    secondary = credential_slot == 'secondary'
     if provider == PROVIDER_ANTHROPIC:
         client = AnthropicClient()
-        if secondary:
-            client.api_key = get_effective_secondary_provider_api_key()
+        if credential_slot != 'primary':
+            client.api_key = slot_key(lambda: client.api_key)
         return client
     elif provider == PROVIDER_OPENROUTER:
-        api_key = (get_effective_secondary_provider_api_key() if secondary
-                   else get_effective_openrouter_api_key()) or 'not-needed'
+        api_key = slot_key(get_effective_openrouter_api_key) or 'not-needed'
         return OpenAICompatibleClient(
             base_url=base_url or OPENROUTER_BASE_URL,
             api_key=api_key,
@@ -2046,8 +2067,7 @@ def _build_client(provider: str, base_url: str | None = None,
         if provider == PROVIDER_OLLAMA:
             if normalized_base_url != raw_base_url:
                 logger.info(f"Ollama provider: normalized base_url to {safe_url_for_log(normalized_base_url)}")
-            api_key = (get_effective_secondary_provider_api_key() if secondary
-                       else get_effective_ollama_api_key()) or 'not-needed'
+            api_key = slot_key(get_effective_ollama_api_key) or 'not-needed'
             ollama_num_ctx = get_effective_ollama_num_ctx()
             if ollama_num_ctx:
                 logger.info(f"Ollama provider: num_ctx={ollama_num_ctx}, using native /api/chat")
@@ -2056,8 +2076,7 @@ def _build_client(provider: str, base_url: str | None = None,
                     extra_headers=_opencode_headers(normalized_base_url),
                     ollama_num_ctx=ollama_num_ctx)
         else:
-            api_key = (get_effective_secondary_provider_api_key() if secondary
-                       else get_effective_openai_api_key()) or 'not-needed'
+            api_key = slot_key(get_effective_openai_api_key) or 'not-needed'
         return OpenAICompatibleClient(base_url=normalized_base_url, api_key=api_key,
                                       extra_headers=_opencode_headers(normalized_base_url))
     return None
@@ -2250,7 +2269,7 @@ def is_retryable_error(error: Exception) -> bool:
             return True
         # Check for specific status codes in generic APIError
         if isinstance(error, a.APIError):
-            if _provider_status_code(error) in (429, 500, 502, 503, 529):
+            if _provider_status_code(error) in (408, 429, 500, 502, 503, 529):
                 return True
             return False  # Non-retryable Anthropic error -- don't fall to string matching
 
@@ -2260,7 +2279,7 @@ def is_retryable_error(error: Exception) -> bool:
         if isinstance(error, (o.APIConnectionError, o.RateLimitError, o.InternalServerError)):
             return True
         if isinstance(error, o.APIError):
-            if _provider_status_code(error) in (429, 500, 502, 503, 529):
+            if _provider_status_code(error) in (408, 429, 500, 502, 503, 529):
                 return True
             return False  # Non-retryable OpenAI error
 
@@ -2300,47 +2319,25 @@ def is_connectivity_error(error: Exception) -> bool:
         # APITimeoutError subclasses APIConnectionError in both SDKs.
         if isinstance(error, (a.APIConnectionError, a.InternalServerError)):
             return True
-        if isinstance(error, a.APIError) and _provider_status_code(error) in (500, 502, 503, 504, 529):
+        if isinstance(error, a.APIError) and _provider_status_code(error) in (408, 500, 502, 503, 504, 529):
             return True
     o = _openai_exc()
     if o is not None:
         if isinstance(error, (o.APIConnectionError, o.InternalServerError)):
             return True
-        if isinstance(error, o.APIError) and _provider_status_code(error) in (500, 502, 503, 504, 529):
+        if isinstance(error, o.APIError) and _provider_status_code(error) in (408, 500, 502, 503, 504, 529):
             return True
     return False
 
 
-def check_llm_connectivity(timeout: float = 5.0) -> bool:
-    """Availability probe for the offline queue re-drive (#482).
-
-    OpenRouter and OpenAI-compatible providers reuse the startup verification
-    (an endpoint /models probe). Anthropic gets a real network probe here:
-    verify_llm_connection only checks key presence for it, which would report
-    "reachable" during a genuine outage and thrash the re-drive loop. Any HTTP
-    response below 500 proves the endpoint is up. On success the LLM circuit
-    breaker resets so re-queued episodes are not immediately rejected by a
-    breaker that opened while the service was down.
-    """
-    try:
-        if get_effective_provider() == PROVIDER_ANTHROPIC:
-            api_key = get_api_key()
-            if not api_key:
-                return False
-            response = requests.get(
-                'https://api.anthropic.com/v1/models',
-                headers={'x-api-key': api_key, 'anthropic-version': '2023-06-01'},
-                timeout=timeout,
-            )
-            reachable = response.status_code < 500
-        else:
-            reachable = verify_llm_connection()
-    except Exception as e:
-        logger.debug(f"LLM connectivity probe failed: {e}")
+def is_failover_trigger_error(error: Exception) -> bool:
+    """True for outages, auth rejections, missing models and exhausted credit. Never a 429 or daily quota."""
+    if isinstance(error, (ProviderRequestRejectedError, StructuralRateLimitError)):
         return False
-    if reachable:
-        _get_circuit_breaker_for_provider(get_effective_provider()).reset()
-    return reachable
+    if is_rate_limit_error(error):
+        return False
+    return (is_connectivity_error(error) or is_auth_error(error)
+            or is_not_found_error(error) or is_limit_exceeded_error(error))
 
 
 def is_llm_api_error(error: Exception) -> bool:

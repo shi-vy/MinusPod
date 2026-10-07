@@ -135,6 +135,24 @@ function renderPanel() {
   );
 }
 
+// Keep the provider mounted while switching feeds.
+function renderPanelFor(slug: string) {
+  const client = makeClient();
+  const result = render(
+    <QueryClientProvider client={client}>
+      <CueTemplatesPanel slug={slug} />
+    </QueryClientProvider>,
+  );
+  return {
+    ...result,
+    navigateTo: (nextSlug: string) => result.rerender(
+      <QueryClientProvider client={client}>
+        <CueTemplatesPanel slug={nextSlug} />
+      </QueryClientProvider>,
+    ),
+  };
+}
+
 function makeEpisode(id: string, title: string, hasOriginalAudio = true): Episode {
   return {
     id,
@@ -712,5 +730,72 @@ describe('Optimize window result panel', () => {
     await waitFor(() => {
       expect(mockOptimizeCueWindow).toHaveBeenCalledWith('test-feed', 7, true);
     });
+  });
+});
+
+// ---- Network mismatch (owning feed's network changed after promotion) ----
+
+describe('Network-scope template whose network no longer matches the feed', () => {
+  beforeEach(() => {
+    mockGetFeed.mockResolvedValue({ slug: 'test-feed', title: 'Test Feed', networkId: 'net-new' });
+    mockListCueTemplates.mockResolvedValue([
+      makeTemplate({ scope: 'network', networkId: 'net-old' }),
+    ]);
+  });
+
+  it('shows a warning naming both networks', async () => {
+    renderPanel();
+    await waitFor(() => {
+      expect(screen.getByText('Shared on network "net-old", this feed is on "net-new"')).toBeDefined();
+    });
+  });
+
+  it('relabels the action to move the template, and moving sends the feed\'s current network', async () => {
+    mockUpdateCueTemplate.mockResolvedValue(makeTemplate({ scope: 'network', networkId: 'net-new' }));
+    renderPanel();
+    const btn = await screen.findByRole('button', { name: /Move to network net-new/i });
+
+    await userEvent.click(btn);
+
+    await waitFor(() => {
+      expect(mockUpdateCueTemplate).toHaveBeenCalledWith(7, { scope: 'network', networkId: 'net-new' });
+    });
+  });
+
+  it('shows no warning and the plain demote label when the networks match', async () => {
+    mockGetFeed.mockResolvedValue({ slug: 'test-feed', title: 'Test Feed', networkId: 'net-old' });
+    renderPanel();
+    await waitFor(() => expect(screen.getByText('Ding')).toBeDefined());
+    expect(screen.queryByText(/Shared on network/)).toBeNull();
+    expect(screen.getByRole('button', { name: 'Make podcast-only' })).toBeDefined();
+  });
+});
+
+describe('SPA navigation between feeds without a remount', () => {
+  it('re-reads the new feed\'s own persisted open state instead of carrying the previous feed\'s', async () => {
+    localStorage.setItem('feed-cue-templates-feed-a', 'true');
+    localStorage.setItem('feed-cue-templates-feed-b', 'false');
+    mockListCueTemplates.mockImplementation((slug: string) =>
+      Promise.resolve(slug === 'feed-a' ? [makeTemplate({ id: 1, label: 'From A' })] : []));
+
+    const { navigateTo } = renderPanelFor('feed-a');
+    await waitFor(() => expect(mockListCueTemplates).toHaveBeenCalledWith('feed-a'));
+    await screen.findByText('From A');
+
+    mockListCueTemplates.mockClear();
+    navigateTo('feed-b');
+
+    // feed-b's own persisted state is closed; the query must stay disabled
+    // instead of inheriting feed-a's open state.
+    await waitFor(() => expect(screen.queryByText('From A')).toBeNull());
+    expect(mockListCueTemplates).not.toHaveBeenCalled();
+  });
+
+  it('never shows "No cues yet" for a collapsed panel whose query is simply disabled', async () => {
+    localStorage.setItem('feed-cue-templates-feed-c', 'false');
+    renderPanelFor('feed-c');
+
+    await waitFor(() => expect(mockListCueTemplates).not.toHaveBeenCalled());
+    expect(screen.queryByText(/No cues yet/)).toBeNull();
   });
 });

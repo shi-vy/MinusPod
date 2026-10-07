@@ -11,16 +11,13 @@ import ChevronCaret from './ChevronCaret';
 // then tracks toggles: pass `storageKey` and wire the setter to `onToggle`.
 // Lives here so knowledge of the storage-key contract stays next to the
 // component that owns it.
-/**
- * Whether a section's content is on screen: its persisted open flag, or a
- * settings search revealing it. Use to gate a query on visibility. The search
- * path matters because a search expands a section without ever calling
- * onToggle, so the persisted flag alone would leave a matched section stuck
- * on "Loading..." with no way to reach its settings.
- */
+/** Search matches override saved openness when gating section queries. */
+export function sectionVisible(matchKeys: Set<string> | null, storageKey: string, open: boolean): boolean {
+  return matchKeys !== null ? matchKeys.has(storageKey) : open;
+}
+
 export function useSectionVisible(storageKey: string, open: boolean): boolean {
-  const matchKeys = useSettingsSearch();
-  return open || (matchKeys !== null && matchKeys.has(storageKey));
+  return sectionVisible(useSettingsSearch(), storageKey, open);
 }
 
 export function useCollapsibleOpen(
@@ -30,6 +27,12 @@ export function useCollapsibleOpen(
   const [open, setOpen] = useState(
     () => readStoredValue<boolean>(storageKey, defaultOpen) === true,
   );
+  // Re-read a new key so reused feed panels restore that feed's saved state.
+  const [prevKey, setPrevKey] = useState(storageKey);
+  if (storageKey !== prevKey) {
+    setPrevKey(storageKey);
+    setOpen(readStoredValue<boolean>(storageKey, defaultOpen) === true);
+  }
   return [open, setOpen];
 }
 

@@ -25,14 +25,41 @@ def traced_pair(tmp_path, monkeypatch):
 
 
 def test_long_held_write_transaction_is_logged_with_opener(traced_pair, caplog):
+    # Opener label names the first real statement, not the BEGIN that started it
+    # (#728 follow-up: "opened by: BEGIN IMMEDIATE" gave no way to trace the holder).
     holder, _ = traced_pair
     with caplog.at_level(logging.WARNING, logger='database'):
         holder.execute('BEGIN IMMEDIATE')
-        holder.execute("INSERT INTO t VALUES (1)")
+        holder.execute("UPDATE t SET x = 2 WHERE x = 1")
         time.sleep(0.08)
         holder.commit()
     assert 'write transaction held' in caplog.text
-    assert 'opened by: BEGIN IMMEDIATE' in caplog.text
+    assert 'opened by: UPDATE t SET x = 2 WHERE x = 1' in caplog.text
+    assert 'opened by: BEGIN IMMEDIATE' not in caplog.text
+
+
+def test_plain_begin_opener_names_the_first_statement(traced_pair, caplog):
+    holder, _ = traced_pair
+    holder.isolation_level = None
+    with caplog.at_level(logging.WARNING, logger='database'):
+        holder.execute('BEGIN')
+        holder.execute("INSERT INTO t VALUES (3)")
+        time.sleep(0.08)
+        holder.commit()
+    assert 'opened by: INSERT INTO t VALUES (3)' in caplog.text
+    assert 'opened by: BEGIN' not in caplog.text
+
+
+def test_implicit_transaction_opener_is_still_its_own_statement(traced_pair, caplog):
+    # Plain autocommit-style writes (no explicit BEGIN IMMEDIATE) are
+    # unaffected: the first statement itself opens the transaction.
+    holder, _ = traced_pair
+    with caplog.at_level(logging.WARNING, logger='database'):
+        holder.execute("INSERT INTO t VALUES (1)")
+        time.sleep(0.08)
+        holder.commit()
+    assert 'SQLite transaction elapsed' in caplog.text
+    assert 'opened by: INSERT INTO t VALUES (1)' in caplog.text
 
 
 def test_short_transaction_is_quiet(traced_pair, caplog, monkeypatch):

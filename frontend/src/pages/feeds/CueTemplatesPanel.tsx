@@ -212,6 +212,11 @@ function CueTemplatesPanel({ slug }: Props) {
   const handlePromote = async (template: CueTemplate) => {
     setActionError(null);
     if (template.scope === 'network') {
+      if (networkId && template.networkId !== networkId) {
+        // The owning feed's network moved; follow it instead of demoting.
+        updateMutation.mutate({ id: template.id, patch: { scope: 'network', networkId } });
+        return;
+      }
       // Demotion has no blast radius; apply immediately.
       updateMutation.mutate({ id: template.id, patch: { scope: 'podcast' } });
       return;
@@ -365,12 +370,15 @@ function CueTemplatesPanel({ slug }: Props) {
             {verifyState.matched === 0 ? ' No matches yet - it may not recur, or the bracket is loose.' : ''}
           </p>
         )}
-        {templatesQuery.isLoading && <LoadingSpinner size="sm" className="my-2" />}
-        {templatesQuery.error && (
+        {panelOpen && templatesQuery.isLoading && <LoadingSpinner size="sm" className="my-2" />}
+        {panelOpen && templatesQuery.error && (
           <p className="text-sm text-destructive">Could not load cue templates.</p>
         )}
 
-        {!templatesQuery.isLoading && templates.length === 0 && (
+        {/* Gated on panelOpen too: while collapsed the query is disabled
+            (isLoading reads false), so without this the empty state would
+            render even though no fetch has actually run. */}
+        {panelOpen && !templatesQuery.isLoading && templates.length === 0 && (
           <p className="text-sm text-muted-foreground">
             No cues yet. Mark one to start.
           </p>
@@ -433,6 +441,12 @@ function CueTemplatesPanel({ slug }: Props) {
                         {t.sourceEpisodeId ? ` of episode ${t.sourceEpisodeId.slice(0, 8)}` : ''}
                         {t.lastMatchAt ? ` - last match ${formatDate(t.lastMatchAt)}` : ''}
                       </p>
+                      {t.owned !== false && t.scope === 'network' && networkId
+                        && t.networkId && t.networkId !== networkId && (
+                        <p className="text-xs text-warning">
+                          Shared on network "{t.networkId}", this feed is on "{networkId}"
+                        </p>
+                      )}
                     </>
                   )}
                   </div>
@@ -464,20 +478,28 @@ function CueTemplatesPanel({ slug }: Props) {
                       </span>
                     ) : (
                       <>
-                        {(t.scope === 'network' || networkId) && (
-                          <button
-                            type="button"
-                            className={`text-xs text-muted-foreground hover:text-foreground ${focusRing}`}
-                            onClick={() => handlePromote(t)}
-                            title={
-                              t.scope === 'network'
-                                ? 'Limit this cue to this feed only'
-                                : `Apply this cue to every feed on network "${networkId}"`
-                            }
-                          >
-                            {t.scope === 'network' ? 'Make podcast-only' : 'Promote to network'}
-                          </button>
-                        )}
+                        {(t.scope === 'network' || networkId) && (() => {
+                          const mismatched = t.scope === 'network' && !!networkId
+                            && t.networkId !== networkId;
+                          return (
+                            <button
+                              type="button"
+                              className={`text-xs text-muted-foreground hover:text-foreground ${focusRing}`}
+                              onClick={() => handlePromote(t)}
+                              title={
+                                t.scope === 'network'
+                                  ? (mismatched
+                                      ? `Move this cue to network "${networkId}"`
+                                      : 'Limit this cue to this feed only')
+                                  : `Apply this cue to every feed on network "${networkId}"`
+                              }
+                            >
+                              {t.scope === 'network'
+                                ? (mismatched ? `Move to network ${networkId}` : 'Make podcast-only')
+                                : 'Promote to network'}
+                            </button>
+                          );
+                        })()}
                         <button
                           type="button"
                           className={`text-xs text-muted-foreground hover:text-foreground ${focusRing}`}

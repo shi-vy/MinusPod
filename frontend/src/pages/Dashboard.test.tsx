@@ -246,18 +246,37 @@ describe('Dashboard delete confirmation', () => {
 describe('Dashboard OPML export', () => {
   beforeEach(() => vi.clearAllMocks());
 
-  // Both render in jsdom: the phone icon (title row) and the desktop button
-  // (toolbar) are only switched by Tailwind breakpoints.
-  it.each([0, 1])('either Export OPML button opens the feed picker (%i)', async (which) => {
+  it('opens the feed picker from the responsive toolbar button', async () => {
     renderDashboard();
     await screen.findByText('Existing Feed');
-    const buttons = screen.getAllByRole('button', { name: 'Export OPML' });
-    expect(buttons).toHaveLength(2);
-
-    await userEvent.click(buttons[which]);
+    await userEvent.click(screen.getByRole('button', { name: 'Export OPML' }));
 
     const dialog = await screen.findByRole('dialog');
     expect(within(dialog).getByRole('heading', { name: 'Export OPML' })).toBeDefined();
+  });
+});
+
+describe('Dashboard mobile view menu', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.removeItem('dashboardView');
+  });
+
+  afterEach(() => localStorage.removeItem('dashboardView'));
+
+  it('switches and persists the selected dashboard view', async () => {
+    renderDashboard();
+    await screen.findByText('Existing Feed');
+
+    const trigger = screen.getByRole('button', { name: 'View by Podcasts' });
+    await userEvent.click(trigger);
+    expect(screen.getByRole('menuitemradio', { name: 'Podcasts' }).getAttribute('aria-checked')).toBe('true');
+    await userEvent.click(screen.getByRole('menuitemradio', { name: 'Episodes' }));
+
+    expect(screen.getByRole('button', { name: 'View by Episodes' })).toBeDefined();
+    await waitFor(() => expect(localStorage.getItem('dashboardView')).toBe('"episodes"'));
+    await userEvent.click(screen.getByRole('button', { name: 'View by Episodes' }));
+    expect(screen.getByRole('menuitemradio', { name: 'Episodes' }).getAttribute('aria-checked')).toBe('true');
   });
 });
 
@@ -312,16 +331,20 @@ describe('Dashboard Episodes view', () => {
     expect(link?.getAttribute('href')).toBe('/feeds/zulu-show');
   });
 
-  it('disables a queued row action while a sibling row stays actionable', async () => {
+  it('disables a queued Actions menu while a sibling row stays actionable', async () => {
+    const user = userEvent.setup();
     renderDashboard();
-    await userEvent.click(await screen.findByRole('button', { name: 'Episodes' }));
+    await user.click(await screen.findByRole('button', { name: 'Episodes' }));
     await screen.findByText('Episode z1');
-    // z1's status is 'processing' (never completed), so its action label
-    // stays "Process" even while disabled for being queued.
-    const queuedButton = screen.getByText('Process').closest('button') as HTMLButtonElement;
+    const queuedRow = screen.getByText('Episode z1').closest('div.relative') as HTMLElement;
+    const queuedButton = within(queuedRow).getByRole('button', { name: 'Actions' }) as HTMLButtonElement;
     expect(queuedButton.disabled).toBe(true);
-    const idleButton = screen.getAllByText('Reprocess')[0].closest('button') as HTMLButtonElement;
+    const siblingRow = screen.getByText('Episode z2').closest('div.relative') as HTMLElement;
+    const idleButton = within(siblingRow).getByRole('button', { name: 'Actions' }) as HTMLButtonElement;
     expect(idleButton.disabled).toBe(false);
+    await user.click(idleButton);
+    expect(screen.getByRole('menuitem', { name: /Reprocess/ })).toBeTruthy();
+    await user.keyboard('{Escape}');
   });
 
   it('renders a feed with no episodes cleanly instead of a broken card', async () => {

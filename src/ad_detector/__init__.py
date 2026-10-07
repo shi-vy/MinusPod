@@ -21,14 +21,14 @@ from llm_client import (
     is_connectivity_error, is_retryable_error, is_not_found_error,
     is_rate_limit_error, is_limit_exceeded_error,
     is_permanent_request_rejection_status,
-    get_llm_timeout, get_llm_max_retries,
     get_effective_provider, model_matches_provider,
     StructuralRateLimitError, ProviderRateLimitedError,
 )
-from llm_route import client_for_route
+from llm_route import client_for_route, live_route_params
 from run_context import route_for_phase, run_in_worker_thread
 from sponsor_context import description_sponsor_re
 from sponsor_normalize import segment_category_for
+from transcript_differential import spans_overlapping
 from utils.language import get_pattern_language
 from utils.llm_call import (
     LOSS_CONNECTIVITY, LOSS_SERVER_ERROR, _wait_past_breaker_cooldown,
@@ -37,6 +37,7 @@ from utils.llm_call import (
 from utils.markers import (
     DAI_CORE_SPANS,
     DAI_PROBE_SPANS,
+    TRANSCRIPT_SPAN,
     carve_fragment,
     dai_probe_window,
     estimated_text_bounds,
@@ -63,8 +64,10 @@ from config import (
     AUDIO_CUE_START_EDGE_ROLES,
     AUDIO_CUE_END_EDGE_ROLES,
     HOLD_REASON_DIFFERENTIAL_UNCORROBORATED,
+    HOLD_REASON_TRANSCRIPT_DIFFERENTIAL,
     DEFAULT_SEGMENT_ACTION,
     normalize_segment_category,
+    is_keep_like,
     SEGMENT_CATEGORIES,
     is_cue_backed,
     is_template_cue,
@@ -542,8 +545,7 @@ def dai_differential_ads(dai_differential, fp_pairs, corroborating_spans=None, *
             spans.append([c_start, c_end, [probe]])
 
     for start, end, probes in spans:
-        if any(overlap_ratio(fp_start, fp_end, start, end) > 0.5
-               for fp_start, fp_end in fp_pairs):
+        if _fp_excludes(start, end, fp_pairs):
             continue
 
         stage_overlap = any(ranges_overlap(cs, ce, start, end)
@@ -584,6 +586,90 @@ def dai_differential_ads(dai_differential, fp_pairs, corroborating_spans=None, *
             })
         ads.append(ad)
     return ads
+
+
+def _fp_excludes(start, end, fp_pairs) -> bool:
+    """A confirmed false positive covers more than half of [start, end)."""
+    return any(overlap_ratio(fp_start, fp_end, start, end) > 0.5
+               for fp_start, fp_end in fp_pairs or ())
+
+
+def transcript_differential_ads(spans, fp_pairs=None):
+    """Held markers for upstream transcript gaps; only _merge_detection_results releases one."""
+    ads = []
+    for span in spans or []:
+        start, end = float(span['start']), float(span['end'])
+        if _fp_excludes(start, end, fp_pairs):
+            continue
+        offset_confirmed = bool(span.get('offset_confirmed'))
+        ad = {
+            'start': start,
+            'end': end,
+            'confidence': 0.75 if offset_confirmed else 0.6,
+            'sponsor': None,
+            'detection_stage': 'transcript_differential',
+            'category': 'sponsor',
+            'reason': 'Upstream transcript omits this span',
+            TRANSCRIPT_SPAN: {'start': start, 'end': end, 'words': span.get('words'),
+                              'offset_confirmed': offset_confirmed},
+            'held_for_review': True,
+            'was_cut': False,
+            'hold_reason': HOLD_REASON_TRANSCRIPT_DIFFERENTIAL,
+            'transcript_differential_uncorroborated': True,
+        }
+        ads.append(ad)
+    return ads
+
+
+@dataclass(frozen=True)
+class _HoldRelease:
+    hold_reason: str
+    stages: frozenset            # release outright
+    coverage_stages: frozenset   # release only with Whisper coverage of the held span
+    gap_overlap: bool            # the releasing member must cover half of the held gap
+
+
+DIFFERENTIAL_FLAG = 'differential_uncorroborated'
+TRANSCRIPT_DIFF_FLAG = 'transcript_differential_uncorroborated'
+_HOLD_RELEASES = {
+    DIFFERENTIAL_FLAG: _HoldRelease(
+        HOLD_REASON_DIFFERENTIAL_UNCORROBORATED,
+        frozenset({'fingerprint', 'text_pattern'}), frozenset({'claude'}), False),
+    TRANSCRIPT_DIFF_FLAG: _HoldRelease(
+        HOLD_REASON_TRANSCRIPT_DIFFERENTIAL,
+        frozenset({'fingerprint', 'text_pattern', 'claude'}), frozenset(), True),
+}
+
+
+def _hold_released(flag: str, held: dict, other: dict, stages: set, segments=None) -> bool:
+    """Whether other, contributing stages, corroborates the evidence-only held marker."""
+    rule = _HOLD_RELEASES[flag]
+    if rule.gap_overlap and not spans_overlapping(
+            [held.get(TRANSCRIPT_SPAN) or held], other['start'], other['end'],
+            min_fraction_of='span'):
+        return False
+    if stages & rule.stages or is_cue_backed(other):
+        return True
+    return bool(stages & rule.coverage_stages) and (
+        _span_transcript_coverage(segments, held['start'], held['end'])
+        >= DIFFERENTIAL_CLAUDE_UPGRADE_MIN_COVERAGE)
+
+
+def _set_hold(marker: dict, flag: str, held: bool) -> None:
+    if held:
+        marker.update({flag: True, 'held_for_review': True, 'was_cut': False,
+                       'hold_reason': _HOLD_RELEASES[flag].hold_reason})
+    else:
+        for key in (flag, 'held_for_review', 'hold_reason', 'was_cut'):
+            marker.pop(key, None)
+
+
+def _corroborating_stages(ad: dict) -> set:
+    """Stages an ad contributes; an estimated text_pattern span is advisory."""
+    stages = set(ad.get(_MEMBER_STAGES) or [])
+    if not (ad.get('detection_stage') == 'text_pattern' and ad.get('span_estimated')):
+        stages.add(ad.get('detection_stage'))
+    return stages
 
 
 # Roles eligible to corroborate a differential candidate's edge. Fusion
@@ -893,11 +979,11 @@ class AdDetector:
         route = route_for_phase('verification')
         return route['provider_key'] if route else get_effective_provider()
 
-    def _client_for_pass(self, pass_name: str) -> LLMClient | None:
-        """LLM client for a detection pass: the run's routed provider client,
-        or the legacy override/global client outside a run."""
+    def _client_for_pass(self, pass_name: str, route: dict | None = None) -> LLMClient | None:
+        """LLM client for a detection pass: `route` (else the run's routed
+        provider) client, or the legacy override/global client outside a run."""
         return client_for_route(
-            _phase_for_pass(pass_name), override=self._llm_client_override,
+            route or _phase_for_pass(pass_name), override=self._llm_client_override,
             fallback=lambda: get_llm_client() if self.api_key else None)
 
     def _apply_pass_override(self, rendered: str, setting_key: str) -> str:
@@ -1161,14 +1247,14 @@ class AdDetector:
         client for per-pass fallback flag scoping.
         """
         phase = _phase_for_pass(pass_name)
-        route = route_for_phase(phase)
-        provider = route['provider_key'] if route else None
-        credential_slot = route.get('credential_slot', 'primary') if route else 'primary'
+        live = live_route_params(phase, model, llm_timeout, max_retries)
+        provider, credential_slot, model = live.provider, live.credential_slot, live.model
+        llm_timeout, max_retries = live.timeout, live.max_retries
         max_tokens, temperature, reasoning = resolve_stage_tunables(
             phase, provider=provider)
 
         return call_llm_for_window(
-            llm_client=self._client_for_pass(pass_name),
+            llm_client=self._client_for_pass(pass_name, live.route),
             model=model,
             system_prompt=system_prompt,
             prompt=prompt,
@@ -1625,8 +1711,8 @@ class AdDetector:
         window_losses = {}
         last_error = None
         provider_error = None
-        llm_timeout = get_llm_timeout()
-        max_retries = get_llm_max_retries()
+        live = live_route_params(_phase_for_pass(pass_name))
+        llm_timeout, max_retries = live.timeout, live.max_retries
 
         # Instantiate audio signal formatter if audio analysis available
         audio_enforcer = None
@@ -1813,12 +1899,12 @@ class AdDetector:
 
         prompt = format_category_repair_prompt(transcript_excerpt, missing)
         phase = _phase_for_pass(pass_name)
-        route = route_for_phase(phase)
-        provider = route['provider_key'] if route else None
-        credential_slot = route.get('credential_slot', 'primary') if route else 'primary'
+        live = live_route_params(phase, model, llm_timeout, max_retries)
+        provider, credential_slot, model = live.provider, live.credential_slot, live.model
+        llm_timeout, max_retries = live.timeout, live.max_retries
 
         response, error = call_llm(
-            llm_client=self._client_for_pass(pass_name),
+            llm_client=self._client_for_pass(pass_name, live.route),
             model=model,
             system_prompt=CATEGORY_REPAIR_SYSTEM_PROMPT,
             prompt=prompt,
@@ -2234,7 +2320,8 @@ class AdDetector:
                           recurrence_spans: list | None = None,
                           keep_content: bool | None = None,
                           skip_llm: bool = False,
-                          action_map: dict[str, str] | None = None) -> dict:
+                          action_map: dict[str, str] | None = None,
+                          transcript_spans: list | None = None) -> dict:
         """Process transcript for ad detection using three-stage pipeline.
 
         Pipeline stages:
@@ -2269,6 +2356,7 @@ class AdDetector:
                  call only; keep-content mode does not receive it.
             action_map: Caller-resolved category actions; resolved once here
                  when None and shared with detect_ads().
+            transcript_spans: Upstream transcript gaps from the pipeline stage.
 
         Returns:
             Dict with ads, status, and detection metadata
@@ -2305,6 +2393,7 @@ class AdDetector:
             'text_pattern_matches': 0,
             'claude_matches': 0,
             'dai_differential_matches': 0,
+            'transcript_differential_matches': 0,
             'skip_patterns': skip_patterns
         }
 
@@ -2448,6 +2537,14 @@ class AdDetector:
             if dd_ads:
                 logger.info(f"[{slug}:{episode_id}] Differential stage found {len(dd_ads)} ads")
 
+        # Stage 2.6: upstream transcript gaps, held until the merge finds a releasing detection.
+        if transcript_spans:
+            td_ads = transcript_differential_ads(transcript_spans, fp_pairs)
+            all_ads.extend(td_ads)
+            detection_stats['transcript_differential_matches'] = len(td_ads)
+            if td_ads:
+                logger.info(f"[{slug}:{episode_id}] Transcript diff stage found {len(td_ads)} spans")
+
         # Cancel check between stages
         _check_cancel(cancel_event, slug, episode_id)
 
@@ -2484,11 +2581,12 @@ class AdDetector:
                         kc_desc += f"Podcast Description:\n{podcast_description}\n\n"
                     if episode_description:
                         kc_desc += f"Episode Description:\n{episode_description}\n"
+                    kc_live = live_route_params('detection')
                     inverted = self._detect_keep_content_ads(
                         segments, model=model, slug=slug, episode_id=episode_id,
                         podcast_name=podcast_name, episode_title=episode_title,
                         description_section=kc_desc,
-                        llm_timeout=get_llm_timeout(), max_retries=get_llm_max_retries(),
+                        llm_timeout=kc_live.timeout, max_retries=kc_live.max_retries,
                     )
                     if inverted is not None:
                         result = {"ads": inverted, "status": "success",
@@ -2748,10 +2846,10 @@ class AdDetector:
         Filters: was_cut, detection_stage == 'claude', confidence floor,
         and stricter confidence for long (>90s) detections.
         """
-        # Learn from removed ads, or a keep-action marker: it still names a
-        # real ad read the feed chose to leave in, so it's worth learning
-        # even though was_cut is False for it.
-        if not ad.get('was_cut', False) and ad.get('action_applied') != 'keep':
+        # Learn from removed ads, or a keep/mark-action marker: it still
+        # names a real ad read the feed chose to leave in, so it's worth
+        # learning even though was_cut is False for it.
+        if not ad.get('was_cut', False) and not is_keep_like(ad.get('action_applied')):
             logger.debug(f"Skipping pattern for uncut ad: {ad['start']:.1f}s-{ad['end']:.1f}s")
             return False
 
@@ -3187,11 +3285,19 @@ class AdDetector:
                     and last.get('span_estimated') else last_stage_before_merge)
                 # Adjacency is not corroboration (#541): a held differential
                 # only merges with a non-differential marker on true overlap.
-                if (bool(last.get('differential_uncorroborated'))
-                        != bool(current.get('differential_uncorroborated'))
+                if (bool(last.get(DIFFERENTIAL_FLAG)) != bool(current.get(DIFFERENTIAL_FLAG))
                         and current['start'] >= last['end']):
                     merged.append(_with_category_span(current.copy()))
                     continue
+                # A held transcript gap folds only into a detection that releases it.
+                td_last = bool(last.get(TRANSCRIPT_DIFF_FLAG))
+                release_transcript = td_last != bool(current.get(TRANSCRIPT_DIFF_FLAG))
+                if release_transcript:
+                    held, other = (last, current) if td_last else (current, last)
+                    if not _hold_released(TRANSCRIPT_DIFF_FLAG, held, other,
+                                          _corroborating_stages(other)):
+                        merged.append(_with_category_span(current.copy()))
+                        continue
                 note_fold(last, current)
                 # The label goes to the member classifying the most audio,
                 # ties to the incumbent. A member naming nothing, or naming
@@ -3234,7 +3340,8 @@ class AdDetector:
                 # cutting trust (stage + pattern_id) only; the sponsor LABEL is
                 # decided below, tied to the reason, so the two never disagree.
                 stage_priority = {'fingerprint': 0, 'dai_differential': 0,
-                                  'text_pattern': 1, 'claude': 2}
+                                  'text_pattern': 1, 'claude': 2,
+                                  'transcript_differential': 3}
                 if stage_priority.get(current.get('detection_stage'), 2) < stage_priority.get(last.get('detection_stage'), 2):
                     last['detection_stage'] = current['detection_stage']
                     last['pattern_id'] = current.get('pattern_id')
@@ -3290,31 +3397,20 @@ class AdDetector:
                 # transcript coverage (claude saw the region as a prompt
                 # hint, so on an untranscribed span it can only echo it).
                 # Handles the flag on either side of the fold.
-                diff_is_last = bool(last.get('differential_uncorroborated'))
-                diff_is_cur = bool(current.get('differential_uncorroborated'))
-                if diff_is_last != diff_is_cur:
+                diff_is_last = bool(last.get(DIFFERENTIAL_FLAG))
+                if diff_is_last != bool(current.get(DIFFERENTIAL_FLAG)):
                     diff_side = last if diff_is_last else current
                     other = current if diff_is_last else last
                     other_stage = (cur_stage
                                    if diff_is_last else last_corroborating_stage)
                     stages_seen = set(last.get(_MEMBER_STAGES) or []) | {other_stage}
-                    independent = (
-                        bool(stages_seen & {'fingerprint', 'text_pattern'})
-                        or is_cue_backed(other))
-                    claude_verified = (
-                        'claude' in stages_seen
-                        and _span_transcript_coverage(
-                            segments, diff_side['start'], diff_side['end'])
-                        >= DIFFERENTIAL_CLAUDE_UPGRADE_MIN_COVERAGE)
-                    if independent or claude_verified:
-                        for key in ('differential_uncorroborated',
-                                    'held_for_review', 'hold_reason', 'was_cut'):
-                            last.pop(key, None)
+                    _set_hold(last, DIFFERENTIAL_FLAG, not _hold_released(
+                        DIFFERENTIAL_FLAG, diff_side, other, stages_seen, segments))
+                if release_transcript:
+                    if td_last:
+                        _set_hold(last, TRANSCRIPT_DIFF_FLAG, False)
                     else:
-                        last['differential_uncorroborated'] = True
-                        last['held_for_review'] = True
-                        last['hold_reason'] = HOLD_REASON_DIFFERENTIAL_UNCORROBORATED
-                        last['was_cut'] = False
+                        last.setdefault(TRANSCRIPT_SPAN, current.get(TRANSCRIPT_SPAN))
             else:
                 merged.append(_with_category_span(current.copy()))
 
@@ -3407,13 +3503,12 @@ class AdDetector:
                         a_action = effective_resolved_action(a, action_map)
                         b_action = effective_resolved_action(b, action_map)
                         if a_action != b_action:
-                            if a_action == 'keep':
+                            if is_keep_like(a_action):
                                 category_source = a
-                            elif b_action == 'keep':
+                            elif is_keep_like(b_action):
                                 category_source = b
-                            # Neither side resolves to 'keep' (e.g. remove vs
-                            # beep): no side is more "correct" to preserve,
-                            # fall back to the higher-confidence contributor.
+                            # Neither side is keep-like: fall back to the
+                            # higher-confidence contributor (category_source default).
                     source_category = category_source.get('category')
                     if source_category in SEGMENT_CATEGORIES:
                         combined['category'] = source_category

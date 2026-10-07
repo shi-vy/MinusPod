@@ -44,6 +44,7 @@ from api.feeds import _normalize_processing_mode, _normalize_detection_mode
 
 SEGMENTS = [{'start': 0.0, 'end': 5.0, 'text': 'hello'},
             {'start': 5.0, 'end': 10.0, 'text': 'world'}]
+_PROBE_PHASES_UNSET = object()
 
 
 class TestResolveFeedProcessingMode:
@@ -116,17 +117,41 @@ class TestResolveProcessingMode:
             PROCESSING_MODE_PASSTHROUGH
 
 
+_INACTIVE_FAILOVER_STATE = {'active': False, 'source': None, 'since': None, 'reason': None}
+
+
 def _run_pipeline(podcast_row, cue_template_counts=None, cue_templates=None,
                    enable_ad_review=False, admission=None,
                    download_error=None, detect_error=None,
                    token_cost=0.012, real_token_tracking=False,
-                   approval_recut=False):
-    """Drive process_episode with all stages stubbed (mirrors
-    test_skip_ad_detection's harness) and return the interesting mocks."""
+                   approval_recut=False, route_snapshot=None,
+                   failover_state=None, standby_dispatch=False,
+                   probe_phases=_PROBE_PHASES_UNSET, episode_row=None):
+    """Run stubbed pipeline stages with optional frozen routes and failover state."""
     with ExitStack() as stack:
         p = lambda *a, **k: stack.enter_context(patch.object(*a, **k))
         db = p(processing, 'db')
         p(processing, 'status_service')
+        slot_targets = {'primary': 'llm:primary', 'secondary': 'llm:secondary',
+                        'failover': 'llm:failover'}
+        probe_selector = p(
+            processing.failover, 'run_probe_targets',
+            side_effect=lambda phases, whisper_required: list(dict.fromkeys(
+                slot_targets[route.get('credential_slot', 'primary')]
+                for route in (phases or {}).values() if isinstance(route, dict)
+            )),
+        )
+        ensure_probes = p(processing.failover, 'ensure_fresh_probes')
+        if probe_phases is not _PROBE_PHASES_UNSET:
+            p(processing, '_active_phases_for_admission', return_value=probe_phases)
+        if route_snapshot is not None:
+            p(processing, '_resolve_or_load_route_snapshot', return_value=route_snapshot)
+            p(processing, '_assert_route_snapshot_current')
+        if failover_state is not None:
+            p(processing.failover, 'state',
+              side_effect=lambda t: failover_state.get(t, _INACTIVE_FAILOVER_STATE))
+            p(processing.failover, 'is_active',
+              side_effect=lambda t: failover_state.get(t, _INACTIVE_FAILOVER_STATE)['active'])
         storage = p(processing, 'storage')
         audio_processor = p(processing, 'audio_processor')
         p(processing.ad_detector, 'get_model', return_value='test-model')
@@ -174,9 +199,11 @@ def _run_pipeline(podcast_row, cue_template_counts=None, cue_templates=None,
                       (processing.get_episode_token_totals(), True)[1])
         p(processing.shutil, 'move')
         p(processing.os, 'unlink')
-        p(processing.os.path, 'exists', return_value=False)
+        path_exists = processing.os.path.exists
+        p(processing.os.path, 'exists', side_effect=lambda path:
+          False if path in ('/tmp/mode.mp3', '/tmp/cut.mp3') else path_exists(path))
 
-        db.get_episode.return_value = {}
+        db.get_episode.return_value = episode_row or {}
         db.get_podcast_by_slug.return_value = podcast_row
         db.reserve_provider_spend.return_value = (
             admission or {'allowed': True, 'reservation_id': 'provider-run-1'})
@@ -203,11 +230,22 @@ def _run_pipeline(podcast_row, cue_template_counts=None, cue_templates=None,
         local_ap.process_episode.return_value = ('/tmp/cut.mp3', [])
         local_ap.get_audio_duration.return_value = 100.0
         storage.get_episode_path.return_value = '/tmp/final.mp3'
-        result = processing.process_episode(
-            'mode-feed', 'ep1', 'https://example.com/ep1.mp3')
+        ctx = run_context.begin('mode-feed', 'ep1') if standby_dispatch else None
+        if standby_dispatch:
+            def dispatched(*args, **kwargs):
+                ctx.note_llm_failover('detection', 1)
+                return [], 0, None
+            detect.side_effect = dispatched
+        try:
+            result = processing.process_episode(
+                'mode-feed', 'ep1', 'https://example.com/ep1.mp3')
+        finally:
+            if ctx:
+                run_context.end(ctx)
     return {'result': result, 'detect': detect, 'verify': verify,
             'analyze': analyze, 'refine': refine, 'finalize': finalize,
-            'dat': dat, 'db': db, 'reviewer': reviewer, 'recut': recut}
+            'dat': dat, 'db': db, 'reviewer': reviewer, 'recut': recut,
+            'probe_selector': probe_selector, 'ensure_probes': ensure_probes}
 
 
 def _row(pt=None, skip=None, mode=None):
@@ -221,7 +259,9 @@ class TestProcessEpisodeModePlumbing:
     def test_passthrough_wins_over_skip_and_keep_content(self):
         with patch.object(processing, 'db') as db, \
              patch.object(processing, '_passthrough_episode') as pt, \
-             patch.object(processing, 'start_episode_token_tracking'):
+             patch.object(processing, 'start_episode_token_tracking'), \
+             patch.object(processing.failover, 'run_probe_targets') as select_probes, \
+             patch.object(processing.failover, 'ensure_fresh_probes') as ensure_probes:
             db.get_episode.return_value = {}
             db.get_podcast_by_slug.return_value = _row(
                 pt=1, skip=1, mode=DETECTION_MODE_KEEP_CONTENT)
@@ -230,6 +270,8 @@ class TestProcessEpisodeModePlumbing:
                 'mode-feed', 'ep1', 'https://example.com/ep1.mp3')
         assert result is True
         pt.assert_called_once()
+        select_probes.assert_not_called()
+        ensure_probes.assert_not_called()
 
     def test_episode_passthrough_flag_routes_to_passthrough_on_standard_feed(self):
         # Issue #746: the per-episode flag must win even though the feed
@@ -268,10 +310,126 @@ class TestProcessEpisodeModePlumbing:
         assert m['detect'].call_args.kwargs['keep_content'] is None
         assert m['verify'].call_args.kwargs['skip_verification'] is False
 
+    def test_transcript_spans_reach_detection_and_validation(self):
+        span = {'start': 10.0, 'end': 40.0, 'words': 80, 'offset_confirmed': False}
+        with patch.object(processing, '_run_transcript_diff',
+                          return_value={'status': 'ok', 'spans': [span]}) as stage:
+            m = _run_pipeline(_row())
+        stage.assert_called_once()
+        assert m['detect'].call_args.kwargs['transcript_spans'] == [span]
+        assert m['refine'].call_args.kwargs['transcript_spans'] == [span]
+
+    def test_unreliable_transcript_diff_passes_no_spans(self):
+        with patch.object(processing, '_run_transcript_diff',
+                          return_value={'status': 'unreliable', 'spans': []}):
+            m = _run_pipeline(_row())
+        assert m['detect'].call_args.kwargs['transcript_spans'] == []
+
+    def test_transcript_fetch_error_does_not_stop_the_run(self):
+        row = dict(_row(), transcript_differential=1)
+        episode = {'upstream_transcript_url': 'https://cdn.example.com/ep1.vtt',
+                   'upstream_transcript_type': 'text/vtt'}
+        with patch.object(processing, 'fetch_upstream_transcript',
+                          side_effect=RuntimeError('upstream down')) as fetch:
+            m = _run_pipeline(row, episode_row=episode)
+        fetch.assert_called_once()
+        assert m['result'] is True
+        assert m['detect'].call_args.kwargs['transcript_spans'] == []
+        m['finalize'].assert_called_once()
+        saved = m['db'].save_episode_upstream_transcript.call_args.args[2]
+        assert saved['status'] == 'error'
+
+    def test_skip_detection_skips_transcript_diff(self):
+        with patch.object(processing, '_run_transcript_diff') as stage:
+            _run_pipeline(_row(skip=1))
+        stage.assert_not_called()
+
+    def test_pre_run_probe_selection_uses_effective_enabled_routes(self):
+        phases = {
+            'detection': {'credential_slot': 'secondary'},
+            'review': {'credential_slot': 'primary'},
+        }
+        snapshot = {
+            'detection': {'credential_slot': 'secondary'},
+            'review': {'credential_slot': 'primary'},
+        }
+        m = _run_pipeline(_row(), route_snapshot=snapshot, probe_phases=phases)
+        m['probe_selector'].assert_called_once_with(phases, whisper_required=True)
+        m['ensure_probes'].assert_called_once_with(['llm:secondary', 'llm:primary'])
+
+    def test_cue_only_skip_transcription_omits_pre_run_probes(self):
+        row = dict(_row(mode=DETECTION_MODE_CUE_ONLY), skip_transcription=1)
+        m = _run_pipeline(row, route_snapshot={}, probe_phases={})
+        m['probe_selector'].assert_called_once_with({}, whisper_required=False)
+        m['ensure_probes'].assert_called_once_with([])
+
+    def test_unresolved_active_phases_use_conservative_route_fallback(self):
+        m = _run_pipeline(_row(), route_snapshot={}, probe_phases=None)
+        m['probe_selector'].assert_called_once_with(None, whisper_required=True)
+        m['ensure_probes'].assert_called_once_with([])
+
+    def test_recut_skips_pre_run_probes(self):
+        with patch.object(processing, 'db') as db, \
+             patch.object(processing, '_recut_episode', return_value=True) as recut, \
+             patch.object(processing, '_resolve_or_load_route_snapshot', return_value={}), \
+             patch.object(processing, '_assert_route_snapshot_current'), \
+             patch.object(processing, 'start_episode_token_tracking'), \
+             patch.object(processing.failover, 'run_probe_targets') as select_probes, \
+             patch.object(processing.failover, 'ensure_fresh_probes') as ensure_probes:
+            db.get_episode.return_value = {'reprocess_mode': 'recut'}
+            result = processing.process_episode(
+                'mode-feed', 'ep1', 'https://example.com/ep1.mp3')
+        assert result is True
+        recut.assert_called_once()
+        select_probes.assert_not_called()
+        ensure_probes.assert_not_called()
+
     def test_records_disabled_normalization_in_run_stats(self):
         m = _run_pipeline(_row())
         assert m['result'] is True
         assert m['finalize'].call_args.kwargs['run_stats']['normalization_skipped'] is True
+
+    def test_failover_recorded_before_approval_recut_success_exit(self):
+        # #806: run_stats['failover'] must be set before _recut_episode is
+        # called, since its success returns before the main finalize call.
+        snapshot = {'detection': {'failover_from': 'primary',
+                                  'provider_key': 'openai-compatible',
+                                  'credential_slot': 'primary'}}
+        m = _run_pipeline(_row(), approval_recut=True,
+                           route_snapshot=snapshot, failover_state={}, standby_dispatch=True)
+        assert m['result'] is True
+        m['finalize'].assert_not_called()
+        assert m['recut'].call_args.kwargs['run_stats']['failover'] == {
+            'llm': ['primary'], 'whisper': False}
+
+    def test_failover_not_reported_when_trigger_predates_run(self):
+        # A slot active before this run started but absent from the frozen
+        # snapshot was never actually routed to by this run.
+        state = {'llm:primary': {'active': True, 'source': 'auto',
+                                 'since': '2000-01-01T00:00:00Z', 'reason': 'x'}}
+        m = _run_pipeline(_row(), route_snapshot={}, failover_state=state)
+        assert m['result'] is True
+        assert 'failover' not in m['finalize'].call_args.kwargs['run_stats']
+
+    def test_failover_reported_when_triggered_mid_run(self):
+        state = {'llm:primary': {'active': True, 'source': 'probe',
+                                 'since': '2999-01-01T00:00:00Z', 'reason': 'x'}}
+        snapshot = {'detection': {'provider_key': 'anthropic', 'credential_slot': 'primary'}}
+        m = _run_pipeline(_row(), route_snapshot=snapshot, failover_state=state, standby_dispatch=True)
+        assert m['result'] is True
+        assert m['finalize'].call_args.kwargs['run_stats']['failover'] == {
+            'llm': ['primary'], 'whisper': False}
+
+    def test_failover_not_reported_for_slot_absent_from_snapshot(self):
+        # #806: a snapshot that only ever routed to primary must not report
+        # secondary, even if secondary's own failover state changed mid-run.
+        snapshot = {'detection': {'provider_key': 'openai-compatible',
+                                  'credential_slot': 'primary'}}
+        state = {'llm:secondary': {'active': True, 'source': 'probe',
+                                   'since': '2999-01-01T00:00:00Z', 'reason': 'x'}}
+        m = _run_pipeline(_row(), route_snapshot=snapshot, failover_state=state)
+        assert m['result'] is True
+        assert 'failover' not in m['finalize'].call_args.kwargs['run_stats']
 
     def test_provider_denial_happens_after_transcription_before_detection(self):
         m = _run_pipeline(
@@ -346,9 +504,9 @@ def _run_transcript(d, keep_content, kc_return):
         blk = stack.enter_context(patch.object(
             d, 'detect_ads', return_value={'ads': [], 'status': 'success'}))
         stack.enter_context(
-            patch('ad_detector.get_llm_timeout', return_value=30))
+            patch('llm_route.llm_client.get_llm_timeout', return_value=30))
         stack.enter_context(
-            patch('ad_detector.get_llm_max_retries', return_value=1))
+            patch('llm_route.llm_client.get_llm_max_retries', return_value=1))
         result = d.process_transcript(
             SEGMENTS, 'Pod', 'Ep', 'slug', 'ep1', keep_content=keep_content)
     return result, kc, blk

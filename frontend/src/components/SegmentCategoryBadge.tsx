@@ -26,15 +26,19 @@ export function SegmentCategoryBadge({ category }: { category?: string | null })
   );
 }
 
-// Muted marker for a marker whose segment-category action resolved to
-// "keep": the audio was left in on purpose, not cut by mistake.
-export function KeptBadge() {
+// Muted marker for a "keep" or "mark" marker: left in on purpose, not cut by
+// mistake; mark also publishes a skippable chapter. Takes the raw
+// actionApplied and derives the label, rather than asking callers to narrow it.
+export function KeptBadge({ actionApplied }: { actionApplied?: string | null }) {
+  const marked = actionApplied === 'mark';
   return (
     <span
       className={`${badgeBase} font-medium ${tint.neutral}`}
-      title="This segment's category is set to Keep, so it was left in the audio"
+      title={marked
+        ? "This segment's category is set to Mark, so it was left in the audio and published as a chapter"
+        : "This segment's category is set to Keep, so it was left in the audio"}
     >
-      Kept
+      {marked ? 'Marked' : 'Kept'}
     </span>
   );
 }

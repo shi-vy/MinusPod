@@ -6,9 +6,10 @@ from itertools import combinations
 
 from config import (
     MIN_AD_DURATION, SEGMENT_CATEGORIES,
-    count_pending_review, is_pending_review, resolve_max_ad_duration_confirmed,
+    count_pending_review, is_keep_like, is_pending_review, resolve_max_ad_duration_confirmed,
     resolve_max_boundary_shift,
-    HOLD_REASON_DIFFERENTIAL_UNCORROBORATED,
+    SNIPPET_EXCLUDED_HOLD_REASONS, SNIPPET_EXCLUDED_SQL, SNIPPET_EXCLUDED_SQL_PARAMS,
+    SNIPPET_EXCLUDED_STAGE_REASONS,
 )
 from utils.markers import clip_merge_spans, find_marker_in_list, parse_ad_markers
 from utils.time import utc_now_iso, utc_now, parse_iso_datetime
@@ -73,6 +74,7 @@ def list_patterns():
         # Matcher-only join columns; the list response does not carry them.
         pattern.pop('sponsor_tags', None)
         pattern.pop('sponsor_active', None)
+        pattern['is_active'] = bool(pattern.get('is_active'))
         pattern['trust'] = compute_pattern_trust(pattern, now)
         pattern['can_split'] = can_split_pattern(pattern)
 
@@ -353,6 +355,7 @@ def get_pattern(pattern_id):
     if not pattern:
         return error_response('Pattern not found', 404)
 
+    pattern['is_active'] = bool(pattern.get('is_active'))
     return json_response(pattern)
 
 
@@ -1231,7 +1234,7 @@ def _handle_reject_correction(db, slug, episode_id, original_ad):
 
     # Resolve the matched held marker's hold_reason server-side, before
     # _clear_held_marker_on_reject pops it below -- the client payload
-    # carries no hold_reason of its own. A differential-uncorroborated hold
+    # carries no hold_reason of its own. A cross-fetch or transcript-gap hold
     # (by hold_reason or detection_stage) was only ever a hold candidate,
     # never a confirmed false positive of a real detector, so its text must
     # not seed cross-episode FP matching on other episodes.
@@ -1244,19 +1247,14 @@ def _handle_reject_correction(db, slug, episode_id, original_ad):
                 break
 
     source_hold_reason = None
-    is_differential_hold = False
     if matched_marker is not None:
-        marker_hold_reason = matched_marker.get('hold_reason')
-        is_differential_hold = (
-            marker_hold_reason == HOLD_REASON_DIFFERENTIAL_UNCORROBORATED
-            or matched_marker.get('detection_stage') == 'dai_differential'
-        )
-        source_hold_reason = (
-            HOLD_REASON_DIFFERENTIAL_UNCORROBORATED if is_differential_hold
-            else marker_hold_reason
-        )
+        source_hold_reason = matched_marker.get('hold_reason')
+        if source_hold_reason not in SNIPPET_EXCLUDED_HOLD_REASONS:
+            source_hold_reason = SNIPPET_EXCLUDED_STAGE_REASONS.get(
+                matched_marker.get('detection_stage'), source_hold_reason)
 
-    text_snippet = None if is_differential_hold else rejected_text
+    text_snippet = (None if source_hold_reason in SNIPPET_EXCLUDED_HOLD_REASONS
+                    else rejected_text)
 
     if pattern_id:
         pattern = db.get_ad_pattern_by_id(pattern_id)
@@ -1592,17 +1590,15 @@ def submit_correction(slug, episode_id):
     except (TypeError, ValueError):
         return error_response('Original ad boundaries must be numbers', 400)
 
-    # A keep-resolved marker is left in on purpose by the feed's category
-    # action, so confirm/reject/adjust would record a decision the cut can
-    # never honor. Recategorizing changes that verdict, so it is exempt. The
-    # match ignores pending-review state: a keep-resolved marker clears its
-    # hold, so a pending-review-scoped lookup would miss it.
+    # A keep/mark marker is left in on purpose, so confirm/reject/adjust would
+    # record a decision the cut can never honor (recategorize is exempt).
+    # Unscoped by pending-review: a keep/mark marker clears its hold.
     current_markers = _load_markers(db, slug, episode_id)
     target_marker = find_marker_in_list(
         current_markers, original_start, original_end, 0.5)
     if (correction_type != 'recategorize'
             and target_marker is not None
-            and target_marker.get('action_applied') == 'keep'):
+            and is_keep_like(target_marker.get('action_applied'))):
         return error_response(
             'This segment is kept for this feed. Change its category to correct it.',
             409
@@ -1686,7 +1682,7 @@ def export_patterns():
             'sponsor': pattern.get('sponsor'),
             'confirmation_count': pattern.get('confirmation_count', 0),
             'false_positive_count': pattern.get('false_positive_count', 0),
-            'is_active': pattern.get('is_active', True),
+            'is_active': bool(pattern.get('is_active', True)),
             'created_at': pattern.get('created_at'),
         }
         # Unset stays absent (issue #565). An explicit null re-imports as a
@@ -1927,7 +1923,7 @@ def backfill_false_positive_texts():
     conn = db.get_connection()
 
     # Get corrections without text
-    cursor = conn.execute('''
+    cursor = conn.execute(f'''
         SELECT pc.id, pc.episode_id, pc.original_bounds, p.slug
         FROM pattern_corrections pc
         JOIN episodes e ON pc.podcast_id = e.podcast_id
@@ -1935,8 +1931,8 @@ def backfill_false_positive_texts():
         JOIN podcasts p ON e.podcast_id = p.id
         WHERE pc.correction_type = 'false_positive'
         AND (pc.text_snippet IS NULL OR pc.text_snippet = '')
-        AND (pc.source_hold_reason IS NULL OR pc.source_hold_reason != 'differential_uncorroborated')
-    ''')
+        AND {SNIPPET_EXCLUDED_SQL}
+    ''', SNIPPET_EXCLUDED_SQL_PARAMS)  # noqa: S608 (SNIPPET_EXCLUDED_SQL is a fixed placeholder fragment)
 
     rows = cursor.fetchall()
     logger.info(f"Found {len(rows)} false positive corrections to backfill")

@@ -15,6 +15,8 @@
 - [Waveform Ad Editor](#waveform-ad-editor)
 - [Adding a New Ad](#adding-a-new-ad)
 - [Ad Review tab](#ad-review-tab)
+- [Cleanup tab](#cleanup-tab)
+- [OPML export](#opml-export)
 - [Audio Cue Templates](#audio-cue-templates)
 - [Held for Review](#held-for-review)
 - [Partial Detection](#partial-detection)
@@ -24,7 +26,7 @@
 
 ## Overview
 
-The server includes a web-based management UI at `/ui/`:
+The server includes a web-based management UI at `/ui/`. Opening the server root redirects there:
 
 - Dashboard with feed artwork and episode counts
 - Add feeds by RSS URL with optional episode cap
@@ -34,11 +36,13 @@ The server includes a web-based management UI at `/ui/`:
 - Per-feed max ad duration cap: ads longer than the cap are held for review instead of cut (empty = no cap; applies on the next reprocess)
 - Per-feed opening window exclusion: ad markers that begin inside the first N seconds of an episode are ignored, so an intro cue is not cut as an ad (empty = inherit the global setting, 0 = off, 1 to 600 s = this feed's window; applies on the next reprocess)
 - Per-feed cue-gated approval: only ads with audio-cue evidence auto-cut; others are held for review (requires cue templates)
+- Per-feed Transcript diff select (Inherit / On / Off) under Feed Settings > Advanced, next to Cross-fetch diff: overrides the global "Compare with the publisher transcript" default for that feed. Hidden on local feeds. See [Upstream Transcript Differential](transcript-differential.md)
 - Per-feed processing mode: one select with five presets: standard (detect and cut ads, the default), keep content only (experimental; marks show content and removes everything else, see [How It Works](how-it-works.md)), skip ad detection (still transcribes and builds chapters, but nothing is scanned or cut; for ad-free shows), pass-through (relays episodes with no transcription or ad removal, though audio may be transcoded for serving), or cue-only (experimental; cuts from cue pairs and previously learned ad patterns, no LLM call; needs one enabled ad-break-start and one enabled ad-break-end template, and exposes a per-feed safety policy and a skip-transcription toggle, see [Audio Cue Detection > Cue-only preset](audio-cues.md#cue-only-preset))
 - Feed detail page groups its controls into collapsible sections so the page stays scannable. Inside Feed Settings, everyday controls (network, source feed, auto-process, title blacklist, processing mode, queue priority, retention, original audio, language, hide unprocessed, tags) sit at the top; Segment actions, Cue tuning, and the rarely-changed Advanced controls each fold into their own card
 - Per-feed episode title blacklist: glob patterns that skip queuing and just-in-time processing for matching titles. See [Configuration > Title blacklist](configuration.md#title-blacklist)
 - Per-feed queue priority (High / Normal / Low) with automatic boosts. See [Configuration > Queue priority](configuration.md#queue-priority)
-- Segment actions card on the feed settings page, with a matching global card in Settings. See [How It Works > Segment Categories](how-it-works.md#segment-categories)
+- Segment actions card on the feed settings page, with a matching global card in Settings: a four-option toggle per category (Remove, Beep, Keep, or Mark). Mark keeps the audio and publishes the segment as a chapter; see [How It Works > Segment Categories](how-it-works.md#segment-categories)
+- Ad chapters block (Settings > Transcripts & Chapters): chapter and resume titles, minimum confidence, and include-held, with a helper line linking back to Segment actions, where setting a category to Mark is what chapters it. See [Podcasting 2.0 > Ad chapters](podcasting-2.0.md#ad-chapters)
 - Per-feed retention override: inherit the global window, keep for N days, or archive. See [Configuration > Per-feed retention](configuration.md#per-feed-retention)
 - Per-feed original audio override on the same page: inherit the global "Keep original audio" setting, or force it on or off for one feed. Discarding the uncut copy roughly halves what the feed stores and takes effect on the next episode processed
 - Per-feed stat cards above Feed Settings: episode counts by status (colored to match the status badges) plus totals for episodes processed, ads removed, time saved, and LLM cost
@@ -52,6 +56,7 @@ The server includes a web-based management UI at `/ui/`:
 - Pattern management: view and manage cross-episode ad patterns with sponsor names; the detail modal edits a pattern's sponsor, text template, active state, and segment category; includes an Ad Review tab for triaging detections across all podcasts
 - Review decisions are recorded as you make them, then applied together. The Ad Review and Detected Ads pages show an Apply recuts button that recuts each waiting episode once, however many decisions it collected. A feed's own page has the same button for just that feed's episodes
 - Segment category is editable in place: on an Ad Review or Detected Ads row, in the Detected ad window, and per pattern in the Ad Patterns table. It is what decides whether a span is cut, beeped, or left in
+- Episode page marker badges: a segment left in by Keep shows "Kept"; one left in by Mark shows "Marked" instead, in the header and in the kept-segments list
 - Sponsor management: view, add, edit, and remove sponsors, each with its linked-pattern count, created and last-matched dates, and tags
 - Processing history with stats, filtering by podcast, and CSV/JSON export; failed runs show their error reason under the episode title, with the full text on hover
 - Stats dashboard with charts: avg/min/max metrics, top podcasts by ads, episodes by day, token usage, sortable podcast table, and an addressing-modes card comparing contract compliance and ad yield per mode (see [Configuration > Ad Addressing Mode](configuration.md#ad-addressing-mode))
@@ -63,7 +68,10 @@ The server includes a web-based management UI at `/ui/`:
 - Rate-limit hold (Queue > Queue Control): optionally pause the queue while the LLM provider reports a 429 with a reset time, instead of failing episodes
 - Queue page: active jobs show progress and cancellation controls. The full waiting list is paginated, and each row has links and -/+ buttons that can raise or lower its priority. A row the scheduler will not admit yet says why, naming the blocked phase, the account slot, the reason, and when the block lifts
 - Provider account switch (Settings > LLM Provider): changing a slot's endpoint or provider type lists the runs still bound to the current account before you save, and asks whether to requeue them on the new account (the default) or cancel them, so in-flight work is never moved silently
-- Status bar showing processing progress across all pages through 2-second polling, with failure backoff up to 30 seconds. It also appears when the queue holds work with nothing running. The message names the provider reset time for a rate-limit pause or the unavailable service for an offline wait
+- Failover (Settings > AI & Processing): a standby LLM provider and transcriber that take over when Provider A, Provider B, or the active transcriber goes unreachable; status strip per target, health-probe policy, and manual Trigger/Cancel/Probe now controls. See [Failover](failover.md)
+- Pattern Cleanup (Settings > Experiments): scheduled LLM review of learned patterns, suggesting trims, splits, sponsor renames, and retirements; reviewed on the Patterns page's Cleanup tab. Experimental, off by default. See [Pattern Cleanup](pattern-cleanup.md)
+- Status bar showing processing progress across all pages through 2-second polling, with failure backoff up to 30 seconds. It also appears when the queue holds work with nothing running, including while any target is on failover. The message names the provider reset time for a rate-limit pause, the unavailable service for an offline wait, or the targets currently on failover
+- System health panel: a Failover row turns warning while any target is on its failover configuration, alongside the existing Transcriber, Podping, and Feed refresh rows
 - Outbound Requests (Settings > Data & Security): the User-Agent MinusPod sends when it fetches feeds, audio, and artwork, editable per string with a Reset back to the default, plus a toggle for whether download logs include URL query strings
 - OPML export with original or ad-free (modified) feed URLs
 - Optional cover-art badge that marks the filtered feed (Settings > Cover Art), with a Refresh all artwork button
@@ -78,13 +86,29 @@ The server includes a web-based management UI at `/ui/`:
 
 ### Dashboard views
 
-The dashboard toolbar has a Podcasts / Episodes switch. Podcasts is the original view, one card or row per show, and it keeps the grid and list layouts and the sort control. Episodes reorganizes the same dashboard around recent work instead: one section per podcast, each with its cover, its title, its total episode count, a "View all episodes" link, and that show's newest episodes underneath.
+The dashboard toolbar has a Podcasts / Episodes switch. On mobile, an icon menu holds both choices to leave room for the other controls. Podcasts is the original view, one card or row per show, and it keeps the grid and list layouts and the sort control. Episodes reorganizes the same dashboard around recent work instead: one section per podcast, each with its cover, its title, its total episode count, a "View all episodes" link, and that show's newest episodes underneath.
 
 The View menu sets how many episodes each podcast section shows, from 1 to 10, defaulting to 3. Both the chosen view and the chosen count are remembered in the browser, so the dashboard opens the way you left it.
 
-Episode rows in this view are the same rows the feed page renders, with the same status badge, hold chip, pass-through indicator, and per-row action button, so nothing is lost by staying on the dashboard. The Recents feed is left out of the grouped view: its episodes belong to the shows they came from, so it would always render empty.
+Episode rows show the same status badge, hold chip, and pass-through indicator as the feed page. Each dashboard row adds an Actions menu with Process or Reprocess and Full Analysis. For processed episodes that are not busy, Delete removes downloaded audio and resets the episode to Discovered while preserving its record and processing history. Original audio uploaded to local feeds is kept. The Recents feed is left out of the grouped view: its episodes belong to the shows they came from, so it would always render empty.
 
 One request loads the episode groups rather than one request per show, and the dashboard asks for one page of feeds at a time rather than the whole subscription list. Sorting happens on the server before the page is cut, so a page is a slice of the sorted list rather than a sorted slice; changing the sort returns you to page one. Only the active view is fetched: the Podcasts grid never pays for the episode projection, and the Episodes view never fetches a second bare feed list. Screens that need every feed, such as the podcast pickers on Stats, History and Patterns, keep their own unpaginated request.
+
+### OPML export
+
+Use **Export OPML** on the dashboard to download all or selected subscriptions
+with MinusPod's ad-free feed URLs. The picker starts with every feed selected;
+use Select all or individual checkboxes to change the selection. Exports use
+custom feed names when set. If the feed list cannot load, Retry fetches it again.
+
+Settings > Data Management also offers full exports with either original or
+modified URLs. Original URLs point at the publishers; modified URLs point at
+MinusPod and include the feed key when authenticated feeds are enabled.
+
+API clients can use `GET /api/v1/feeds/export-opml?mode=modified` for all feeds,
+or `POST` to the same URL with `{"slugs":["example-podcast"]}` for a selection.
+The POST form avoids URL-length limits for large selections. See
+[API & Webhooks](api-and-webhooks.md#api).
 
 ### Episode actions and job state
 
@@ -160,15 +184,15 @@ If the detector missed one, click `+ Add new ad` from the episode page header or
 The modal has two input modes, toggled by a tab strip at the top:
 
 - **By audio** (default): enter start and end timestamps or drag the pins on the waveform. The text template auto-populates from the transcript span between your bounds.
-- **By text**: the original transcript renders with word-level Whisper timestamps. Select a span of text in the browser; the resolved word boundaries populate the start/end timestamps and the template. A search box with `N of M` navigation jumps between matches. The selected text stays highlighted on mobile too, so the selection is visible after the keyboard closes.
+- **By text**: the original transcript renders with word-level Whisper timestamps. Select a span of text in the browser; the resolved word boundaries populate the start/end timestamps and the template. A search box with `N of M` navigation jumps between matches. The selected text stays highlighted on mobile too, so the selection is visible after the keyboard closes. **Add another span** freezes the current selection as a chip with its time range and a remove control, and clears the selection so you can mark a second run elsewhere in the transcript; spans that overlap or sit within a second of each other merge when frozen.
 
-Switching tabs preserves your selection, so you can refine bounds in either view. Pick a sponsor from the autocomplete or type a new one. A Category select classifies the span (sponsor, cross-promo, self-promo, and the rest); the chosen category is stamped on both the manual marker and the pattern created from it, and each feed's segment actions decide what happens to future matches. Left as Uncategorized, the pattern resolves as Sponsor. The optional Reason field is available in both modes.
+Switching tabs preserves your selection, so you can refine bounds in either view. Pick a sponsor from the autocomplete or type a new one. A Category select classifies the span (sponsor, cross-promo, self-promo, and the rest); the chosen category is stamped on both the manual marker and the pattern created from it, and each feed's segment actions decide what happens to future matches. Left as Uncategorized, the pattern resolves as Sponsor. The optional Reason field is available in both modes, shared across every span in a multi-span submission.
 
-Submitting creates a new pattern with `created_by='user'` and writes a `'create'` correction so the pattern matcher picks it up on future episodes. The Patterns page tags manually created patterns with a `Manual` badge and adds an Origin filter (All / Auto / Manual).
+With one span, saving creates a new pattern with `created_by='user'` and writes a `'create'` correction so the pattern matcher picks it up on future episodes. With more than one selected span, each uses its selected transcript text instead of a shared editable template. The button reads "Mark ad (N spans)": each span needs at least 50 characters of transcript, checked before submission, and submits as its own `'create'` correction, one after another in time order. If one fails partway through, submission stops; the modal stays open and lists which spans saved and which failed, so you can retry just the rest. Saved spans stay recorded while you adjust unsaved selections. Sponsor, category, reason, and scope stay fixed after the first successful save. Selections and shared fields are disabled while saving. The Patterns page tags manually created patterns with a `Manual` badge and adds an Origin filter (All / Auto / Manual).
 
 ### Ad Review tab
 
-The Patterns page has two tabs: Patterns and Ad Review. The Ad Review tab lists ad detections across all your podcasts so you can triage them without opening each episode.
+The Patterns page has four tabs: Patterns, Detected Ads, Ad Review, and Cleanup. See [Pattern Cleanup](pattern-cleanup.md) for reviewing suggested pattern edits. The Ad Review tab lists ad detections across all your podcasts so you can triage them without opening each episode.
 
 Each row covers one detected segment: podcast name, episode title (linked to the episode page), publish date, start/end timestamps and duration, sponsor name, confidence score, detection stage, status, and resolution.
 
@@ -210,6 +234,23 @@ Confirm ad and Not an ad only appear for a detection still awaiting a decision, 
 
 Corrections go through the same per-episode corrections endpoint used on the episode page, so approve and dismiss decisions feed pattern learning the same way.
 
+### Cleanup tab
+
+The Patterns page's Cleanup tab lists suggestions from the Pattern Cleanup experiment (Settings > Experiments > Pattern Cleanup). A badge on the tab shows the pending count. Filter by kind (Trim, Split, Rename, Retire, Flag) and status (Pending, Approved, Rejected, Undone).
+
+Each card shows the sponsor, scope, podcast, confidence, and reasons. Expand
+Original pattern text to check any suggestion against its source. Source
+context is also available when the original transcript was retained. Trims
+show removed text beside the retained copy; a combined trim and rename shows
+both changes. Split cards show the proposed pieces, while retirement and
+false-positive flags show the relevant statistics.
+
+Approve or Reject a pending suggestion, or Undo an approved one. Load older
+suggestions reaches earlier decisions. Select all and bulk actions apply to
+the loaded pending rows. On mobile, a dropdown replaces the kind filter chips
+to keep the toolbar within the screen. See [Pattern Cleanup](pattern-cleanup.md)
+for validation rules, undo conflicts, and force recheck behavior.
+
 ### Audio Cue Templates
 
 If a show plays a recurring ding or stinger around its ad breaks, you can teach MinusPod that exact sound and have it snap cuts to the chime. Marking a cue, the find-audio-cues scan, the cross-episode scan, the window optimizer, cue types, and cue management are all covered in [Audio Cue Detection](audio-cues.md). Each template row shows its last match date and, once it has matched before but produced no above-threshold matches in the feed's last 5 episodes, an amber "quiet" badge, so a publisher swapping their stinger shows up before a cue-only feed silently stops cutting ads.
@@ -224,6 +265,8 @@ When a feed has a max ad duration cap or cue-gated approval on, ads that cannot 
 When the original audio is retained, a pencil button next to the play button opens the ad in the waveform editor, where you can drag the boundaries before confirming; confirming with moved boundaries cuts only the span inside the pins. If the hold came from the ad reviewer proposing a boundary past the detected span, confirming at that position is accepted too, not just a narrower one.
 
 The episode list shows an amber "N held" chip for any episode with pending held ads. See [Held for Review](how-it-works.md#held-for-review) for what triggers a hold.
+
+A gap the upstream transcript differential found but no other stage backed carries an "Upstream transcript omits this span" chip; an ad another stage found that the differential corroborates instead shows a "Corroborated: transcript" badge. When the stage ran on an episode, its header shows a "Transcript diff: N gaps" pill (or "no gaps", "unreliable", "empty", or "failed"), hovering it for the match percentage. See [Transcript Differential](how-it-works.md#transcript-differential).
 
 ### Partial Detection
 

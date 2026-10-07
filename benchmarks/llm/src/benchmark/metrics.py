@@ -20,6 +20,8 @@ EXACT_METHOD_SCORES: dict[str, float] = {
     # as the cleanest timestamp-mode parse rather than re-parsing the text
     # a second time just to recover that detail.
     "segment_id_direct": 1.0,
+    # The segmentation prompt asks for an object, so the object is full compliance.
+    "segmentation_object_direct": 1.0,
 }
 
 PREFIX_METHOD_SCORES: tuple[tuple[str, float], ...] = (

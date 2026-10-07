@@ -176,6 +176,46 @@ def test_run_unknown_episode_filter_exits_2(tmp_path, monkeypatch, write_corpus_
     assert "ep-bogus" in result.output
 
 
+def test_run_episode_filter_keeps_other_episodes_in_regenerated_report(
+    tmp_path, monkeypatch, write_corpus_episode, pricing_snapshot,
+):
+    """A filtered `run` must only narrow which calls execute, not the corpus
+    the end-of-run report is regenerated from: ep-b's prior-run row must
+    survive a run filtered to ep-a alone."""
+    monkeypatch.setattr(cli, "_root", lambda: tmp_path)
+    monkeypatch.setattr(cli.pricing, "latest_snapshot", lambda _dir: pricing_snapshot)
+    cli_runner = CliRunner()
+    cfg_path = write_minimal_config(tmp_path)
+    corpus_dir = tmp_path / "data" / "corpus"
+    write_corpus_episode(corpus_dir, "ep-a")
+    write_corpus_episode(corpus_dir, "ep-b")
+
+    paths = runner.RunPaths.for_root(tmp_path / "results")
+    append_jsonl(paths.calls_jsonl, {
+        **CALL_TEMPLATE, "call_id": "cb1", "episode_id": "ep-b",
+        "addressing_mode": "timestamps", "prompt_variant": "detection",
+        "parsed_ads": [{"start": 0.0, "end": 30.0}],
+    })
+
+    async def fake_call(**kwargs):
+        return LLMResponse(
+            text='[{"start_time": 0.0, "end_time": 30.0}]',
+            input_tokens=100, output_tokens=10,
+            json_format_used="native", underlying_provider="openrouter", stop_reason="stop",
+        )
+
+    monkeypatch.setattr(cli.runner_mod.llm, "call_with_retry", fake_call)
+
+    result = cli_runner.invoke(
+        cli.app, ["run", "--config", str(cfg_path), "--episode", "ep-a"],
+    )
+    assert result.exit_code == 0, result.output
+
+    report_text = (tmp_path / "results" / "report.md").read_text()
+    assert "ep-a" in report_text
+    assert "ep-b" in report_text
+
+
 # --- CLI: segmentation + --snapshot rejected ---------------------------------
 
 def test_run_segmentation_with_snapshot_exits_2(tmp_path, monkeypatch, write_corpus_episode):

@@ -61,6 +61,29 @@ def test_inserts_prompt_variant_after_addressing_mode(tmp_path):
         assert keys.index("prompt_variant") == keys.index("addressing_mode") + 1
 
 
+def test_existing_prompt_variant_is_overwritten_by_stamp(tmp_path):
+    src = tmp_path / "src_raw"
+    _write_jsonl(src / "calls.jsonl", [
+        {
+            "schema_version": 2, "call_id": "m1_ep1_t0_w0_abc", "model": "deepseek/deepseek-v4-flash",
+            "addressing_mode": "segment_ids", "prompt_variant": "detection", "prompt_hash": "sha256:abc",
+        },
+    ])
+    _write_jsonl(src / "responses" / "deepseek_deepseek-v4-flash.jsonl", [
+        {"call_id": "m1_ep1_t0_w0_abc", "body": "[]"},
+    ])
+    dest = tmp_path / "dest_raw"
+
+    rows_added, _ = import_calls.import_calls(src, "segmentation", dest_raw=dest)
+    assert rows_added == 1
+
+    row = json.loads((dest / "calls.jsonl").read_text().splitlines()[0])
+    keys = list(row.keys())
+    assert row["prompt_variant"] == "segmentation"
+    assert keys.count("prompt_variant") == 1
+    assert keys.index("prompt_variant") == keys.index("addressing_mode") + 1
+
+
 def test_import_is_idempotent(tmp_path):
     src = _make_source(tmp_path)
     dest = tmp_path / "dest_raw"

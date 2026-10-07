@@ -222,6 +222,7 @@ async def run(
     include_errored: bool = False,
     addressing_mode: str = "timestamps",
     prompt_variant: str = "detection",
+    all_episodes: list[Episode] | None = None,
 ) -> RunStats:
     prompt_hashes = precompute_prompt_hashes(
         cfg, episodes, system_prompt=system_prompt, addressing_mode=addressing_mode, prompt_variant=prompt_variant,
@@ -374,7 +375,9 @@ async def run(
 
     await asyncio.gather(*(execute(u) for u in units), return_exceptions=False)
 
-    derive_episode_results(cfg, episodes, paths=paths)
+    # A --model/--episode-filtered run still derives episode_results.jsonl from the
+    # full corpus, so episodes outside this run's filter aren't dropped from it.
+    derive_episode_results(cfg, all_episodes if all_episodes is not None else episodes, paths=paths)
     return stats
 
 

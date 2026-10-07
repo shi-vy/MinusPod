@@ -245,13 +245,19 @@ def run(
         typer.echo("no corpus episodes; run `benchmark capture` first", err=True)
         raise typer.Exit(1)
 
+    # --model/--episode narrow only the work list the runner executes; cfg and
+    # episodes stay the full corpus so the report render and derive_episode_results
+    # below don't drop other episodes or lose track of deprecated models.
+    run_cfg = cfg
+    run_episodes = episodes
+
     if model:
         model_set = _require_known(model, {m.id for m in cfg.models}, "--model")
-        cfg = dataclasses.replace(cfg, models=[m for m in cfg.models if m.id in model_set])
+        run_cfg = dataclasses.replace(cfg, models=[m for m in cfg.models if m.id in model_set])
 
     if episode:
         episode_set = _require_known(episode, {e.ep_id for e in episodes}, "--episode")
-        episodes = [e for e in episodes if e.ep_id in episode_set]
+        run_episodes = [e for e in episodes if e.ep_id in episode_set]
 
     paths = runner_mod.RunPaths.for_root(_root() / "results")
     snapshots_dir = _root() / "data" / "pricing_snapshots"
@@ -266,15 +272,16 @@ def run(
 
     if dry_run:
         units, skipped = _preview(
-            cfg, episodes, paths=paths, system_prompt=system_prompt,
+            run_cfg, run_episodes, paths=paths, system_prompt=system_prompt,
             include_errored=retry_errors, addressing_mode=addressing_mode, prompt_variant=prompt_variant,
         )
         typer.echo(f"dry-run: {len(units)} calls would execute, {skipped} skipped (already done)")
         raise typer.Exit(0)
 
     stats = asyncio.run(runner_mod.run(
-        cfg, episodes, paths=paths, pricing_snapshot=snap, system_prompt=system_prompt,
+        run_cfg, run_episodes, paths=paths, pricing_snapshot=snap, system_prompt=system_prompt,
         include_errored=retry_errors, addressing_mode=addressing_mode, prompt_variant=prompt_variant,
+        all_episodes=episodes,
     ))
     typer.echo(f"run complete: total={stats.total_units} skipped={stats.skipped} completed={stats.completed} errored={stats.errored}")
 

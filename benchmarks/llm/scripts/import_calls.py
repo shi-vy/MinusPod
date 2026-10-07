@@ -21,6 +21,8 @@ def _load_call_ids(path: Path) -> set[str]:
 def _insert_prompt_variant(row: dict, variant: str) -> dict:
     out = {}
     for key, value in row.items():
+        if key == "prompt_variant":
+            continue  # the stamped value below always wins over a source row's own
         out[key] = value
         if key == "addressing_mode":
             out["prompt_variant"] = variant

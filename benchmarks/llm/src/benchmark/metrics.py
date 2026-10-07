@@ -22,6 +22,9 @@ EXACT_METHOD_SCORES: dict[str, float] = {
     "segment_id_direct": 1.0,
     # The segmentation prompt asks for an object, so the object is full compliance.
     "segmentation_object_direct": 1.0,
+    # A bare array where the segmentation prompt mandates an object; mirrors
+    # how detection scores an object wrapper around its requested array.
+    "segmentation_array_wrapper": 0.85,
 }
 
 PREFIX_METHOD_SCORES: tuple[tuple[str, float], ...] = (

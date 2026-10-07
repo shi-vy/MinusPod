@@ -1,8 +1,11 @@
 """Cross-cell comparison: prompt variant x addressing mode, side by side.
 
 One row per model across the four cells, reusing each per-cell report's own
-aggregation so the numbers match; delta/p-value pair segmentation/segment_ids
-against detection/timestamps on the episodes a model scored in both.
+aggregation; delta/p-value pair segmentation/segment_ids against
+detection/timestamps on the episodes a model scored in both. Most columns
+match the corresponding per-cell report exactly, but cost/ep here is always
+divided by this cell's own episode count, while the per-cell report's
+"Cost / episode" column prints the corpus-wide total cost unchanged.
 """
 from __future__ import annotations
 
@@ -90,7 +93,10 @@ def render(
         "omitted. The delta and p-value columns compare segmentation/segment_ids "
         "against detection/timestamps, paired on the episodes each model has "
         "scored in both of those two cells (not the full episode set in either "
-        "cell's own columns).",
+        "cell's own columns). One exception: each cell's `cost/ep` here is this "
+        "cell's total cost divided by this cell's own episode count, while the "
+        "per-cell report's 'Cost / episode' column prints the corpus-wide total "
+        "cost unchanged, so the two are not directly comparable.",
         "",
     ]
 

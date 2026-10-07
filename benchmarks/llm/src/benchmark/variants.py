@@ -129,10 +129,12 @@ def _to_int_or_none(value) -> int | None:
 
 
 def _normalize_direct_method(method: str | None) -> str | None:
-    """A raw JSON-wrapping method that carries ads collapses to the one
-    compliance label the segmentation prompt's object shape earns."""
-    if method in ("json_object_segments_key", "json_array_direct"):
+    """The segmentation prompt mandates an object: an object wrapper is full
+    compliance, a bare array is the mismatched wrapper and scores lower."""
+    if method == "json_object_segments_key":
         return "segmentation_object_direct"
+    if method == "json_array_direct":
+        return "segmentation_array_wrapper"
     return method
 
 
@@ -149,8 +151,14 @@ def parse_segmentation_response(
     ]
     if not kept:
         # A valid all-main_content answer: no promo entries to judge the id
-        # contract against, so score it as full compliance for the mode in use.
-        no_promo_method = "segment_id_direct" if addressing_mode == "segment_ids" else "segmentation_object_direct"
+        # contract against, so score the route the JSON actually took rather
+        # than a fixed full-compliance label.
+        if addressing_mode == "segment_ids":
+            no_promo_method = (
+                "segment_id_direct" if method in ("json_object_segments_key", "json_array_direct") else method
+            )
+        else:
+            no_promo_method = _normalize_direct_method(method)
         return [], no_promo_method, False
 
     if addressing_mode == "segment_ids":

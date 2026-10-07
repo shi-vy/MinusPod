@@ -126,6 +126,33 @@ def test_compare_cost_per_episode_is_divided_by_cell_episode_count(
     assert detection_cost == segmentation_cost == "$0.0045"
 
 
+def test_compare_header_notes_cost_per_episode_divergence_from_per_cell_report(
+    tmp_path, minimal_cfg, pricing_snapshot, write_corpus_episode,
+):
+    ep_dir = write_corpus_episode(tmp_path / "corpus", segments=SEGMENTS)
+    ep = corpus.load_episode(ep_dir)
+    calls_path = tmp_path / "calls.jsonl"
+    append_jsonl(calls_path, {
+        **CALL_TEMPLATE, "call_id": "c1", "episode_id": ep.ep_id,
+        "prompt_variant": "detection", "addressing_mode": "timestamps",
+        "parsed_ads": [{"start_time": 0.0, "end_time": 30.0}],
+    })
+    append_jsonl(calls_path, {
+        **CALL_TEMPLATE, "call_id": "c2", "episode_id": ep.ep_id,
+        "prompt_variant": "segmentation", "addressing_mode": "segment_ids",
+        "parsed_ads": [{"start": 0.0, "end": 30.0}],
+    })
+
+    out = tmp_path / "comparison.md"
+    compare_mod.render(
+        cfg=minimal_cfg, episodes=[ep], calls_path=calls_path,
+        pricing_snapshot=pricing_snapshot, output_path=out,
+    )
+    text = out.read_text()
+    assert "corpus-wide total" in text
+    assert "not directly comparable" in text
+
+
 def test_compare_excludes_deprecated_models(
     tmp_path, minimal_cfg, pricing_snapshot, write_corpus_episode,
 ):

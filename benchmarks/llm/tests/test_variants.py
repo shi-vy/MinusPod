@@ -89,6 +89,26 @@ def test_timestamps_mode_header_says_timestamps():
     assert "Transcript with timestamps:" in prompt
 
 
+# --- _normalize_direct_method: object vs. bare-array wrapper ----------------
+
+def test_normalize_direct_method_object_wrapper_is_full_compliance():
+    assert variants._normalize_direct_method("json_object_segments_key") == "segmentation_object_direct"
+
+
+def test_normalize_direct_method_bare_array_is_mismatched_wrapper():
+    assert variants._normalize_direct_method("json_array_direct") == "segmentation_array_wrapper"
+
+
+def test_bare_array_response_with_promo_scores_segmentation_array_wrapper():
+    response = '[{"start": 10.0, "end": 40.0, "category": "sponsor"}]'
+    ads, method, id_contract_miss = variants.parse_segmentation_response(
+        response, "timestamps", None,
+    )
+    assert method == "segmentation_array_wrapper"
+    assert len(ads) == 1
+    assert id_contract_miss is False
+
+
 # --- parse_segmentation_response: segment-id mode ----------------------------
 
 def test_id_mode_resolves_only_the_sponsor_segment_to_exact_seconds():
@@ -200,6 +220,28 @@ def test_id_mode_mixed_int_and_float_entries_logs_and_drops_float(caplog):
     assert len(ads) == 1
     assert "mixed formats" in caplog.text
     assert "skipped 1" in caplog.text
+
+
+# --- no-promo responses: real extraction route is kept, not a fixed label --
+
+def test_no_promo_response_via_markdown_block_keeps_markdown_code_block_method_timestamps():
+    response = '```json\n[{"start": 0.0, "end": 100.0, "category": "main_content"}]\n```'
+    ads, method, id_contract_miss = variants.parse_segmentation_response(
+        response, "timestamps", None,
+    )
+    assert ads == []
+    assert method == "markdown_code_block"
+    assert id_contract_miss is False
+
+
+def test_no_promo_response_via_markdown_block_keeps_markdown_code_block_method_id_mode():
+    response = '```json\n[{"start": 0.0, "end": 100.0, "category": "main_content"}]\n```'
+    ads, method, id_contract_miss = variants.parse_segmentation_response(
+        response, "segment_ids", ID_SEGMENTS,
+    )
+    assert ads == []
+    assert method == "markdown_code_block"
+    assert id_contract_miss is False
 
 
 def test_id_mode_with_float_timestamps_sets_id_contract_miss():

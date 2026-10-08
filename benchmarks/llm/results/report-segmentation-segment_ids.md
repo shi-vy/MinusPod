@@ -55,13 +55,26 @@ Models ranked by F0.5 (precision weighted 2x recall) against human-verified grou
 
 | Tier | Model | F0.5 | 95% CI | Precision | Recall | F1 | Cost / episode | p50 latency | JSON compliance | Flags |
 |------|-------|------|--------|-----------|--------|----|----------------|-------------|-----------------|-------|
-| A | `google/gemini-3.1-flash-lite` | 0.853 | +/-0.141 | 0.838 | 0.936 | 0.879 | $0.0663 | 1.5s | 1.00 | (!) fails no-ad control |
+| A | `claude-fable-5-1` | 0.857 | +/-0.142 | 0.837 | 0.964 | 0.891 | $1.9845 | 5.4s | 1.00 |  |
+| A | `claude-opus-5` | 0.849 | +/-0.157 | 0.835 | 0.936 | 0.874 | $0.9741 | 5.5s | 1.00 |  |
+| A | `google/gemini-3.5-flash` | 0.834 | +/-0.221 | 0.822 | 0.914 | 0.857 | $1.0715 | 10.4s | 1.00 |  |
+| A | `claude-haiku-4-5-20251001` | 0.822 | +/-0.164 | 0.799 | 0.964 | 0.865 | $0.2156 | 71.4s | 1.00 |  |
+| A | `x-ai/grok-4.3` | 0.814 | +/-0.150 | 0.792 | 0.939 | 0.853 | $0.3117 | 7.9s | 1.00 |  |
 | A | `qwen/qwen3.7-flash` | 0.813 | +/-0.171 | 0.803 | 0.871 | 0.831 | $0.0335 | 52.8s | 0.99 | (!) fails no-ad control |
-| B | `deepseek/deepseek-v4-flash` | 0.787 | +/-0.164 | 0.836 | 0.751 | 0.758 | $0.0227 | 32.8s | 0.81 | (!) brittle JSON |
+| B | `claude-opus-4-8` | 0.808 | +/-0.162 | 0.786 | 0.937 | 0.846 | $1.0137 | 10.6s | 1.00 |  |
+| B | `claude-sonnet-5` | 0.801 | +/-0.151 | 0.790 | 0.896 | 0.826 | $0.3954 | 26.6s | 1.00 |  |
+| B | `claude-opus-5-5` | 0.799 | +/-0.180 | 0.777 | 0.941 | 0.839 | $0.7825 | 4.1s | 1.00 |  |
+| B | `deepseek/deepseek-v4-flash` | 0.787 | +/-0.164 | 0.836 | 0.751 | 0.758 | $0.2042 | 32.8s | 0.81 | (!) brittle JSON |
+| B | `google/gemini-3.1-flash-lite` | 0.782 | +/-0.160 | 0.763 | 0.896 | 0.816 | $0.0587 | 1.8s | 0.99 |  |
 | B | `google/gemini-3.5-flash-lite` | 0.774 | +/-0.125 | 0.749 | 0.914 | 0.817 | $0.0752 | 1.4s | 1.00 | (!) fails no-ad control |
 | B | `openai/gpt-oss-120b` | 0.754 | +/-0.124 | 0.741 | 0.837 | 0.779 | $0.0152 | 9.1s | 1.00 |  |
-| B | `microsoft/phi-4` | 0.720 | +/-0.146 | 0.689 | 0.936 | 0.780 | $0.0139 | 7.7s | 1.00 |  |
-| B | `gemma4:e4b` | 0.682 | +/-0.225 | 0.659 | 0.817 | 0.723 | $0.0000 | 13.3s | 1.00 |  |
+| C | `microsoft/phi-4` | 0.720 | +/-0.146 | 0.689 | 0.936 | 0.780 | $0.0139 | 7.7s | 1.00 |  |
+| C | `mistralai/mistral-small-2603` | 0.719 | +/-0.184 | 0.700 | 0.843 | 0.755 | $0.0323 | 3.9s | 1.00 |  |
+| C | `gemma4:e4b` | 0.682 | +/-0.225 | 0.659 | 0.817 | 0.723 | $0.0000 | 13.3s | 1.00 |  |
+| D | `qwen/qwen3-8b` | 0.555 | +/-0.117 | 0.640 | 0.441 | 0.491 | $0.0576 | 31.2s | 0.51 | (!) brittle JSON (!) fails no-ad control |
+| E | `qwen/qwen3.8-flash` | 0.167 | +/-0.186 | 0.224 | 0.094 | 0.127 | $0.1051 | 67.1s | 0.26 | (!) brittle JSON |
+| F | `bytedance-seed/seed-2-1-turbo` | 0.000 | +/-0.000 | 0.000 | 0.000 | 0.000 | $0.5122 | 64.9s | 0.06 | (!) brittle JSON |
+| F | `qwen/qwen3.5-plus-02-15` | 0.000 | +/-0.000 | 0.000 | 0.000 | 0.000 | $0.3407 | 70.7s | 0.02 | (!) brittle JSON |
 
 ### Best Value (F0.5 per dollar)
 
@@ -71,10 +84,23 @@ Paid-tier only, ranked by F0.5 per dollar. Free-tier models are excluded here be
 |------|-------|--------|------|----|----------------|-------|
 | 1 | `microsoft/phi-4` | 51.94 | 0.720 | 0.780 | $0.0139 |  |
 | 2 | `openai/gpt-oss-120b` | 49.70 | 0.754 | 0.779 | $0.0152 |  |
-| 3 | `deepseek/deepseek-v4-flash` | 34.66 | 0.787 | 0.758 | $0.0227 | (!) brittle JSON |
-| 4 | `qwen/qwen3.7-flash` | 24.26 | 0.813 | 0.831 | $0.0335 | (!) fails no-ad control |
-| 5 | `google/gemini-3.1-flash-lite` | 12.86 | 0.853 | 0.879 | $0.0663 | (!) fails no-ad control |
+| 3 | `qwen/qwen3.7-flash` | 24.26 | 0.813 | 0.831 | $0.0335 | (!) fails no-ad control |
+| 4 | `mistralai/mistral-small-2603` | 22.26 | 0.719 | 0.755 | $0.0323 |  |
+| 5 | `google/gemini-3.1-flash-lite` | 13.31 | 0.782 | 0.816 | $0.0587 |  |
 | 6 | `google/gemini-3.5-flash-lite` | 10.30 | 0.774 | 0.817 | $0.0752 | (!) fails no-ad control |
+| 7 | `qwen/qwen3-8b` | 9.64 | 0.555 | 0.491 | $0.0576 | (!) brittle JSON (!) fails no-ad control |
+| 8 | `deepseek/deepseek-v4-flash` | 3.85 | 0.787 | 0.758 | $0.2042 | (!) brittle JSON |
+| 9 | `claude-haiku-4-5-20251001` | 3.81 | 0.822 | 0.865 | $0.2156 |  |
+| 10 | `x-ai/grok-4.3` | 2.61 | 0.814 | 0.853 | $0.3117 |  |
+| 11 | `claude-sonnet-5` | 2.03 | 0.801 | 0.826 | $0.3954 |  |
+| 12 | `qwen/qwen3.8-flash` | 1.59 | 0.167 | 0.127 | $0.1051 | (!) brittle JSON |
+| 13 | `claude-opus-5-5` | 1.02 | 0.799 | 0.839 | $0.7825 |  |
+| 14 | `claude-opus-5` | 0.87 | 0.849 | 0.874 | $0.9741 |  |
+| 15 | `claude-opus-4-8` | 0.80 | 0.808 | 0.846 | $1.0137 |  |
+| 16 | `google/gemini-3.5-flash` | 0.78 | 0.834 | 0.857 | $1.0715 |  |
+| 17 | `claude-fable-5-1` | 0.43 | 0.857 | 0.891 | $1.9845 |  |
+| 18 | `bytedance-seed/seed-2-1-turbo` | 0.00 | 0.000 | 0.000 | $0.5122 | (!) brittle JSON |
+| 19 | `qwen/qwen3.5-plus-02-15` | 0.00 | 0.000 | 0.000 | $0.3407 | (!) brittle JSON |
 
 ### Best Free-Tier (F0.5)
 
@@ -238,13 +264,26 @@ Reading the table: high precision + low recall means the model is cautious. It r
 
 | Model | Precision | Recall | TP | FP | FN |
 |---|---:|---:|---:|---:|---:|
-| `google/gemini-3.1-flash-lite` | 0.838 | 0.936 | 115 | 25 | 10 |
+| `claude-fable-5-1` | 0.837 | 0.964 | 120 | 27 | 5 |
+| `claude-opus-5` | 0.835 | 0.936 | 115 | 26 | 10 |
+| `claude-haiku-4-5-20251001` | 0.799 | 0.964 | 120 | 36 | 5 |
+| `google/gemini-3.5-flash` | 0.822 | 0.914 | 116 | 29 | 9 |
+| `x-ai/grok-4.3` | 0.792 | 0.939 | 116 | 37 | 9 |
+| `claude-opus-4-8` | 0.786 | 0.937 | 116 | 38 | 9 |
+| `claude-opus-5-5` | 0.777 | 0.941 | 116 | 41 | 9 |
 | `qwen/qwen3.7-flash` | 0.803 | 0.871 | 110 | 31 | 15 |
+| `claude-sonnet-5` | 0.790 | 0.896 | 110 | 37 | 15 |
 | `google/gemini-3.5-flash-lite` | 0.749 | 0.914 | 112 | 39 | 13 |
+| `google/gemini-3.1-flash-lite` | 0.763 | 0.896 | 110 | 35 | 15 |
 | `microsoft/phi-4` | 0.689 | 0.936 | 116 | 63 | 9 |
 | `openai/gpt-oss-120b` | 0.741 | 0.837 | 104 | 41 | 21 |
 | `deepseek/deepseek-v4-flash` | 0.836 | 0.751 | 90 | 25 | 35 |
+| `mistralai/mistral-small-2603` | 0.700 | 0.843 | 107 | 45 | 18 |
 | `gemma4:e4b` | 0.659 | 0.817 | 105 | 60 | 20 |
+| `qwen/qwen3-8b` | 0.640 | 0.441 | 55 | 35 | 70 |
+| `qwen/qwen3.8-flash` | 0.224 | 0.094 | 14 | 11 | 111 |
+| `bytedance-seed/seed-2-1-turbo` | 0.000 | 0.000 | 0 | 0 | 125 |
+| `qwen/qwen3.5-plus-02-15` | 0.000 | 0.000 | 0 | 1 | 125 |
 
 ## Boundary accuracy
 
@@ -254,11 +293,22 @@ MAE is size of the miss; bias is its direction (mean of predicted minus truth). 
 
 | Model | Start MAE (s) | End MAE (s) | Start bias (s) | End bias (s) |
 |---|---:|---:|---:|---:|
+| `qwen/qwen3.8-flash` | 1.45 | 0.49 | -1.45 | -0.49 |
+| `claude-fable-5-1` | 2.54 | 2.78 | +0.21 | -1.19 |
+| `claude-opus-5` | 5.43 | 1.75 | -2.67 | -0.71 |
+| `claude-opus-5-5` | 4.24 | 4.12 | +0.06 | -2.53 |
+| `claude-opus-4-8` | 5.36 | 3.23 | -1.51 | -1.91 |
+| `claude-sonnet-5` | 3.84 | 4.82 | -0.83 | -3.64 |
 | `deepseek/deepseek-v4-flash` | 7.19 | 1.68 | -1.50 | -0.96 |
-| `google/gemini-3.1-flash-lite` | 5.62 | 3.44 | -2.86 | -1.85 |
+| `x-ai/grok-4.3` | 4.80 | 4.14 | -2.04 | -3.24 |
+| `google/gemini-3.1-flash-lite` | 5.94 | 3.06 | -2.91 | -1.29 |
+| `claude-haiku-4-5-20251001` | 4.65 | 4.47 | -1.64 | -3.56 |
+| `google/gemini-3.5-flash` | 5.35 | 4.11 | -2.60 | -3.20 |
+| `qwen/qwen3-8b` | 7.68 | 2.94 | -3.40 | +2.18 |
 | `google/gemini-3.5-flash-lite` | 7.27 | 4.57 | -3.55 | -3.53 |
 | `gemma4:e4b` | 3.53 | 8.91 | -0.26 | -7.24 |
 | `qwen/qwen3.7-flash` | 8.99 | 3.90 | -6.23 | -3.72 |
+| `mistralai/mistral-small-2603` | 8.72 | 5.37 | -5.96 | -1.64 |
 | `openai/gpt-oss-120b` | 9.45 | 6.91 | -4.46 | -6.00 |
 | `microsoft/phi-4` | 6.48 | 10.92 | +3.02 | -10.01 |
 
@@ -268,13 +318,25 @@ Models include a self-reported `confidence` on each detected ad. A well-calibrat
 
 | Model | 0.00-0.70 | 0.70-0.90 | 0.90-0.95 | 0.95-0.99 | 0.99+ | total |
 |---|---:|---:|---:|---:|---:|---:|
+| `claude-fable-5-1` | -- | 0.25 (n=16) | -- | 0.89 (n=131) | -- | 147 |
+| `claude-haiku-4-5-20251001` | -- | 0.25 (n=4) | -- | 0.78 (n=152) | -- | 156 |
+| `claude-opus-4-8` | -- | 0.15 (n=13) | -- | 0.81 (n=141) | -- | 154 |
+| `claude-opus-5` | -- | 0.07 (n=15) | -- | 0.90 (n=126) | -- | 141 |
+| `claude-opus-5-5` | -- | 0.00 (n=19) | -- | 0.84 (n=138) | -- | 157 |
+| `claude-sonnet-5` | 0.00 (n=1) | 0.22 (n=18) | -- | 0.83 (n=128) | -- | 147 |
 | `deepseek/deepseek-v4-flash` | -- | 0.25 (n=8) | -- | 0.82 (n=107) | -- | 115 |
 | `gemma4:e4b` | -- | 0.00 (n=2) | -- | 0.64 (n=163) | -- | 165 |
-| `google/gemini-3.1-flash-lite` | -- | -- | -- | 0.79 (n=145) | -- | 145 |
+| `google/gemini-3.1-flash-lite` | -- | -- | -- | 0.76 (n=145) | -- | 145 |
+| `google/gemini-3.5-flash` | -- | -- | -- | 0.80 (n=145) | -- | 145 |
 | `google/gemini-3.5-flash-lite` | -- | 0.00 (n=3) | -- | 0.74 (n=151) | -- | 154 |
 | `microsoft/phi-4` | -- | 0.00 (n=4) | -- | 0.66 (n=175) | -- | 179 |
+| `mistralai/mistral-small-2603` | -- | -- | -- | 0.70 (n=152) | -- | 152 |
 | `openai/gpt-oss-120b` | -- | -- | -- | 0.72 (n=145) | -- | 145 |
+| `qwen/qwen3-8b` | -- | 0.40 (n=15) | -- | 0.64 (n=76) | -- | 91 |
+| `qwen/qwen3.5-plus-02-15` | -- | -- | -- | 0.00 (n=1) | -- | 1 |
 | `qwen/qwen3.7-flash` | -- | 0.00 (n=6) | -- | 0.79 (n=139) | -- | 145 |
+| `qwen/qwen3.8-flash` | 0.00 (n=1) | 0.00 (n=6) | -- | 0.78 (n=18) | -- | 25 |
+| `x-ai/grok-4.3` | -- | 0.00 (n=2) | -- | 0.77 (n=151) | -- | 153 |
 
 See `report_assets-segmentation-segment_ids/calibration.svg` for the visual reliability diagram.
 
@@ -285,12 +347,25 @@ Median latency hides outliers. p99 and max are what determines queue depth and w
 | Model | p50 | p90 | p95 | p99 | max |
 |---|---:|---:|---:|---:|---:|
 | `google/gemini-3.5-flash-lite` | 1.35s | 1.87s | 2.01s | 2.32s | 2.50s |
-| `google/gemini-3.1-flash-lite` | 1.53s | 1.97s | 2.11s | 2.38s | 3.48s |
+| `google/gemini-3.1-flash-lite` | 1.83s | 2.62s | 3.03s | 5.15s | 10.71s |
+| `mistralai/mistral-small-2603` | 3.92s | 11.20s | 14.81s | 24.27s | 28.03s |
+| `claude-opus-5-5` | 4.13s | 64.01s | 64.91s | 162.51s | 243.91s |
+| `claude-fable-5-1` | 5.36s | 63.93s | 65.81s | 146.83s | 245.00s |
+| `claude-opus-5` | 5.54s | 64.96s | 66.61s | 110.30s | 188.95s |
 | `microsoft/phi-4` | 7.73s | 11.34s | 12.43s | 15.50s | 118.40s |
+| `x-ai/grok-4.3` | 7.88s | 11.76s | 12.50s | 16.68s | 19.85s |
 | `openai/gpt-oss-120b` | 9.13s | 47.82s | 90.31s | 230.98s | 284.82s |
+| `google/gemini-3.5-flash` | 10.44s | 16.35s | 20.63s | 22.92s | 28.64s |
+| `claude-opus-4-8` | 10.55s | 63.81s | 71.58s | 186.93s | 196.53s |
 | `gemma4:e4b` | 13.29s | 23.36s | 25.52s | 30.41s | 31.89s |
+| `claude-sonnet-5` | 26.56s | 61.20s | 76.53s | 205.73s | 249.45s |
+| `qwen/qwen3-8b` | 31.22s | 60.93s | 82.10s | 104.66s | 139.87s |
 | `deepseek/deepseek-v4-flash` | 32.84s | 252.16s | 261.32s | 272.85s | 366.50s |
 | `qwen/qwen3.7-flash` | 52.83s | 73.55s | 79.41s | 91.16s | 94.10s |
+| `bytedance-seed/seed-2-1-turbo` | 64.92s | 69.42s | 71.75s | 73.57s | 78.28s |
+| `qwen/qwen3.8-flash` | 67.14s | 77.91s | 84.09s | 96.05s | 108.38s |
+| `qwen/qwen3.5-plus-02-15` | 70.68s | 70.95s | 71.02s | 71.34s | 71.50s |
+| `claude-haiku-4-5-20251001` | 71.38s | 152.84s | 166.69s | 323.72s | 440.29s |
 
 ## Output token efficiency
 
@@ -298,13 +373,25 @@ How many output tokens the model spent per detected ad. Lower is more concise (t
 
 | Model | Total output tokens | Ads detected | Tokens / ad | Cost / TP |
 |---|---:|---:|---:|---:|
+| `claude-opus-5-5` | 32,988 | 394 | 84 | $0.0067 |
+| `claude-fable-5-1` | 35,823 | 403 | 89 | $0.0165 |
+| `claude-opus-4-8` | 40,107 | 449 | 89 | $0.0087 |
+| `claude-sonnet-5` | 35,069 | 346 | 101 | $0.0036 |
+| `claude-opus-5` | 32,185 | 313 | 103 | $0.0085 |
 | `google/gemini-3.5-flash-lite` | 54,976 | 469 | 117 | $0.0007 |
-| `google/gemini-3.1-flash-lite` | 59,415 | 435 | 137 | $0.0006 |
+| `claude-haiku-4-5-20251001` | 52,973 | 415 | 128 | $0.0018 |
+| `google/gemini-3.1-flash-lite` | 69,232 | 417 | 166 | $0.0005 |
+| `mistralai/mistral-small-2603` | 75,200 | 393 | 191 | $0.0003 |
 | `microsoft/phi-4` | 121,122 | 495 | 245 | $0.0001 |
+| `x-ai/grok-4.3` | 236,465 | 450 | 525 | $0.0027 |
 | `openai/gpt-oss-120b` | 284,892 | 364 | 783 | $0.0001 |
 | `gemma4:e4b` | 392,648 | 450 | 873 | $0.0000 |
+| `google/gemini-3.5-flash` | 462,963 | 388 | 1193 | $0.0092 |
+| `qwen/qwen3-8b` | 437,875 | 199 | 2200 | $0.0010 |
 | `qwen/qwen3.7-flash` | 1,108,593 | 364 | 3046 | $0.0003 |
-| `deepseek/deepseek-v4-flash` | 779,874 | 251 | 3107 | $0.0003 |
+| `deepseek/deepseek-v4-flash` | 779,874 | 251 | 3107 | $0.0023 |
+| `qwen/qwen3.8-flash` | 866,071 | 43 | 20141 | $0.0075 |
+| `qwen/qwen3.5-plus-02-15` | 961,920 | 1 | 961920 | n/a |
 
 ## Cost breakdown (input vs output)
 
@@ -312,10 +399,23 @@ Where each model's per-episode dollars go, at the same pricing snapshot as every
 
 | Model | Cost / episode | Input | Output | Output share |
 |---|---:|---:|---:|---:|
+| `claude-fable-5-1` | $1.9845 | $1.6263 | $0.3582 | 18% |
+| `google/gemini-3.5-flash` | $1.0715 | $0.2382 | $0.8333 | 78% |
+| `claude-opus-4-8` | $1.0137 | $0.8132 | $0.2005 | 20% |
+| `claude-opus-5` | $0.9741 | $0.8132 | $0.1609 | 17% |
+| `claude-opus-5-5` | $0.7825 | $0.6505 | $0.1320 | 17% |
+| `bytedance-seed/seed-2-1-turbo` | $0.5122 | $0.0740 | $0.4383 | 86% |
+| `claude-sonnet-5` | $0.3954 | $0.3253 | $0.0701 | 18% |
+| `qwen/qwen3.5-plus-02-15` | $0.3407 | $0.0406 | $0.3001 | 88% |
+| `x-ai/grok-4.3` | $0.3117 | $0.1935 | $0.1182 | 38% |
+| `claude-haiku-4-5-20251001` | $0.2156 | $0.1626 | $0.0530 | 25% |
+| `deepseek/deepseek-v4-flash` | $0.2042 | $0.0046 | $0.1996 | 98% |
+| `qwen/qwen3.8-flash` | $0.1051 | $0.0237 | $0.0814 | 77% |
 | `google/gemini-3.5-flash-lite` | $0.0752 | $0.0477 | $0.0275 | 37% |
-| `google/gemini-3.1-flash-lite` | $0.0663 | $0.0485 | $0.0178 | 27% |
+| `google/gemini-3.1-flash-lite` | $0.0587 | $0.0380 | $0.0208 | 35% |
+| `qwen/qwen3-8b` | $0.0576 | $0.0178 | $0.0398 | 69% |
 | `qwen/qwen3.7-flash` | $0.0335 | $0.0047 | $0.0288 | 86% |
-| `deepseek/deepseek-v4-flash` | $0.0227 | $0.0075 | $0.0152 | 67% |
+| `mistralai/mistral-small-2603` | $0.0323 | $0.0233 | $0.0090 | 28% |
 | `openai/gpt-oss-120b` | $0.0152 | $0.0055 | $0.0097 | 64% |
 | `microsoft/phi-4` | $0.0139 | $0.0105 | $0.0034 | 24% |
 
@@ -325,32 +425,50 @@ All trials run at temperature 0.0. If a model produces stable output you'd expec
 
 | Model | Mean F1 stdev across episodes | Highest single-episode stdev |
 |---|---:|---:|
-| `google/gemini-3.1-flash-lite` | 0.0000 | 0.0000 |
+| `claude-fable-5-1` | 0.0226 | 0.0609 |
+| `claude-opus-5` | 0.0262 | 0.0730 |
+| `claude-haiku-4-5-20251001` | 0.0339 | 0.0730 |
+| `google/gemini-3.5-flash` | 0.0343 | 0.1461 |
+| `x-ai/grok-4.3` | 0.0507 | 0.1193 |
+| `claude-opus-4-8` | 0.0489 | 0.1135 |
+| `claude-opus-5-5` | 0.0505 | 0.0894 |
 | `qwen/qwen3.7-flash` | 0.0416 | 0.2236 |
+| `claude-sonnet-5` | 0.0595 | 0.1372 |
 | `google/gemini-3.5-flash-lite` | 0.0305 | 0.1369 |
+| `google/gemini-3.1-flash-lite` | 0.0479 | 0.1342 |
 | `microsoft/phi-4` | 0.0165 | 0.0596 |
 | `openai/gpt-oss-120b` | 0.1541 | 0.2681 |
 | `deepseek/deepseek-v4-flash` | 0.0990 | 0.1491 |
+| `mistralai/mistral-small-2603` | 0.0261 | 0.0782 |
 | `gemma4:e4b` | 0.0713 | 0.1826 |
+| `qwen/qwen3-8b` | 0.1391 | 0.2074 |
+| `qwen/qwen3.8-flash` | 0.1318 | 0.2594 |
+| `bytedance-seed/seed-2-1-turbo` | 0.0000 | 0.0000 |
+| `qwen/qwen3.5-plus-02-15` | 0.0000 | 0.0000 |
 
 ## Cross-model agreement
 
-For each of the 47 (episode, window, trial-equivalent) entries, how many of the 7 active models predicted at least one ad? High-agreement windows are unambiguous ads (or unambiguously not ads). Low-agreement windows are where individual models disagree, and are candidates for ensemble voting if you want a cheap accuracy boost.
+For each of the 47 (episode, window, trial-equivalent) entries, how many of the 20 active models predicted at least one ad? High-agreement windows are unambiguous ads (or unambiguously not ads). Low-agreement windows are where individual models disagree, and are candidates for ensemble voting if you want a cheap accuracy boost.
 
 | Models predicting an ad | Window count | Share |
 |---:|---:|---:|
-| 0 of 7 | 12 | 25.5% |
-| 1 of 7 | 2 | 4.3% |
-| 2 of 7 | 2 | 4.3% |
-| 3 of 7 | 1 | 2.1% |
-| 6 of 7 | 3 | 6.4% |
-| 7 of 7 | 27 | 57.4% |
+| 0 of 20 | 11 | 23.4% |
+| 1 of 20 | 1 | 2.1% |
+| 2 of 20 | 2 | 4.3% |
+| 3 of 20 | 1 | 2.1% |
+| 4 of 20 | 1 | 2.1% |
+| 7 of 20 | 1 | 2.1% |
+| 15 of 20 | 1 | 2.1% |
+| 16 of 20 | 4 | 8.5% |
+| 17 of 20 | 19 | 40.4% |
+| 18 of 20 | 5 | 10.6% |
+| 19 of 20 | 1 | 2.1% |
 
 Read this as: rows near the top are windows where the field disagrees (most models said no, a few said yes, usually false positives); rows near the bottom are windows where the field broadly agrees (typical of clear sponsor reads).
 
 ### Per-model alignment with consensus
 
-Same data, viewed per model. For each window, the **majority** is whether more than half of the 7 active models flagged an ad. Then for each model: did it vote with the majority or against it? Four buckets:
+Same data, viewed per model. For each window, the **majority** is whether more than half of the 20 active models flagged an ad. Then for each model: did it vote with the majority or against it? Four buckets:
 
 - **with-yes**: this model voted yes, majority also voted yes (likely true positive)
 - **with-no**: this model voted no, majority also voted no (likely true negative)
@@ -361,23 +479,38 @@ Alignment rate is `(with-yes + with-no) / total`. High alignment means the model
 
 | Model | with-yes | with-no | broke-yes | broke-no | Alignment |
 |---|---:|---:|---:|---:|---:|
+| `claude-fable-5-1` | 30 | 17 | 0 | 0 | 100.0% |
+| `claude-opus-4-8` | 30 | 17 | 0 | 0 | 100.0% |
+| `claude-opus-5` | 30 | 17 | 0 | 0 | 100.0% |
+| `claude-sonnet-5` | 30 | 17 | 0 | 0 | 100.0% |
+| `claude-haiku-4-5-20251001` | 30 | 16 | 1 | 0 | 97.9% |
 | `gemma4:e4b` | 30 | 16 | 1 | 0 | 97.9% |
 | `google/gemini-3.1-flash-lite` | 30 | 16 | 1 | 0 | 97.9% |
+| `mistralai/mistral-small-2603` | 30 | 16 | 1 | 0 | 97.9% |
 | `qwen/qwen3.7-flash` | 30 | 16 | 1 | 0 | 97.9% |
+| `x-ai/grok-4.3` | 30 | 16 | 1 | 0 | 97.9% |
+| `claude-opus-5-5` | 30 | 15 | 2 | 0 | 95.7% |
 | `deepseek/deepseek-v4-flash` | 28 | 17 | 0 | 2 | 95.7% |
+| `google/gemini-3.5-flash` | 30 | 15 | 2 | 0 | 95.7% |
 | `microsoft/phi-4` | 29 | 16 | 1 | 1 | 95.7% |
 | `openai/gpt-oss-120b` | 30 | 15 | 2 | 0 | 95.7% |
 | `google/gemini-3.5-flash-lite` | 30 | 14 | 3 | 0 | 93.6% |
+| `qwen/qwen3-8b` | 24 | 14 | 3 | 6 | 80.9% |
+| `qwen/qwen3.8-flash` | 9 | 17 | 0 | 21 | 55.3% |
+| `qwen/qwen3.5-plus-02-15` | 1 | 17 | 0 | 29 | 38.3% |
+| `bytedance-seed/seed-2-1-turbo` | 0 | 17 | 0 | 30 | 36.2% |
 
 ### Windows flagged with no truth ad
 
-The other side of the histogram: windows the ground truth marks ad-free, ranked by how many of the 7 models flagged them anyway (in at least one trial). A window near the top is either content that genuinely resembles an ad, which is what precision-focused validator rules should train against, or a spot the truth file missed. Either way these are the first windows worth a manual re-listen; on a corpus this size a single mislabeled window moves scores. No-ad control episodes are included and tagged.
+The other side of the histogram: windows the ground truth marks ad-free, ranked by how many of the 20 models flagged them anyway (in at least one trial). A window near the top is either content that genuinely resembles an ad, which is what precision-focused validator rules should train against, or a spot the truth file missed. Either way these are the first windows worth a manual re-listen; on a corpus this size a single mislabeled window moves scores. No-ad control episodes are included and tagged.
 
 | Episode | Window | Span | Models flagging |
 |---|---:|---|---:|
-| `ep-ai-cloud-essentials-e8dc897fbd6b` (no-ad control) | 0 | 0-600s | 3 of 7 |
-| `ep-daily-gist-chicago-70a82fe93a5c` | 2 | 840-1271s | 2 of 7 |
-| `ep-it-s-a-thing-e339179dfad6` | 2 | 840-1440s | 2 of 7 |
+| `ep-it-s-a-thing-e339179dfad6` | 2 | 840-1440s | 7 of 20 |
+| `ep-daily-gist-chicago-70a82fe93a5c` | 2 | 840-1271s | 4 of 20 |
+| `ep-ai-cloud-essentials-e8dc897fbd6b` (no-ad control) | 0 | 0-600s | 3 of 20 |
+| `ep-crime-junkie-8ce498f299d7` | 1 | 420-1020s | 2 of 20 |
+| `ep-daily-tech-news-show-b576979e1fe8` | 2 | 840-1440s | 2 of 20 |
 
 ## Detection rate by ad characteristic
 
@@ -389,13 +522,26 @@ Truth ads bucketed by duration: short (<30s), medium (30-90s), long (>=90s). Cel
 
 | Model | long (>=90s) | medium (30-90s) | short (<30s) |
 |---|---:|---:|---:|
+| `bytedance-seed/seed-2-1-turbo` | 0.00 (n=60) | 0.00 (n=50) | 0.00 (n=15) |
+| `claude-fable-5-1` | 0.92 (n=60) | 1.00 (n=50) | 1.00 (n=15) |
+| `claude-haiku-4-5-20251001` | 0.92 (n=60) | 1.00 (n=50) | 1.00 (n=15) |
+| `claude-opus-4-8` | 0.92 (n=60) | 0.94 (n=50) | 0.93 (n=15) |
+| `claude-opus-5` | 0.92 (n=60) | 1.00 (n=50) | 0.67 (n=15) |
+| `claude-opus-5-5` | 0.92 (n=60) | 1.00 (n=50) | 0.73 (n=15) |
+| `claude-sonnet-5` | 0.80 (n=60) | 0.94 (n=50) | 1.00 (n=15) |
 | `deepseek/deepseek-v4-flash` | 0.67 (n=60) | 0.76 (n=50) | 0.80 (n=15) |
 | `gemma4:e4b` | 0.92 (n=60) | 0.74 (n=50) | 0.87 (n=15) |
-| `google/gemini-3.1-flash-lite` | 0.92 (n=60) | 1.00 (n=50) | 0.67 (n=15) |
+| `google/gemini-3.1-flash-lite` | 0.88 (n=60) | 0.96 (n=50) | 0.60 (n=15) |
+| `google/gemini-3.5-flash` | 0.90 (n=60) | 0.94 (n=50) | 1.00 (n=15) |
 | `google/gemini-3.5-flash-lite` | 0.92 (n=60) | 0.94 (n=50) | 0.67 (n=15) |
 | `microsoft/phi-4` | 1.00 (n=60) | 0.82 (n=50) | 1.00 (n=15) |
+| `mistralai/mistral-small-2603` | 0.92 (n=60) | 0.94 (n=50) | 0.33 (n=15) |
 | `openai/gpt-oss-120b` | 0.78 (n=60) | 0.92 (n=50) | 0.73 (n=15) |
+| `qwen/qwen3-8b` | 0.43 (n=60) | 0.46 (n=50) | 0.40 (n=15) |
+| `qwen/qwen3.5-plus-02-15` | 0.00 (n=60) | 0.00 (n=50) | 0.00 (n=15) |
 | `qwen/qwen3.7-flash` | 0.92 (n=60) | 0.98 (n=50) | 0.40 (n=15) |
+| `qwen/qwen3.8-flash` | 0.15 (n=60) | 0.06 (n=50) | 0.13 (n=15) |
+| `x-ai/grok-4.3` | 0.92 (n=60) | 0.96 (n=50) | 0.87 (n=15) |
 
 ### By ad position
 
@@ -403,13 +549,26 @@ Truth ads bucketed by where they fall in the episode: pre-roll (first 10%), mid-
 
 | Model | pre-roll (<10%) | mid-roll (10-90%) | post-roll (>90%) |
 |---|---:|---:|---:|
+| `bytedance-seed/seed-2-1-turbo` | 0.00 (n=35) | 0.00 (n=60) | 0.00 (n=30) |
+| `claude-fable-5-1` | 1.00 (n=35) | 1.00 (n=60) | 0.83 (n=30) |
+| `claude-haiku-4-5-20251001` | 1.00 (n=35) | 1.00 (n=60) | 0.83 (n=30) |
+| `claude-opus-4-8` | 1.00 (n=35) | 0.98 (n=60) | 0.73 (n=30) |
+| `claude-opus-5` | 1.00 (n=35) | 0.92 (n=60) | 0.83 (n=30) |
+| `claude-opus-5-5` | 1.00 (n=35) | 0.93 (n=60) | 0.83 (n=30) |
+| `claude-sonnet-5` | 1.00 (n=35) | 0.88 (n=60) | 0.73 (n=30) |
 | `deepseek/deepseek-v4-flash` | 0.63 (n=35) | 0.78 (n=60) | 0.70 (n=30) |
 | `gemma4:e4b` | 0.86 (n=35) | 0.97 (n=60) | 0.57 (n=30) |
-| `google/gemini-3.1-flash-lite` | 1.00 (n=35) | 0.92 (n=60) | 0.83 (n=30) |
+| `google/gemini-3.1-flash-lite` | 0.94 (n=35) | 0.88 (n=60) | 0.80 (n=30) |
+| `google/gemini-3.5-flash` | 0.97 (n=35) | 1.00 (n=60) | 0.73 (n=30) |
 | `google/gemini-3.5-flash-lite` | 1.00 (n=35) | 0.92 (n=60) | 0.73 (n=30) |
 | `microsoft/phi-4` | 0.86 (n=35) | 1.00 (n=60) | 0.87 (n=30) |
+| `mistralai/mistral-small-2603` | 0.77 (n=35) | 0.92 (n=60) | 0.83 (n=30) |
 | `openai/gpt-oss-120b` | 0.94 (n=35) | 0.80 (n=60) | 0.77 (n=30) |
+| `qwen/qwen3-8b` | 0.37 (n=35) | 0.52 (n=60) | 0.37 (n=30) |
+| `qwen/qwen3.5-plus-02-15` | 0.00 (n=35) | 0.00 (n=60) | 0.00 (n=30) |
 | `qwen/qwen3.7-flash` | 1.00 (n=35) | 0.85 (n=60) | 0.80 (n=30) |
+| `qwen/qwen3.8-flash` | 0.14 (n=35) | 0.15 (n=60) | 0.00 (n=30) |
+| `x-ai/grok-4.3` | 1.00 (n=35) | 0.97 (n=60) | 0.77 (n=30) |
 
 ## Quick Comparison
 
@@ -417,13 +576,26 @@ One row per model, one column per episode. The headline columns (`F1`, `Cost/ep`
 
 | Model | F1 | Cost/ep | p50 | ep-andy-and-ari-e774e8022fab | ep-crime-junkie-8ce498f299d7 | ep-daily-gist-chicago-70a82fe93a5c | ep-daily-tech-news-show-b576979e1fe8 | ep-daily-tech-news-show-c1904b8605f7 | ep-drink-champs-30c9a2d49f13 | ep-glt1412515089-373d5ba5007b | ep-it-s-a-thing-e339179dfad6 | ep-on-air-with-dan-and-alex2-574e4f303730 | ep-security-now-audio-2850b24903b2 | ep-the-brilliant-idiots-0bb9bf634c8e | ep-the-tim-dillon-show-f62bd5fa1cfe | ep-tosh-show-5f6894439bb6 | ep-ai-cloud-essentials-e8dc897fbd6b (no-ad) | ep-oxide-and-friends-ce789ff5b62e (no-ad) | F1 stdev | Moderation blocked |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `google/gemini-3.1-flash-lite` | 0.879 | $0.0663 | 1.5s | - | 1.000 | 1.000 | 0.889 | 0.667 | - | - | 0.800 | - | - | - | 1.000 | 0.800 | FAIL (1 FP) | - | 0.000 | - |
+| `claude-fable-5-1` | 0.891 | $1.9845 | 5.4s | - | 0.933 | 1.000 | 0.956 | 0.640 | - | - | 0.800 | - | - | - | 1.000 | 0.909 | PASS | - | 0.023 | - |
+| `claude-opus-5` | 0.874 | $0.9741 | 5.5s | - | 0.978 | 1.000 | 0.956 | 0.667 | - | - | 0.720 | - | - | - | 1.000 | 0.800 | PASS | - | 0.026 | - |
+| `claude-haiku-4-5-20251001` | 0.865 | $0.2156 | 71.4s | - | 0.956 | 1.000 | 0.871 | 0.613 | - | - | 0.720 | - | - | - | 1.000 | 0.894 | PASS | - | 0.034 | - |
+| `google/gemini-3.5-flash` | 0.857 | $1.0715 | 10.4s | - | 1.000 | 1.000 | 0.971 | 0.613 | - | - | 0.507 | - | - | - | 1.000 | 0.909 | PASS | - | 0.034 | - |
+| `x-ai/grok-4.3` | 0.853 | $0.3117 | 7.9s | - | 0.911 | 1.000 | 0.764 | 0.613 | - | - | 0.813 | - | - | - | 1.000 | 0.865 | PASS | - | 0.051 | - |
+| `claude-opus-4-8` | 0.846 | $1.0137 | 10.6s | - | 0.933 | 1.000 | 0.828 | 0.613 | - | - | 0.720 | - | - | - | 1.000 | 0.827 | PASS | - | 0.049 | - |
+| `claude-opus-5-5` | 0.839 | $0.7825 | 4.1s | - | 0.978 | 0.960 | 0.916 | 0.600 | - | - | 0.674 | - | - | - | 1.000 | 0.748 | PASS | - | 0.050 | - |
 | `qwen/qwen3.7-flash` | 0.831 | $0.0335 | 52.8s | - | 0.927 | 0.600 | 0.889 | 0.600 | - | - | 1.000 | - | - | - | 1.000 | 0.800 | FAIL (1 FP) | - | 0.042 | - |
+| `claude-sonnet-5` | 0.826 | $0.3954 | 26.6s | - | 0.876 | 1.000 | 0.780 | 0.600 | - | - | 0.773 | - | - | - | 0.900 | 0.850 | PASS | - | 0.059 | - |
 | `google/gemini-3.5-flash-lite` | 0.817 | $0.0752 | 1.4s | - | 0.850 | 0.800 | 0.889 | 0.627 | - | - | 0.800 | - | - | - | 1.000 | 0.756 | FAIL (1 FP) | - | 0.030 | - |
+| `google/gemini-3.1-flash-lite` | 0.816 | $0.0587 | 1.8s | - | 1.000 | 0.740 | 0.861 | 0.580 | - | - | 0.800 | - | - | - | 1.000 | 0.733 | PASS | - | 0.048 | - |
 | `microsoft/phi-4` | 0.780 | $0.0139 | 7.7s | - | 0.889 | 1.000 | 0.693 | 0.679 | - | - | 0.667 | - | - | - | 0.750 | 0.782 | PASS | - | 0.016 | - |
 | `openai/gpt-oss-120b` | 0.779 | $0.0152 | 9.1s | - | 0.877 | 0.920 | 0.899 | 0.642 | - | - | 0.627 | - | - | - | 0.772 | 0.716 | PASS | - | 0.154 | - |
-| `deepseek/deepseek-v4-flash` | 0.758 | $0.0227 | 32.8s | - | 0.886 | 0.933 | 0.434 | 0.533 | - | - | 0.853 | - | - | - | 0.950 | 0.716 | PASS | - | 0.099 | - |
+| `deepseek/deepseek-v4-flash` | 0.758 | $0.2042 | 32.8s | - | 0.886 | 0.933 | 0.434 | 0.533 | - | - | 0.853 | - | - | - | 0.950 | 0.716 | PASS | - | 0.099 | - |
+| `mistralai/mistral-small-2603` | 0.755 | $0.0323 | 3.9s | - | 0.889 | 0.420 | 0.889 | 0.600 | - | - | 0.773 | - | - | - | 0.914 | 0.800 | PASS | - | 0.026 | - |
 | `gemma4:e4b` | 0.723 | $0.0000 | 13.3s | - | 0.871 | 1.000 | 0.653 | 0.578 | - | - | 0.300 | - | - | - | 0.806 | 0.851 | PASS | - | 0.071 | - |
+| `qwen/qwen3-8b` | 0.491 | $0.0576 | 31.2s | - | 0.672 | 0.567 | 0.429 | 0.457 | - | - | 0.360 | - | - | - | 0.440 | 0.515 | FAIL (1 FP) | - | 0.139 | - |
+| `qwen/qwen3.8-flash` | 0.127 | $0.1051 | 67.1s | - | 0.373 | 0.000 | 0.248 | 0.000 | - | - | 0.000 | - | - | - | 0.080 | 0.189 | PASS | - | 0.132 | - |
+| `bytedance-seed/seed-2-1-turbo` | 0.000 | $0.5122 | 64.9s | - | 0.000 | 0.000 | 0.000 | 0.000 | - | - | 0.000 | - | - | - | 0.000 | 0.000 | PASS | - | 0.000 | - |
+| `qwen/qwen3.5-plus-02-15` | 0.000 | $0.3407 | 70.7s | - | 0.000 | 0.000 | 0.000 | 0.000 | - | - | 0.000 | - | - | - | 0.000 | 0.000 | PASS | - | 0.000 | - |
 
 ---
 
@@ -433,17 +605,89 @@ One row per model, one column per episode. The headline columns (`F1`, `Cost/ep`
 
 Full per-model profile: F1 averaged across episodes, total cost per episode at current pricing, p50 / p95 latency, JSON compliance, parse-failure rate, the distribution of extraction methods the parser had to use, and verbosity / truncation telemetry. The `Extraction methods` list shows how often each route was hit. `json_array_direct` is the cleanest; the rest are recovery paths. The verbosity row flags models that emit long `reason` fields or run out of token budget mid-response. Ordered by F1 descending so the best performers appear first.
 
-#### `google/gemini-3.1-flash-lite`
+#### `claude-fable-5-1`
 
-- F1 (avg across episodes): **0.879**
-- Total cost / episode: **$0.0663**
-- p50 / p95 latency: 1.53s / 2.11s
+- F1 (avg across episodes): **0.891**
+- Total cost / episode: **$1.9845**
+- p50 / p95 latency: 5.36s / 65.81s
 - JSON compliance: 1.00
 - JSON mode: native (100% native, 235 calls)
 - Parse failure rate: 0.0%
 - Extraction methods: `segment_id_direct`: 235
 - Verbosity: 0/235 calls over 1024 output tokens (0.0%); 0 hit max_tokens (0.0%); 0 salvaged from truncated JSON (0.0%)
-- Segment category named on 435/435 detections (100%); the rest stay uncategorized (resolver: production)
+- Segment category named on 403/403 detections (100%); the rest stay uncategorized (resolver: production)
+
+#### `claude-opus-5`
+
+- F1 (avg across episodes): **0.874**
+- Total cost / episode: **$0.9741**
+- p50 / p95 latency: 5.54s / 66.61s
+- JSON compliance: 1.00
+- JSON mode: native (100% native, 235 calls)
+- Parse failure rate: 0.0%
+- Extraction methods: `segment_id_direct`: 235
+- Verbosity: 0/235 calls over 1024 output tokens (0.0%); 0 hit max_tokens (0.0%); 0 salvaged from truncated JSON (0.0%)
+- Segment category named on 313/313 detections (100%); the rest stay uncategorized (resolver: production)
+
+#### `claude-haiku-4-5-20251001`
+
+- F1 (avg across episodes): **0.865**
+- Total cost / episode: **$0.2156**
+- p50 / p95 latency: 71.38s / 166.69s
+- JSON compliance: 1.00
+- JSON mode: native (100% native, 235 calls)
+- Parse failure rate: 0.0%
+- Extraction methods: `segment_id_direct`: 235
+- Verbosity: 0/235 calls over 1024 output tokens (0.0%); 0 hit max_tokens (0.0%); 0 salvaged from truncated JSON (0.0%)
+- Segment category named on 415/415 detections (100%); the rest stay uncategorized (resolver: production)
+
+#### `google/gemini-3.5-flash`
+
+- F1 (avg across episodes): **0.857**
+- Total cost / episode: **$1.0715**
+- p50 / p95 latency: 10.44s / 20.63s
+- JSON compliance: 1.00
+- JSON mode: native (100% native, 235 calls)
+- Parse failure rate: 0.0%
+- Extraction methods: `json_object_single_ad_truncated`: 6, `segment_id_direct`: 229
+- Verbosity: 196/235 calls over 1024 output tokens (83.4%); 6 hit max_tokens (2.6%); 6 salvaged from truncated JSON (2.6%)
+- Segment category named on 388/388 detections (100%); the rest stay uncategorized (resolver: production)
+
+#### `x-ai/grok-4.3`
+
+- F1 (avg across episodes): **0.853**
+- Total cost / episode: **$0.3117**
+- p50 / p95 latency: 7.88s / 12.50s
+- JSON compliance: 1.00
+- JSON mode: native (100% native, 235 calls)
+- Parse failure rate: 0.0%
+- Extraction methods: `segment_id_direct`: 235
+- Verbosity: 111/235 calls over 1024 output tokens (47.2%); 0 hit max_tokens (0.0%); 0 salvaged from truncated JSON (0.0%)
+- Segment category named on 450/450 detections (100%); the rest stay uncategorized (resolver: production)
+
+#### `claude-opus-4-8`
+
+- F1 (avg across episodes): **0.846**
+- Total cost / episode: **$1.0137**
+- p50 / p95 latency: 10.55s / 71.58s
+- JSON compliance: 1.00
+- JSON mode: native (100% native, 235 calls)
+- Parse failure rate: 0.0%
+- Extraction methods: `segment_id_direct`: 235
+- Verbosity: 0/235 calls over 1024 output tokens (0.0%); 0 hit max_tokens (0.0%); 0 salvaged from truncated JSON (0.0%)
+- Segment category named on 449/449 detections (100%); the rest stay uncategorized (resolver: production)
+
+#### `claude-opus-5-5`
+
+- F1 (avg across episodes): **0.839**
+- Total cost / episode: **$0.7825**
+- p50 / p95 latency: 4.13s / 64.91s
+- JSON compliance: 1.00
+- JSON mode: native (100% native, 235 calls)
+- Parse failure rate: 0.0%
+- Extraction methods: `segment_id_direct`: 235
+- Verbosity: 0/235 calls over 1024 output tokens (0.0%); 0 hit max_tokens (0.0%); 0 salvaged from truncated JSON (0.0%)
+- Segment category named on 394/394 detections (100%); the rest stay uncategorized (resolver: production)
 
 #### `qwen/qwen3.7-flash`
 
@@ -457,6 +701,18 @@ Full per-model profile: F1 averaged across episodes, total cost per episode at c
 - Verbosity: 235/235 calls over 1024 output tokens (100.0%); 4 hit max_tokens (1.7%); 0 salvaged from truncated JSON (0.0%)
 - Segment category named on 364/364 detections (100%); the rest stay uncategorized (resolver: production)
 
+#### `claude-sonnet-5`
+
+- F1 (avg across episodes): **0.826**
+- Total cost / episode: **$0.3954**
+- p50 / p95 latency: 26.56s / 76.53s
+- JSON compliance: 1.00
+- JSON mode: native (100% native, 235 calls)
+- Parse failure rate: 0.0%
+- Extraction methods: `segment_id_direct`: 235
+- Verbosity: 0/235 calls over 1024 output tokens (0.0%); 0 hit max_tokens (0.0%); 0 salvaged from truncated JSON (0.0%)
+- Segment category named on 346/346 detections (100%); the rest stay uncategorized (resolver: production)
+
 #### `google/gemini-3.5-flash-lite`
 
 - F1 (avg across episodes): **0.817**
@@ -468,6 +724,18 @@ Full per-model profile: F1 averaged across episodes, total cost per episode at c
 - Extraction methods: `segment_id_direct`: 235
 - Verbosity: 0/235 calls over 1024 output tokens (0.0%); 0 hit max_tokens (0.0%); 0 salvaged from truncated JSON (0.0%)
 - Segment category named on 469/469 detections (100%); the rest stay uncategorized (resolver: production)
+
+#### `google/gemini-3.1-flash-lite`
+
+- F1 (avg across episodes): **0.816**
+- Total cost / episode: **$0.0587**
+- p50 / p95 latency: 1.83s / 3.03s
+- JSON compliance: 0.99
+- JSON mode: native (100% native, 235 calls)
+- Parse failure rate: 0.0%
+- Extraction methods: `json_object_single_ad_truncated`: 10, `segment_id_direct`: 225
+- Verbosity: 0/235 calls over 1024 output tokens (0.0%); 0 hit max_tokens (0.0%); 10 salvaged from truncated JSON (4.3%)
+- Segment category named on 417/417 detections (100%); the rest stay uncategorized (resolver: production)
 
 #### `microsoft/phi-4`
 
@@ -496,7 +764,7 @@ Full per-model profile: F1 averaged across episodes, total cost per episode at c
 #### `deepseek/deepseek-v4-flash`
 
 - F1 (avg across episodes): **0.758**
-- Total cost / episode: **$0.0227**
+- Total cost / episode: **$0.2042**
 - p50 / p95 latency: 32.84s / 261.32s
 - JSON compliance: 0.81
 - JSON mode: native (100% native, 235 calls)
@@ -505,6 +773,18 @@ Full per-model profile: F1 averaged across episodes, total cost per episode at c
 - Extraction methods: `parse_failure`: 45, `segment_id_direct`: 190
 - Verbosity: 160/235 calls over 1024 output tokens (68.1%); 46 hit max_tokens (19.6%); 0 salvaged from truncated JSON (0.0%)
 - Segment category named on 251/251 detections (100%); the rest stay uncategorized (resolver: production)
+
+#### `mistralai/mistral-small-2603`
+
+- F1 (avg across episodes): **0.755**
+- Total cost / episode: **$0.0323**
+- p50 / p95 latency: 3.92s / 14.81s
+- JSON compliance: 1.00
+- JSON mode: native (100% native, 235 calls)
+- Parse failure rate: 0.0%
+- Extraction methods: `segment_id_direct`: 235
+- Verbosity: 0/235 calls over 1024 output tokens (0.0%); 0 hit max_tokens (0.0%); 0 salvaged from truncated JSON (0.0%)
+- Segment category named on 393/393 detections (100%); the rest stay uncategorized (resolver: production)
 
 #### `gemma4:e4b`
 
@@ -517,6 +797,53 @@ Full per-model profile: F1 averaged across episodes, total cost per episode at c
 - Extraction methods: `segment_id_direct`: 235
 - Verbosity: 148/235 calls over 1024 output tokens (63.0%); 0 hit max_tokens (0.0%); 0 salvaged from truncated JSON (0.0%)
 - Segment category named on 450/450 detections (100%); the rest stay uncategorized (resolver: production)
+
+#### `qwen/qwen3-8b`
+
+- F1 (avg across episodes): **0.491**
+- Total cost / episode: **$0.0576**
+- p50 / p95 latency: 31.22s / 82.10s
+- JSON compliance: 0.51
+- JSON mode: native (100% native, 235 calls)
+- Parse failure rate: 49.4%
+- Extraction methods: `json_object_no_ads`: 26, `parse_failure`: 116, `segment_id_direct`: 93
+- Verbosity: 189/235 calls over 1024 output tokens (80.4%); 6 hit max_tokens (2.6%); 0 salvaged from truncated JSON (0.0%)
+- Segment category named on 199/199 detections (100%); the rest stay uncategorized (resolver: production)
+
+#### `qwen/qwen3.8-flash`
+
+- F1 (avg across episodes): **0.127**
+- Total cost / episode: **$0.1051**
+- p50 / p95 latency: 67.14s / 84.09s
+- JSON compliance: 0.26
+- JSON mode: native (100% native, 235 calls)
+- Parse failure rate: 73.6%
+- Extraction methods: `json_object_single_ad_truncated`: 2, `parse_failure`: 173, `segment_id_direct`: 60
+- Verbosity: 230/235 calls over 1024 output tokens (97.9%); 171 hit max_tokens (72.8%); 2 salvaged from truncated JSON (0.9%)
+- Segment category named on 43/43 detections (100%); the rest stay uncategorized (resolver: production)
+
+#### `bytedance-seed/seed-2-1-turbo`
+
+- F1 (avg across episodes): **0.000**
+- Total cost / episode: **$0.5122**
+- p50 / p95 latency: 64.92s / 71.75s
+- JSON compliance: 0.06
+- JSON mode: native (100% native, 235 calls)
+- Parse failure rate: 93.6%
+- Extraction methods: `bracket_fallback`: 1, `parse_failure`: 220, `segment_id_direct`: 14
+- Verbosity: 219/235 calls over 1024 output tokens (93.2%); 202 hit max_tokens (86.0%); 0 salvaged from truncated JSON (0.0%)
+
+#### `qwen/qwen3.5-plus-02-15`
+
+- F1 (avg across episodes): **0.000**
+- Total cost / episode: **$0.3407**
+- p50 / p95 latency: 70.68s / 71.02s
+- JSON compliance: 0.02
+- JSON mode: native (100% native, 235 calls)
+- Parse failure rate: 97.9%
+- Extraction methods: `parse_failure`: 230, `segment_id_direct`: 5
+- Verbosity: 235/235 calls over 1024 output tokens (100.0%); 230 hit max_tokens (97.9%); 0 salvaged from truncated JSON (0.0%)
+- Segment category named on 1/1 detections (100%); the rest stay uncategorized (resolver: production)
 
 
 ### Per-Episode Detail
@@ -531,12 +858,25 @@ One subsection per episode in the corpus, showing how every model performed on t
 
 | Model | Result | FP count |
 |-------|--------|----------|
+| `bytedance-seed/seed-2-1-turbo` | PASS | 0 |
+| `claude-fable-5-1` | PASS | 0 |
+| `claude-haiku-4-5-20251001` | PASS | 0 |
+| `claude-opus-4-8` | PASS | 0 |
+| `claude-opus-5` | PASS | 0 |
+| `claude-opus-5-5` | PASS | 0 |
+| `claude-sonnet-5` | PASS | 0 |
 | `deepseek/deepseek-v4-flash` | PASS | 0 |
 | `gemma4:e4b` | PASS | 0 |
+| `google/gemini-3.1-flash-lite` | PASS | 0 |
+| `google/gemini-3.5-flash` | PASS | 0 |
 | `microsoft/phi-4` | PASS | 0 |
+| `mistralai/mistral-small-2603` | PASS | 0 |
 | `openai/gpt-oss-120b` | PASS | 0 |
-| `google/gemini-3.1-flash-lite` | FAIL | 1 |
+| `qwen/qwen3.5-plus-02-15` | PASS | 0 |
+| `qwen/qwen3.8-flash` | PASS | 0 |
+| `x-ai/grok-4.3` | PASS | 0 |
 | `google/gemini-3.5-flash-lite` | FAIL | 1 |
+| `qwen/qwen3-8b` | FAIL | 1 |
 | `qwen/qwen3.7-flash` | FAIL | 1 |
 
 #### `ep-andy-and-ari-e774e8022fab`: Indiana LOADS UP on the edge before Big Ten play vs Northwestern thanks to court ruling | Oregon at USC Deep DIVE | Trinidad Chambliss, QB1 in NFL Draft? Why the SEC is STEALING Big Ten's TV power
@@ -557,12 +897,25 @@ One subsection per episode in the corpus, showing how every model performed on t
 | Model | F1 | F1 stdev |
 |-------|----|----------|
 | `google/gemini-3.1-flash-lite` | 1.000 | 0.000 |
+| `google/gemini-3.5-flash` | 1.000 | 0.000 |
+| `claude-opus-5` | 0.978 | 0.050 |
+| `claude-opus-5-5` | 0.978 | 0.050 |
+| `claude-haiku-4-5-20251001` | 0.956 | 0.061 |
+| `claude-fable-5-1` | 0.933 | 0.061 |
+| `claude-opus-4-8` | 0.933 | 0.061 |
 | `qwen/qwen3.7-flash` | 0.927 | 0.068 |
+| `x-ai/grok-4.3` | 0.911 | 0.050 |
 | `microsoft/phi-4` | 0.889 | 0.000 |
+| `mistralai/mistral-small-2603` | 0.889 | 0.000 |
 | `deepseek/deepseek-v4-flash` | 0.886 | 0.064 |
 | `openai/gpt-oss-120b` | 0.877 | 0.089 |
+| `claude-sonnet-5` | 0.876 | 0.137 |
 | `gemma4:e4b` | 0.871 | 0.040 |
 | `google/gemini-3.5-flash-lite` | 0.850 | 0.137 |
+| `qwen/qwen3-8b` | 0.672 | 0.189 |
+| `qwen/qwen3.8-flash` | 0.373 | 0.239 |
+| `bytedance-seed/seed-2-1-turbo` | 0.000 | 0.000 |
+| `qwen/qwen3.5-plus-02-15` | 0.000 | 0.000 |
 
 #### `ep-daily-gist-chicago-70a82fe93a5c`: Suburban apartment market heats up
 
@@ -572,13 +925,26 @@ One subsection per episode in the corpus, showing how every model performed on t
 
 | Model | F1 | F1 stdev |
 |-------|----|----------|
+| `claude-fable-5-1` | 1.000 | 0.000 |
+| `claude-haiku-4-5-20251001` | 1.000 | 0.000 |
+| `claude-opus-4-8` | 1.000 | 0.000 |
+| `claude-opus-5` | 1.000 | 0.000 |
+| `claude-sonnet-5` | 1.000 | 0.000 |
 | `gemma4:e4b` | 1.000 | 0.000 |
-| `google/gemini-3.1-flash-lite` | 1.000 | 0.000 |
+| `google/gemini-3.5-flash` | 1.000 | 0.000 |
 | `microsoft/phi-4` | 1.000 | 0.000 |
+| `x-ai/grok-4.3` | 1.000 | 0.000 |
+| `claude-opus-5-5` | 0.960 | 0.089 |
 | `deepseek/deepseek-v4-flash` | 0.933 | 0.149 |
 | `openai/gpt-oss-120b` | 0.920 | 0.110 |
 | `google/gemini-3.5-flash-lite` | 0.800 | 0.000 |
+| `google/gemini-3.1-flash-lite` | 0.740 | 0.134 |
 | `qwen/qwen3.7-flash` | 0.600 | 0.224 |
+| `qwen/qwen3-8b` | 0.567 | 0.091 |
+| `mistralai/mistral-small-2603` | 0.420 | 0.045 |
+| `bytedance-seed/seed-2-1-turbo` | 0.000 | 0.000 |
+| `qwen/qwen3.5-plus-02-15` | 0.000 | 0.000 |
+| `qwen/qwen3.8-flash` | 0.000 | 0.000 |
 
 #### `ep-daily-tech-news-show-b576979e1fe8`: Motorola Razr Fold is a Noble Competitor to the Galaxy Z Fold 7 - DTNS 5269
 
@@ -588,13 +954,26 @@ One subsection per episode in the corpus, showing how every model performed on t
 
 | Model | F1 | F1 stdev |
 |-------|----|----------|
+| `google/gemini-3.5-flash` | 0.971 | 0.064 |
+| `claude-fable-5-1` | 0.956 | 0.061 |
+| `claude-opus-5` | 0.956 | 0.061 |
+| `claude-opus-5-5` | 0.916 | 0.085 |
 | `openai/gpt-oss-120b` | 0.899 | 0.105 |
-| `google/gemini-3.1-flash-lite` | 0.889 | 0.000 |
 | `google/gemini-3.5-flash-lite` | 0.889 | 0.000 |
+| `mistralai/mistral-small-2603` | 0.889 | 0.000 |
 | `qwen/qwen3.7-flash` | 0.889 | 0.000 |
+| `claude-haiku-4-5-20251001` | 0.871 | 0.040 |
+| `google/gemini-3.1-flash-lite` | 0.861 | 0.062 |
+| `claude-opus-4-8` | 0.828 | 0.114 |
+| `claude-sonnet-5` | 0.780 | 0.027 |
+| `x-ai/grok-4.3` | 0.764 | 0.096 |
 | `microsoft/phi-4` | 0.693 | 0.060 |
 | `gemma4:e4b` | 0.653 | 0.087 |
 | `deepseek/deepseek-v4-flash` | 0.434 | 0.077 |
+| `qwen/qwen3-8b` | 0.429 | 0.130 |
+| `qwen/qwen3.8-flash` | 0.248 | 0.246 |
+| `bytedance-seed/seed-2-1-turbo` | 0.000 | 0.000 |
+| `qwen/qwen3.5-plus-02-15` | 0.000 | 0.000 |
 
 #### `ep-daily-tech-news-show-c1904b8605f7`: Switch 2 Prices Rise, Forecast Drops - DTNS 5265
 
@@ -605,12 +984,25 @@ One subsection per episode in the corpus, showing how every model performed on t
 | Model | F1 | F1 stdev |
 |-------|----|----------|
 | `microsoft/phi-4` | 0.679 | 0.027 |
-| `google/gemini-3.1-flash-lite` | 0.667 | 0.000 |
+| `claude-opus-5` | 0.667 | 0.000 |
 | `openai/gpt-oss-120b` | 0.642 | 0.166 |
+| `claude-fable-5-1` | 0.640 | 0.037 |
 | `google/gemini-3.5-flash-lite` | 0.627 | 0.037 |
+| `claude-haiku-4-5-20251001` | 0.613 | 0.030 |
+| `claude-opus-4-8` | 0.613 | 0.030 |
+| `google/gemini-3.5-flash` | 0.613 | 0.030 |
+| `x-ai/grok-4.3` | 0.613 | 0.030 |
+| `claude-opus-5-5` | 0.600 | 0.000 |
+| `claude-sonnet-5` | 0.600 | 0.000 |
+| `mistralai/mistral-small-2603` | 0.600 | 0.000 |
 | `qwen/qwen3.7-flash` | 0.600 | 0.000 |
+| `google/gemini-3.1-flash-lite` | 0.580 | 0.045 |
 | `gemma4:e4b` | 0.578 | 0.030 |
 | `deepseek/deepseek-v4-flash` | 0.533 | 0.075 |
+| `qwen/qwen3-8b` | 0.457 | 0.096 |
+| `bytedance-seed/seed-2-1-turbo` | 0.000 | 0.000 |
+| `qwen/qwen3.5-plus-02-15` | 0.000 | 0.000 |
+| `qwen/qwen3.8-flash` | 0.000 | 0.000 |
 
 #### `ep-drink-champs-30c9a2d49f13`: Episode 501 w/ Warren Sapp
 
@@ -640,11 +1032,24 @@ One subsection per episode in the corpus, showing how every model performed on t
 |-------|----|----------|
 | `qwen/qwen3.7-flash` | 1.000 | 0.000 |
 | `deepseek/deepseek-v4-flash` | 0.853 | 0.145 |
+| `x-ai/grok-4.3` | 0.813 | 0.119 |
+| `claude-fable-5-1` | 0.800 | 0.000 |
 | `google/gemini-3.1-flash-lite` | 0.800 | 0.000 |
 | `google/gemini-3.5-flash-lite` | 0.800 | 0.000 |
+| `claude-sonnet-5` | 0.773 | 0.060 |
+| `mistralai/mistral-small-2603` | 0.773 | 0.060 |
+| `claude-haiku-4-5-20251001` | 0.720 | 0.073 |
+| `claude-opus-4-8` | 0.720 | 0.073 |
+| `claude-opus-5` | 0.720 | 0.073 |
+| `claude-opus-5-5` | 0.674 | 0.081 |
 | `microsoft/phi-4` | 0.667 | 0.000 |
 | `openai/gpt-oss-120b` | 0.627 | 0.268 |
+| `google/gemini-3.5-flash` | 0.507 | 0.146 |
+| `qwen/qwen3-8b` | 0.360 | 0.207 |
 | `gemma4:e4b` | 0.300 | 0.183 |
+| `bytedance-seed/seed-2-1-turbo` | 0.000 | 0.000 |
+| `qwen/qwen3.5-plus-02-15` | 0.000 | 0.000 |
+| `qwen/qwen3.8-flash` | 0.000 | 0.000 |
 
 #### `ep-on-air-with-dan-and-alex2-574e4f303730`: Ryanair Wants Alcohol Bans, Emirates' $6.8B Record Profit & Buying Spirit Airlines?!
 
@@ -690,13 +1095,26 @@ One subsection per episode in the corpus, showing how every model performed on t
 
 | Model | F1 | F1 stdev |
 |-------|----|----------|
+| `claude-fable-5-1` | 1.000 | 0.000 |
+| `claude-haiku-4-5-20251001` | 1.000 | 0.000 |
+| `claude-opus-4-8` | 1.000 | 0.000 |
+| `claude-opus-5` | 1.000 | 0.000 |
+| `claude-opus-5-5` | 1.000 | 0.000 |
 | `google/gemini-3.1-flash-lite` | 1.000 | 0.000 |
+| `google/gemini-3.5-flash` | 1.000 | 0.000 |
 | `google/gemini-3.5-flash-lite` | 1.000 | 0.000 |
 | `qwen/qwen3.7-flash` | 1.000 | 0.000 |
+| `x-ai/grok-4.3` | 1.000 | 0.000 |
 | `deepseek/deepseek-v4-flash` | 0.950 | 0.112 |
+| `mistralai/mistral-small-2603` | 0.914 | 0.078 |
+| `claude-sonnet-5` | 0.900 | 0.137 |
 | `gemma4:e4b` | 0.806 | 0.076 |
 | `openai/gpt-oss-120b` | 0.772 | 0.193 |
 | `microsoft/phi-4` | 0.750 | 0.000 |
+| `qwen/qwen3-8b` | 0.440 | 0.130 |
+| `qwen/qwen3.8-flash` | 0.080 | 0.179 |
+| `bytedance-seed/seed-2-1-turbo` | 0.000 | 0.000 |
+| `qwen/qwen3.5-plus-02-15` | 0.000 | 0.000 |
 
 #### `ep-tosh-show-5f6894439bb6`: My Mom - Emergency Pod
 
@@ -706,28 +1124,54 @@ One subsection per episode in the corpus, showing how every model performed on t
 
 | Model | F1 | F1 stdev |
 |-------|----|----------|
+| `claude-fable-5-1` | 0.909 | 0.000 |
+| `google/gemini-3.5-flash` | 0.909 | 0.000 |
+| `claude-haiku-4-5-20251001` | 0.894 | 0.034 |
+| `x-ai/grok-4.3` | 0.865 | 0.060 |
 | `gemma4:e4b` | 0.851 | 0.084 |
-| `google/gemini-3.1-flash-lite` | 0.800 | 0.000 |
+| `claude-sonnet-5` | 0.850 | 0.055 |
+| `claude-opus-4-8` | 0.827 | 0.065 |
+| `claude-opus-5` | 0.800 | 0.000 |
+| `mistralai/mistral-small-2603` | 0.800 | 0.000 |
 | `qwen/qwen3.7-flash` | 0.800 | 0.000 |
 | `microsoft/phi-4` | 0.782 | 0.029 |
 | `google/gemini-3.5-flash-lite` | 0.756 | 0.040 |
+| `claude-opus-5-5` | 0.748 | 0.047 |
+| `google/gemini-3.1-flash-lite` | 0.733 | 0.094 |
 | `openai/gpt-oss-120b` | 0.716 | 0.147 |
 | `deepseek/deepseek-v4-flash` | 0.716 | 0.072 |
+| `qwen/qwen3-8b` | 0.515 | 0.130 |
+| `qwen/qwen3.8-flash` | 0.189 | 0.259 |
+| `bytedance-seed/seed-2-1-turbo` | 0.000 | 0.000 |
+| `qwen/qwen3.5-plus-02-15` | 0.000 | 0.000 |
 
 
 ### Parser stress test
 
 How each model's responses were actually parsed. Columns are extraction methods, ordered alphabetically; rows are models, sorted by parse-failure rate (cleanest at top). `json_array_direct` is the happy path: a bare JSON array we could `json.loads` and process immediately. `markdown_code_block` means we had to strip triple-backtick fences first; `json_object_*` means the model wrapped the array in an outer object and we had to find the array key; `regex_*` are last-resort recovery paths. A model that needs anything but `json_array_direct` for most calls is fragile. It works today, but a small prompt change can break the parser.
 
-| Model | parse_failure | segment_id_direct |
-|---|---|---|
-| `gemma4:e4b` | 0 | 235 |
-| `google/gemini-3.1-flash-lite` | 0 | 235 |
-| `google/gemini-3.5-flash-lite` | 0 | 235 |
-| `microsoft/phi-4` | 0 | 235 |
-| `openai/gpt-oss-120b` | 0 | 235 |
-| `qwen/qwen3.7-flash` | 2 | 233 |
-| `deepseek/deepseek-v4-flash` | 45 | 190 |
+| Model | bracket_fallback | json_object_no_ads | json_object_single_ad_truncated | parse_failure | segment_id_direct |
+|---|---|---|---|---|---|
+| `claude-fable-5-1` | 0 | 0 | 0 | 0 | 235 |
+| `claude-haiku-4-5-20251001` | 0 | 0 | 0 | 0 | 235 |
+| `claude-opus-4-8` | 0 | 0 | 0 | 0 | 235 |
+| `claude-opus-5` | 0 | 0 | 0 | 0 | 235 |
+| `claude-opus-5-5` | 0 | 0 | 0 | 0 | 235 |
+| `claude-sonnet-5` | 0 | 0 | 0 | 0 | 235 |
+| `gemma4:e4b` | 0 | 0 | 0 | 0 | 235 |
+| `google/gemini-3.1-flash-lite` | 0 | 0 | 10 | 0 | 225 |
+| `google/gemini-3.5-flash` | 0 | 0 | 6 | 0 | 229 |
+| `google/gemini-3.5-flash-lite` | 0 | 0 | 0 | 0 | 235 |
+| `microsoft/phi-4` | 0 | 0 | 0 | 0 | 235 |
+| `mistralai/mistral-small-2603` | 0 | 0 | 0 | 0 | 235 |
+| `openai/gpt-oss-120b` | 0 | 0 | 0 | 0 | 235 |
+| `x-ai/grok-4.3` | 0 | 0 | 0 | 0 | 235 |
+| `qwen/qwen3.7-flash` | 0 | 0 | 0 | 2 | 233 |
+| `deepseek/deepseek-v4-flash` | 0 | 0 | 0 | 45 | 190 |
+| `qwen/qwen3-8b` | 0 | 26 | 0 | 116 | 93 |
+| `qwen/qwen3.8-flash` | 0 | 0 | 2 | 173 | 60 |
+| `bytedance-seed/seed-2-1-turbo` | 1 | 0 | 0 | 220 | 14 |
+| `qwen/qwen3.5-plus-02-15` | 0 | 0 | 0 | 230 | 5 |
 
 ## Methodology
 
@@ -737,7 +1181,7 @@ Reproducibility settings used for this run. The benchmark sends the same prompts
 - max_tokens: 4096 (matches MinusPod production)
 - response_format: json_object (with prompt-injection fallback when provider rejects native)
 - Window size: 10 min, overlap: 3 min (imported from MinusPod's create_windows)
-- Pricing snapshot: 2026-08-23T20:34:27.481692Z
+- Pricing snapshot: 2026-10-07T08:48:49.567770Z
 - Corpus episodes: 15
 
 ## Transcript source
@@ -969,15 +1413,15 @@ The `initial_prompt` seeded a sponsor vocabulary so Whisper produced consistent 
 
 ## Run Metadata
 
-- Report generated: 2026-10-07T08:41:01Z
-- Unique work units (current state, last-write-wins after retries): 1645
-- Raw rows in calls.jsonl: 1880 (235 superseded by later retries; kept for audit)
-- Successful: 1645
+- Report generated: 2026-10-08T03:42:29Z
+- Unique work units (current state, last-write-wins after retries): 4700
+- Raw call records: 5170 (470 superseded by later retries; kept for audit)
+- Successful: 4700
 - Failed: 0
-- Lifetime list-price cost (sum of at-runtime costs, includes superseded rows): $1.1338
-- Lifetime tokens (same basis): 6,570,120 in + 3,184,026 out = 9,754,146
+- Lifetime list-price cost (sum of at-runtime costs, includes superseded rows): $40.4122
+- Lifetime tokens (same basis): 17,621,050 in + 7,399,417 out = 25,020,467
 - Note: every input token is priced at list rate. Providers that serve a repeated prompt from cache bill less than this, and the harness does not record cache hits, so a real invoice for this run will come in under the figure above.
-- Active pricing snapshot: 2026-08-23T20:34:27.481692Z
+- Active pricing snapshot: 2026-10-07T08:48:49.567770Z
 - Addressing mode: segment_ids
 - Prompt variant: segmentation
 - System prompt: segmentation-v1.txt (sha256:85b53077)

@@ -154,7 +154,7 @@ def precompute_prompt_hashes(
 
 
 def reconstruct_user_prompt(record: dict, *, corpus_dir: Path) -> str:
-    """Rebuild the exact user prompt for a calls.jsonl record from the corpus.
+    """Rebuild the exact user prompt for a call record from the corpus.
 
     Uses the record's own ``addressing_mode`` (records written before this
     field existed default to 'timestamps'). Deterministic as long as the

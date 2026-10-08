@@ -161,7 +161,7 @@ def regenerate_windows_cmd(
     _setup_logging()
     cfg = _load(config_path)
     if not force:
-        typer.echo("regenerate-windows requires --force (invalidates prior calls.jsonl entries for this episode).")
+        typer.echo("regenerate-windows requires --force (invalidates prior call records for this episode).")
         raise typer.Exit(2)
     n = capture_mod.regenerate_windows(ep_id, corpus_dir=cfg.corpus.path)
     typer.echo(f"regenerated {n} windows for {ep_id}")
@@ -246,7 +246,7 @@ def run(
         [], "--episode", help="Only run this episode directory name (exact match); repeatable. Unknown names exit 2.",
     ),
 ) -> None:
-    """Auto-fill all gaps in calls.jsonl, then regenerate report."""
+    """Auto-fill all gaps in the call records, then regenerate report."""
     _setup_logging()
     _validate_addressing_mode(addressing_mode)
     _validate_prompt_variant(prompt_variant)
@@ -328,7 +328,7 @@ def report(
     ),
     addressing_mode: str = typer.Option(
         "timestamps", "--addressing-mode",
-        help="Regenerate the report from only the calls.jsonl rows recorded under this "
+        help="Regenerate the report from only the call records recorded under this "
         "addressing mode (records without the field are 'timestamps'). A report never "
         "mixes modes; run this twice to get both sides of an A/B.",
     ),
@@ -338,7 +338,7 @@ def report(
         "'detection' (default, live/snapshot prompt) or 'segmentation' (frozen prompt).",
     ),
 ) -> None:
-    """Regenerate results/report.md from existing calls.jsonl."""
+    """Regenerate results/report.md from the existing call records."""
     _setup_logging()
     _validate_addressing_mode(addressing_mode)
     _validate_prompt_variant(prompt_variant)
@@ -509,7 +509,7 @@ def _find_call_or_exit(paths: runner_mod.RunPaths, call_id: str) -> dict:
 
 @app.command("show-prompt")
 def show_prompt_cmd(
-    call_id: str = typer.Argument(..., help="call_id from calls.jsonl"),
+    call_id: str = typer.Argument(..., help="call_id from the call records"),
     config_path: Path = typer.Option(Path("benchmark.toml"), "--config"),
     snapshot: Path | None = typer.Option(
         None, "--snapshot",
@@ -581,7 +581,7 @@ def show_prompt_cmd(
 
 @app.command("show-response")
 def show_response_cmd(
-    call_id: str = typer.Argument(..., help="call_id from calls.jsonl"),
+    call_id: str = typer.Argument(..., help="call_id from the call records"),
 ) -> None:
     """Print the raw LLM response body for a call from its per-model shard."""
     paths = runner_mod.RunPaths.for_root(_root() / "results")

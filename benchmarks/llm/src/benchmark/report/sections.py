@@ -687,7 +687,7 @@ def _render_run_metadata(
     ]
     if raw_calls is not None and len(raw_calls) != total_calls:
         lines.append(
-            f"- Raw rows in calls.jsonl: {len(raw_calls)} "
+            f"- Raw call records: {len(raw_calls)} "
             f"({len(raw_calls) - total_calls} superseded by later retries; kept for audit)"
         )
     lines += [

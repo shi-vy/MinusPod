@@ -121,7 +121,7 @@ def render(
     mixed = campaign_mixing(raw_calls)
     if mixed:
         logger.warning(
-            "calls.jsonl holds more than one campaign: %d work units across %d models carry "
+            "call records hold more than one campaign: %d work units across %d models carry "
             "two prompt hashes. Dedup keeps the last row per unit regardless of prompt, so "
             "any unit not re-run this campaign still shows the older result. Run "
             "`benchmark rotate-raw` between campaigns.",

@@ -87,7 +87,7 @@ def render(
         "Detection scores every ad the model returned; segmentation keeps only "
         "sponsor, cross_promo, self_promo, and interaction segments, so the two "
         "variants are not scored against the same definition of 'ad'. Each "
-        "cell's columns below come from that cell's own calls.jsonl rows and "
+        "cell's columns below come from that cell's own call records and "
         "match the corresponding per-cell report. One row per model that has "
         "rows in at least two cells; a model present in only one cell is "
         "omitted. The delta and p-value columns compare segmentation/segment_ids "

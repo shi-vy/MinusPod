@@ -52,7 +52,7 @@ Every term the app uses, in plain words, with a link to the part of the docs tha
 
 **Confidence** - The detector's certainty (0-100%) that a flagged region is an ad. Only detections at or above the cut threshold are removed; the rest stay in the audio for review. [Configuration > Ad Detection Settings](configuration.md#ad-detection-settings)
 
-**Contaminated pattern** - A learned ad pattern that contains show content or other material that should not be matched as an ad. Pattern Cleanup can flag it for review; nothing changes until a suggestion is approved. [Pattern Cleanup](pattern-cleanup.md#the-five-kinds)
+**Contaminated pattern** - A learned ad pattern that contains show content or other material that should not be matched as an ad. Pattern Cleanup can flag it for review; nothing changes until a suggestion is approved. [Pattern Cleanup](pattern-cleanup.md#suggestion-kinds)
 
 **Correction** - Your verdict on a detection: "Confirm ad" or "Not an ad". Corrections train future detection for that feed and can trigger a recut. [Web Interface > Ad Review tab](web-interface.md#ad-review-tab)
 
@@ -152,7 +152,7 @@ Every term the app uses, in plain words, with a link to the part of the docs tha
 
 **Pattern** - Anything MinusPod has learned from confirmed ads and reapplies to new episodes: text patterns from transcripts and audio fingerprints. Patterns catch repeat ads without spending LLM tokens. [How It Works > Pattern Learning](how-it-works.md#pattern-learning)
 
-**Pattern Cleanup** - An experiment that reviews learned text patterns with an LLM and suggests trims, splits, sponsor corrections, and disabling unused or unreliable patterns. It supports scheduled and manual runs, with a separate provider and model choice. [Pattern Cleanup](pattern-cleanup.md)
+**Pattern Cleanup** - An experiment that reviews learned text patterns with an LLM and suggests trims, splits, sponsor corrections, category changes, and disabling unused or unreliable patterns. It supports scheduled and manual runs, with a separate provider and model choice. [Pattern Cleanup](pattern-cleanup.md)
 
 **Podping** - An opt-in listener that watches the Hive blockchain for publish notifications and refreshes a matching feed immediately. System Health identifies the active RPC node, checks every fallback every five minutes, and can check them on demand. Scheduled feed polling continues either way. [Podcasting 2.0 > Podping](podcasting-2.0.md#podping)
 
@@ -180,7 +180,7 @@ Every term the app uses, in plain words, with a link to the part of the docs tha
 
 **Resurrected** - A detection the validator rejected that the Ad Reviewer overruled and put back in the cut list. [Configuration > Ad Reviewer](configuration.md#ad-reviewer)
 
-**Retired pattern** - A pattern disabled after an approved cleanup suggestion because it has gone unused. Its record is retained and the approval can be undone if it has not been changed afterward. [Pattern Cleanup > The five kinds](pattern-cleanup.md#the-five-kinds)
+**Retired pattern** - A pattern disabled after an approved cleanup suggestion because it has gone unused. Its record is retained and the approval can be undone if it has not been changed afterward. [Pattern Cleanup > Suggestion kinds](pattern-cleanup.md#suggestion-kinds)
 
 **Retention** - How long processed audio is kept before the episode resets to Discovered. The pre-cut original can have its own shorter window, and any feed can override the whole window on its own settings page. [Configuration > Per-feed retention](configuration.md#per-feed-retention)
 

@@ -4249,7 +4249,7 @@ paths:
           schema: { type: string, enum: [pending, approved, rejected, undone] }
         - name: kind
           in: query
-          schema: { type: string, enum: [trim, split, rename, retire, flag] }
+          schema: { type: string, enum: [trim, split, rename, retire, flag, category] }
         - name: limit
           in: query
           schema: { type: integer, default: 50, minimum: 1, maximum: 200 }
@@ -11838,7 +11838,7 @@ components:
           type: integer
         kind:
           type: string
-          enum: [trim, split, rename, retire, flag]
+          enum: [trim, split, rename, retire, flag, category]
         status:
           type: string
           enum: [pending, approved, rejected, undone]
@@ -11853,18 +11853,24 @@ components:
         payload:
           type: object
           description: >-
-            Shape depends on kind: trim {text, sponsor?}; split {pieces: [{text,
-            sponsor}]}; rename {sponsor}; retire {unusedDays, lastMatchedAt,
+            Shape depends on kind: trim {text, sponsor?, category?}; split
+            {pieces: [{text, sponsor, category?}]}; rename {sponsor, category?};
+            category {category}; retire {unusedDays, lastMatchedAt,
             confirmationCount}; flag {falsePositiveCount, confirmationCount,
-            contaminated, contaminationReason, recommended, trimText?, sponsor?}.
-            A trim's optional sponsor applies a sponsor correction in the
-            same approval as the text edit.
+            contaminated, contaminationReason, recommended, trimText?, sponsor?, category?}.
+            Combined text, sponsor, and category edits apply in one approval.
+            Categories are sponsor, cross_promo, self_promo, interaction,
+            intro, outro, and recap.
         before:
           type: [object, 'null']
           description: Snapshot of the pattern at suggestion time, used to undo an approval.
           properties:
             textTemplate:
               type: [string, 'null']
+            category:
+              type: [string, 'null']
+              enum: [sponsor, cross_promo, self_promo, interaction, intro, outro, recap, null]
+              description: Original category; absent in older suggestions.
             sponsor:
               type: [string, 'null']
             sponsorId:

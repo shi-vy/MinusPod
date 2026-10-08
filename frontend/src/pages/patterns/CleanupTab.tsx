@@ -7,6 +7,7 @@ import {
   patternCleanupQueryKey, rejectCleanupSuggestion, undoCleanupSuggestion,
   type CleanupKind, type CleanupStatus, type FlagPayload, type PatternCleanupSuggestion,
   type RenamePayload, type RetirePayload, type SplitPayload, type TrimPayload,
+  type CategoryPayload,
 } from '../../api/patternCleanup';
 import { ApiError, getErrorMessage } from '../../api/client';
 import SegmentedToggle from '../../components/SegmentedToggle';
@@ -19,6 +20,7 @@ import { btnOutline, btnPrimary } from '../../components/buttonStyles';
 import { cardActionBtn } from '../../components/rowActionStyles';
 import { focusRing, selectBase } from '../../components/fieldStyles';
 import { formatDate } from '../../utils/format';
+import { SEGMENT_CATEGORY_LABELS, type SegmentCategory } from '../../utils/segmentCategory';
 import { TrimDiff } from './TrimDiff';
 
 type KindFilter = CleanupKind | 'all';
@@ -30,6 +32,7 @@ const KIND_OPTIONS: Array<{ value: KindFilter; label: string }> = [
   { value: 'rename', label: 'Rename' },
   { value: 'retire', label: 'Retire' },
   { value: 'flag', label: 'Flag' },
+  { value: 'category', label: 'Category' },
 ];
 
 const KIND_BADGE: Record<CleanupKind, [string, string]> = {
@@ -38,6 +41,7 @@ const KIND_BADGE: Record<CleanupKind, [string, string]> = {
   rename: ['Rename', tint.blue],
   retire: ['Retire', tint.neutral],
   flag: ['Flag', tint.warning],
+  category: ['Category', tint.blue],
 };
 
 const STATUS_OPTIONS: Array<[CleanupStatus, string]> = [
@@ -86,6 +90,17 @@ function SponsorRename({ from, to, combined = false }: { from: string; to: strin
   );
 }
 
+function CategoryChange({ from, to }: { from?: SegmentCategory | null; to: SegmentCategory }) {
+  return (
+    <p className="text-sm">
+      <span className="text-muted-foreground">Category: </span>
+      <span className="text-muted-foreground">{from ? SEGMENT_CATEGORY_LABELS[from] : 'Uncategorized'}</span>
+      <ArrowRight className="mx-1 inline h-4 w-4 text-muted-foreground" aria-hidden="true" />
+      <span className="font-medium text-foreground">{SEGMENT_CATEGORY_LABELS[to]}</span>
+    </p>
+  );
+}
+
 // One renderer per kind, keyed like KIND_BADGE.
 const PROPOSED_CHANGE: Record<CleanupKind, (s: PatternCleanupSuggestion, original: string) => ReactNode> = {
   trim: (s, original) => {
@@ -99,6 +114,7 @@ const PROPOSED_CHANGE: Record<CleanupKind, (s: PatternCleanupSuggestion, origina
             combined
           />
         )}
+        {payload.category && <CategoryChange from={s.before?.category} to={payload.category} />}
         <TrimDiff original={original} kept={payload.text} />
       </div>
     );
@@ -110,6 +126,9 @@ const PROPOSED_CHANGE: Record<CleanupKind, (s: PatternCleanupSuggestion, origina
         {pieces.map((piece, i) => (
           <div key={i} data-testid="split-piece" className="rounded border border-border bg-muted/40 p-3 min-w-0">
             <span className={`${badgeBase} ${tint.secondary}`}>{piece.sponsor}</span>
+            {piece.category && (
+              <CategoryChange from={s.before?.category} to={piece.category} />
+            )}
             <p className="mt-2 text-sm leading-relaxed whitespace-pre-wrap break-words">{piece.text}</p>
             <details className="mt-2 border-t border-border pt-2">
               <summary className="flex max-sm:min-h-11 cursor-pointer items-center text-sm text-muted-foreground">
@@ -124,7 +143,13 @@ const PROPOSED_CHANGE: Record<CleanupKind, (s: PatternCleanupSuggestion, origina
   },
   rename: (s) => {
     const from = s.before?.sponsor ?? s.pattern?.sponsor ?? '(Unknown)';
-    return <SponsorRename from={from} to={(s.payload as RenamePayload).sponsor} />;
+    const payload = s.payload as RenamePayload;
+    return (
+      <div className="space-y-2">
+        <SponsorRename from={from} to={payload.sponsor} />
+        {payload.category && <CategoryChange from={s.before?.category} to={payload.category} />}
+      </div>
+    );
   },
   retire: (s) => {
     const p = s.payload as RetirePayload;
@@ -161,11 +186,16 @@ const PROPOSED_CHANGE: Record<CleanupKind, (s: PatternCleanupSuggestion, origina
                 combined
               />
             )}
+            {p.category && <CategoryChange from={s.before?.category} to={p.category} />}
             <TrimDiff original={original} kept={p.trimText} />
           </div>
         )}
       </div>
     );
+  },
+  category: (s) => {
+    const payload = s.payload as CategoryPayload;
+    return <CategoryChange from={s.before?.category} to={payload.category} />;
   },
 };
 

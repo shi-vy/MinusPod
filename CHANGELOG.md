@@ -9,6 +9,11 @@ Alongside the standard sections, a "Breaking" section marks changes
 that require operator action; these are surfaced at the top of stable
 release notes.
 
+## [Unreleased]
+
+### Added
+- Pattern Cleanup can suggest category changes alongside text and sponsor edits, including separate categories for split patterns.
+
 ## [2.98.2] - 2026-10-07
 
 ### Fixed

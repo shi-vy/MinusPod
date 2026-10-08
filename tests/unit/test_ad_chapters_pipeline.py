@@ -19,6 +19,7 @@ _test_data_dir = bootstrap('ad_chapters_pipeline_test_', reset_storage=True)
 
 import chapters_generator
 import run_context
+from api import get_storage
 from ad_chapters import AdChapterConfig, public_chapters
 from llm_client import ProviderRateLimitedError
 from main_app import processing
@@ -268,6 +269,7 @@ def _post_regenerate(app_client, generated, ad_config=_UNSET):
          patch('api.episodes.resolve_ad_chapter_config',
                lambda db, row: resolved), \
          patch('main_app.processing._refresh_rss_for_slug'):
+        generator.return_value.chapters_degraded = False
         if callable(generated):
             generator.return_value.generate_chapters.side_effect = generated
         else:
@@ -296,6 +298,72 @@ def test_regenerate_endpoint_merges_ad_chapters(app_client, seeded):
         {'startTime': 960, 'title': 'Show'}]
     assert row['chapters_regen_started_at'] is None
     assert row['chapters_regen_error'] is None
+
+
+def test_degraded_manual_regeneration_keeps_existing_chapters_and_recovers(app_client, seeded):
+    storage = get_storage()
+    existing = {'version': '1.2.0', 'chapters': [{'startTime': 1, 'title': 'Existing'}]}
+    storage.save_chapters_json(SLUG, EPISODE_ID, existing)
+    headers = _authed(app_client)
+
+    with patch('api.episodes.threading', SimpleNamespace(Thread=SyncThread)), \
+         patch('api.episodes.ChaptersGenerator') as generator, \
+         patch('api.episodes.embed_chapters') as embed, \
+         patch('main_app.processing._refresh_rss_for_slug') as refresh:
+        generator.return_value.chapters_degraded = True
+        generator.return_value.generate_chapters.return_value = {
+            'version': '1.2.0', 'chapters': [{'startTime': 1, 'title': 'Fallback'}]}
+        response = app_client.post(
+            f'/api/v1/feeds/{SLUG}/episodes/{EPISODE_ID}/regenerate-chapters',
+            headers=headers)
+
+        assert response.status_code == 202, response.data
+        detail = app_client.get(f'/api/v1/feeds/{SLUG}/episodes/{EPISODE_ID}').get_json()
+        assert detail['chaptersRegenError']
+        assert 'existing chapters were kept' in detail['chaptersRegenError'].lower()
+        assert storage.get_chapters_json(SLUG, EPISODE_ID) == existing
+        embed.assert_not_called()
+        refresh.assert_not_called()
+
+        generator.return_value.chapters_degraded = False
+        generator.return_value.generate_chapters.return_value = {
+            'version': '1.2.0', 'chapters': [{'startTime': 1, 'title': 'Recovered'}]}
+        response = app_client.post(
+            f'/api/v1/feeds/{SLUG}/episodes/{EPISODE_ID}/regenerate-chapters',
+            headers=headers)
+
+    assert response.status_code == 202, response.data
+    detail = app_client.get(f'/api/v1/feeds/{SLUG}/episodes/{EPISODE_ID}').get_json()
+    assert detail['chaptersRegenError'] is None
+    assert storage.get_chapters_json(SLUG, EPISODE_ID)['chapters'] == [
+        {'startTime': 1, 'title': 'Recovered'}]
+
+
+@pytest.mark.parametrize('response', ['', 'Opening topic'])
+def test_incomplete_titles_preserve_existing_chapters(app_client, seeded, monkeypatch, response):
+    storage = get_storage()
+    existing = {'version': '1.2.0', 'chapters': [{'startTime': 1, 'title': 'Existing'}]}
+    storage.save_chapters_json(SLUG, EPISODE_ID, existing)
+    generator = chapters_generator.ChaptersGenerator(api_key='test')
+    generator._llm_client = MagicMock()
+    monkeypatch.setattr(generator, '_detect_boundaries_windowed', lambda *args, **kwargs: [
+        {'original_time': 600, 'title': None}])
+    monkeypatch.setattr(chapters_generator, 'call_llm', lambda **kwargs: (
+        SimpleNamespace(content=response), None))
+    headers = _authed(app_client)
+    with patch('api.episodes.threading', SimpleNamespace(Thread=SyncThread)), \
+         patch('api.episodes.ChaptersGenerator', return_value=generator), \
+         patch('api.episodes.embed_chapters') as embed, \
+         patch('main_app.processing._refresh_rss_for_slug') as refresh:
+        result = app_client.post(
+            f'/api/v1/feeds/{SLUG}/episodes/{EPISODE_ID}/regenerate-chapters', headers=headers)
+
+    assert result.status_code == 202
+    assert generator.chapters_degraded is True
+    assert 'existing chapters were kept' in seeded.get_episode(SLUG, EPISODE_ID)['chapters_regen_error'].lower()
+    assert storage.get_chapters_json(SLUG, EPISODE_ID) == existing
+    embed.assert_not_called()
+    refresh.assert_not_called()
 
 
 def test_regenerate_endpoint_skips_ad_chapters_without_applied_cuts(app_client, seeded):

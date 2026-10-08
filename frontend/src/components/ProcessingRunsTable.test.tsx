@@ -398,3 +398,35 @@ describe('failed run error disclosure', () => {
     expect(screen.getAllByText('failed').length).toBeGreaterThan(0);
   });
 });
+
+describe('chapter degradation result', () => {
+  it('warns for a completed fallback in the desktop table and mobile card', () => {
+    const degradedRun: EpisodeProcessingRun = {
+      ...statsRun,
+      stats: {
+        ...statsRun.stats!,
+        chaptersDegraded: true,
+        chaptersDegradedReason: 'Chapter AI is unavailable. Check Settings > AI Models, then try again.',
+      },
+    };
+    render(<ProcessingRunsTable runs={[degradedRun]} />);
+
+    expect(screen.getAllByText('completed with chapter warning')).toHaveLength(2);
+    expect(screen.getAllByText(degradedRun.stats!.chaptersDegradedReason!)).toHaveLength(2);
+    expect(screen.getAllByText(/regenerate chapters after recovery/i)).toHaveLength(2);
+  });
+
+  it('keeps legacy and failed runs on their existing result labels', () => {
+    render(<ProcessingRunsTable runs={[legacyRun, {
+      ...legacyRun,
+      runNumber: 8,
+      status: 'failed',
+      errorMessage: 'Audio processing failed',
+      stats: { chaptersDegraded: true, chaptersDegradedReason: 'Chapter warning' },
+    }]} />);
+
+    expect(screen.getAllByText('completed')).toHaveLength(2);
+    expect(screen.getAllByRole('button', { name: /failed/i })).toHaveLength(2);
+    expect(screen.queryByText('completed with chapter warning')).toBeNull();
+  });
+});

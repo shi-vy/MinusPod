@@ -17,6 +17,7 @@ release notes.
 
 ### Fixed
 - Retired search-index cleanup uses smaller write batches so it releases the database lock more often.
+- Processing history shows chapter-generation warnings. Failed chapter regeneration keeps existing chapters and reports the failure. Chapter generation respects cancellation and provider changes, and detailed response text is logged only at debug level.
 
 ## [2.98.2] - 2026-10-07
 

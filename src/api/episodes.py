@@ -498,6 +498,10 @@ def _run_stats_to_api(stats):
             'ffmpegSeconds': timings.get('ffmpeg'),
         } if timings is not None else None,
     }
+    if 'chapters_degraded' in stats:
+        result['chaptersDegraded'] = stats['chapters_degraded']
+    if 'chapters_degraded_reason' in stats:
+        result['chaptersDegradedReason'] = stats['chapters_degraded_reason']
     transcription = stats.get('transcription')
     if transcription:
         result['transcription'] = {
@@ -1379,6 +1383,10 @@ def _regenerate_chapters(db, storage, slug, episode_id, episode, podcast, podcas
             marker_cuts=marker_cuts,
             slug=slug,
         )
+        if getattr(chapters_gen, 'chapters_degraded', False) is True:
+            raise RuntimeError(
+                'Chapter generation was incomplete. Existing chapters were kept. '
+                'Check Settings > AI Models and try again after recovery.')
 
         # A reprocess finishing during the LLM call above rewrote the transcript
         # these chapters came from, so they no longer describe the served audio.

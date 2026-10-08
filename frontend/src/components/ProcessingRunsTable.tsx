@@ -60,7 +60,18 @@ function RunCost({ run }: { run: EpisodeProcessingRun }) {
 // hover title used to hide, and the copy action lifts it out for a report.
 function RunResult({ run }: { run: EpisodeProcessingRun }) {
   const [open, setOpen] = useState(false);
-  if (run.status !== 'failed') return <>completed</>;
+  if (run.status !== 'failed') {
+    if (!run.stats?.chaptersDegraded) return <>completed</>;
+    return (
+      <div className="flex flex-col items-start gap-1">
+        <span className="text-amber-700 dark:text-amber-300">completed with chapter warning</span>
+        <div className="w-full max-w-xs whitespace-normal break-words rounded border border-amber-500/40 bg-amber-500/10 p-2 text-xs">
+          {run.stats.chaptersDegradedReason && <p>{run.stats.chaptersDegradedReason}</p>}
+          <p className="mt-1">Check Settings &gt; AI Models, or regenerate chapters after recovery.</p>
+        </div>
+      </div>
+    );
+  }
   if (!run.errorMessage) return <span className="text-destructive">failed</span>;
   const panelId = `run-error-${run.runNumber}`;
   return (

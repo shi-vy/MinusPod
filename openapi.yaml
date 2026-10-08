@@ -13482,6 +13482,12 @@ components:
                 - boolean
                 - 'null'
               description: True when the run skipped ad detection because the feed has skipAdDetection set
+            chaptersDegraded:
+              type: boolean
+              description: Chapter generation used a fallback; absent on runs without this diagnostic.
+            chaptersDegradedReason:
+              type: string
+              description: Reason chapter generation used a fallback.
             verificationSkipped:
               type:
                 - boolean

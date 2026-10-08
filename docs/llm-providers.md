@@ -252,7 +252,9 @@ its own provider and model selectors. Each can inherit detection's choice.
 Choose a higher-quality model when reviewing patterns: an approved pattern
 can affect matches in many later episodes.
 
-Switching a stage's slot only changes that stage. Model discovery re-runs for the newly selected slot, so the model dropdown next to it shows that slot's own catalog. Every other stage's slot and model stay exactly as you left them. A stage still accepts a hand-typed model ID (the "Type a model ID" link) for models a slot's catalog does not list, the same as the single-provider case. If a stage is set to Provider B and Provider B is later disabled, that stage falls back to Provider A until Provider B is turned back on.
+Switching a stage's slot only changes that stage. Model discovery re-runs for the newly selected slot, so the model dropdown next to it shows that slot's own catalog. Other stages keep their slot and model unless their provider account also changes.
+
+When a provider type, custom endpoint, or stage route changes the account used by a stage, MinusPod clears that stage's saved model. Empty fields show a reminder to choose a model and stay blank after reload until you choose a replacement. A stage still accepts a hand-typed model ID (the "Type a model ID" link) for models a slot's catalog does not list. Changing only an API key keeps model selections. If a stage is set to Provider B and Provider B is later disabled, that stage falls back to Provider A until Provider B is turned back on.
 
 Each slot needs its own API key and, where relevant, base URL configured under Settings > LLM Provider before a stage can use it; an unconfigured slot's model list comes back empty until credentials are saved.
 

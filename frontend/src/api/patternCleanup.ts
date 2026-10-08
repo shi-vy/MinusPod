@@ -19,6 +19,7 @@ export interface PatternCleanupSettings {
 }
 
 export interface PatternCleanupStatus extends PatternCleanupSettings {
+  modelMissing: boolean;
   inProgress: boolean;
   // Start of the newest run, including one still running.
   lastRun: string | null;

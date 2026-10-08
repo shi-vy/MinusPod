@@ -14,7 +14,8 @@ KNOWN_STATUSES = ('pending', 'approved', 'rejected', 'undone')
 
 
 def cleanup_settings_view(db) -> dict:
-    """The six pattern cleanup settings, camelCased. Shared with PUT /settings/pattern-cleanup."""
+    """Pattern cleanup settings in the API's camelCase form."""
+    model = db.get_setting('pattern_cleanup_model')
     return {
         'enabled': db.get_setting_bool(
             'pattern_cleanup_enabled', registry_get_default('pattern_cleanup_enabled')),
@@ -24,7 +25,8 @@ def cleanup_settings_view(db) -> dict:
         'unusedDays': db.get_setting_int(
             'pattern_cleanup_unused_days', registry_get_default('pattern_cleanup_unused_days')),
         'provider': db.get_setting('pattern_cleanup_provider') or '',
-        'model': db.get_setting('pattern_cleanup_model') or '',
+        'model': model or '',
+        'modelMissing': model == '',
     }
 
 

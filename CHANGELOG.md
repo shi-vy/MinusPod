@@ -13,6 +13,7 @@ release notes.
 
 ### Added
 - Pattern Cleanup can suggest category changes alongside text and sponsor edits, including separate categories for split patterns.
+- Podping settings let users add, edit, remove, and reset RPC servers through the UI and API.
 
 ### Fixed
 - Retired search-index cleanup uses smaller write batches so it releases the database lock more often.

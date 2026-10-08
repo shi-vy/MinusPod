@@ -9481,6 +9481,63 @@ paths:
                         tag:         { type: string }
                         description: { type: string }
 
+  /podping/nodes:
+    get:
+      summary: Get configured Podping RPC servers
+      operationId: getPodpingNodes
+      tags: [Settings]
+      responses:
+        '200':
+          description: Effective server list and shipped defaults
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PodpingNodeSettings'
+    put:
+      summary: Replace the Podping RPC server list
+      operationId: updatePodpingNodes
+      tags: [Settings]
+      description: >-
+        Normalizes and deduplicates endpoint URLs. Changes apply to the running
+        listener without resetting its block position. URLs must use HTTP or
+        HTTPS and cannot contain credentials, query strings, or fragments.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [nodes]
+              properties:
+                nodes:
+                  $ref: '#/components/schemas/PodpingNodeUrls'
+      responses:
+        '200':
+          description: Saved server list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PodpingNodeSettings'
+        '400':
+          description: Invalid or empty server list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /podping/nodes/reset:
+    post:
+      summary: Restore the default Podping RPC servers
+      operationId: resetPodpingNodes
+      tags: [Settings]
+      responses:
+        '200':
+          description: Shipped server list restored
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PodpingNodeSettings'
+
   /podping/hosts:
     get:
       summary: List domains seen sending Podpings on the Hive chain
@@ -11729,6 +11786,23 @@ components:
         finishedAt:
           type: string
           description: ISO 8601 UTC timestamp when the backup completed.
+
+    PodpingNodeUrls:
+      type: array
+      minItems: 1
+      maxItems: 20
+      items:
+        type: string
+        format: uri
+        maxLength: 2048
+    PodpingNodeSettings:
+      type: object
+      required: [nodes, defaults]
+      properties:
+        nodes:
+          $ref: '#/components/schemas/PodpingNodeUrls'
+        defaults:
+          $ref: '#/components/schemas/PodpingNodeUrls'
 
     PatternCleanupSettings:
       type: object

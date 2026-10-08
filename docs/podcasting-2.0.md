@@ -240,6 +240,13 @@ configured feeds. On a match, MinusPod stamps that feed's "last
 podping" time and triggers an immediate refresh of that one feed,
 instead of waiting for the next scheduled RSS poll.
 
+The Hive RPC node list is editable beneath that toggle. Add between 1
+and 20 HTTP(S) endpoint URLs, remove or reorder them, then save. MinusPod
+normalizes and deduplicates the list, and rotates through it for listener
+traffic and health checks. **Reset defaults** restores the shipped node
+list. These RPC endpoints are separate from the observed feed hosts shown
+in System Health.
+
 Which senders count is up to each feed. A feed can name the accounts
 allowed to podping it with `<podcast:hiveAccount account="...">` inside
 its `<podcast:podping>` tag, and MinusPod ignores podpings for that feed

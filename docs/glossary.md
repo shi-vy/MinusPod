@@ -154,7 +154,7 @@ Every term the app uses, in plain words, with a link to the part of the docs tha
 
 **Pattern Cleanup** - An experiment that reviews learned text patterns with an LLM and suggests trims, splits, sponsor corrections, category changes, and disabling unused or unreliable patterns. It supports scheduled and manual runs, with a separate provider and model choice. [Pattern Cleanup](pattern-cleanup.md)
 
-**Podping** - An opt-in listener that watches the Hive blockchain for publish notifications and refreshes a matching feed immediately. System Health identifies the active RPC node, checks every fallback every five minutes, and can check them on demand. Scheduled feed polling continues either way. [Podcasting 2.0 > Podping](podcasting-2.0.md#podping)
+**Podping** - An opt-in listener that watches the Hive blockchain for publish notifications and refreshes a matching feed immediately. Its RPC server list is editable in settings and through the API. System Health identifies the active RPC node, checks every fallback every five minutes, and can check them on demand. Scheduled feed polling continues either way. [Podcasting 2.0 > Podping](podcasting-2.0.md#podping)
 
 **Processing mode** - The per-feed preset that decides what the pipeline does with each episode: standard ad removal, keep-content detection, skip ad detection (transcripts and chapters only), pass-through, or cue-only (cuts from cue pairs and previously learned ad patterns, no LLM call). One select in Feed Settings; the REST API also accepts the underlying per-field flags. [How It Works](how-it-works.md)
 

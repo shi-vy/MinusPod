@@ -7,11 +7,30 @@
  * their own card, SegmentActionsSection; see SegmentActionsSection.test.tsx.
  */
 import { useState } from 'react';
-import { beforeEach, describe, it, expect } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { beforeEach, describe, it, expect, vi } from 'vitest';
+import { render as rtlRender, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import GlobalDefaultsSection from './GlobalDefaultsSection';
 import type { EpisodeLogLevel, LowAdYieldAction } from '../../api/types';
+
+vi.mock('../../api/podping', () => ({
+  podpingNodesQueryKey: ['podping', 'nodes'],
+  getPodpingNodes: async () => ({
+    nodes: ['https://one.example'], defaults: ['https://one.example'],
+  }),
+  updatePodpingNodes: async (nodes: string[]) => ({ nodes, defaults: nodes }),
+  resetPodpingNodes: async () => ({
+    nodes: ['https://one.example'], defaults: ['https://one.example'],
+  }),
+}));
+
+function render(ui: React.ReactElement) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return rtlRender(
+    <QueryClientProvider client={client}>{ui}</QueryClientProvider>,
+  );
+}
 
 function Harness({ onCommit }: { onCommit: (minutes: number) => void }) {
   const [minutes, setMinutes] = useState(15);

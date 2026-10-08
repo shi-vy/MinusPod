@@ -11,7 +11,7 @@ from typer.testing import CliRunner
 from benchmark import cli, corpus, report as report_mod, runner, variants
 from benchmark.llm import LLMResponse
 from benchmark.pricing import PricingSnapshot
-from benchmark.storage import append_jsonl, read_jsonl
+from benchmark.storage import append_call, read_calls, read_jsonl
 
 from tests.test_addressing_mode import CALL_TEMPLATE, SEGMENTS
 from tests.test_cli import write_minimal_config
@@ -84,22 +84,21 @@ def test_run_writes_prompt_variant_on_record(tmp_path, minimal_cfg, make_episode
         minimal_cfg, [ep], paths=paths, pricing_snapshot=pricing_snapshot, system_prompt="S",
         prompt_variant="segmentation",
     ))
-    records = list(read_jsonl(paths.calls_jsonl))
+    records = list(read_calls(paths.raw))
     assert records
     assert all(r["prompt_variant"] == "segmentation" for r in records)
 
 
 def test_derive_episode_results_keeps_rows_for_two_variants(tmp_path, minimal_cfg, make_episode):
     ep = make_episode(n_windows=1)
-    calls_path = tmp_path / "raw" / "calls.jsonl"
     paths = runner.RunPaths.for_root(tmp_path)
     base = {
         "schema_version": 2, "model": "m1", "episode_id": ep.ep_id, "trial": 0,
         "window_index": 0, "input_tokens": 10, "output_tokens": 5, "response_time_ms": 1,
         "parsed_ads": [], "error": None,
     }
-    append_jsonl(calls_path, {**base, "addressing_mode": "timestamps", "prompt_variant": "detection"})
-    append_jsonl(calls_path, {**base, "addressing_mode": "timestamps", "prompt_variant": "segmentation"})
+    append_call(paths.raw, {**base, "addressing_mode": "timestamps", "prompt_variant": "detection"})
+    append_call(paths.raw, {**base, "addressing_mode": "timestamps", "prompt_variant": "segmentation"})
 
     runner.derive_episode_results(minimal_cfg, [ep], paths=paths)
     results = list(read_jsonl(paths.episode_results_jsonl))
@@ -112,9 +111,8 @@ def test_derive_episode_results_keeps_rows_for_two_variants(tmp_path, minimal_cf
 
 def test_derive_episode_results_legacy_record_defaults(tmp_path, minimal_cfg, make_episode):
     ep = make_episode(n_windows=1)
-    calls_path = tmp_path / "raw" / "calls.jsonl"
     paths = runner.RunPaths.for_root(tmp_path)
-    append_jsonl(calls_path, {
+    append_call(paths.raw, {
         "schema_version": 2, "model": "m1", "episode_id": ep.ep_id, "trial": 0,
         "window_index": 0, "input_tokens": 10, "output_tokens": 5, "response_time_ms": 1,
         "parsed_ads": [], "error": None,
@@ -191,7 +189,7 @@ def test_run_episode_filter_keeps_other_episodes_in_regenerated_report(
     write_corpus_episode(corpus_dir, "ep-b")
 
     paths = runner.RunPaths.for_root(tmp_path / "results")
-    append_jsonl(paths.calls_jsonl, {
+    append_call(paths.raw, {
         **CALL_TEMPLATE, "call_id": "cb1", "episode_id": "ep-b",
         "addressing_mode": "timestamps", "prompt_variant": "detection",
         "parsed_ads": [{"start": 0.0, "end": 30.0}],
@@ -241,7 +239,7 @@ def test_show_prompt_segmentation_record_with_snapshot_exits_2(tmp_path, monkeyp
     write_corpus_episode(tmp_path / "data" / "corpus")
 
     paths = runner.RunPaths.for_root(tmp_path / "results")
-    append_jsonl(paths.calls_jsonl, {
+    append_call(paths.raw, {
         **CALL_TEMPLATE, "call_id": "cseg1",
         "prompt_variant": "segmentation", "addressing_mode": "timestamps",
     })
@@ -270,13 +268,12 @@ def test_dump_prompt_segmentation_writes_frozen_prompt(tmp_path):
 def test_report_isolates_prompt_variants(tmp_path, minimal_cfg, pricing_snapshot, write_corpus_episode):
     ep_dir = write_corpus_episode(tmp_path / "corpus", segments=SEGMENTS)
     ep = corpus.load_episode(ep_dir)
-    calls_path = tmp_path / "calls.jsonl"
-    append_jsonl(calls_path, {
+    append_call(tmp_path, {
         **CALL_TEMPLATE, "call_id": "c1", "episode_id": ep.ep_id,
         "prompt_variant": "detection",
         "parsed_ads": [{"start_time": 0.0, "end_time": 30.0}],
     })
-    append_jsonl(calls_path, {
+    append_call(tmp_path, {
         **CALL_TEMPLATE, "call_id": "c2", "episode_id": ep.ep_id,
         "model": "m-seg-only", "prompt_variant": "segmentation",
         "parsed_ads": [{"start": 0.0, "end": 30.0}],
@@ -284,7 +281,7 @@ def test_report_isolates_prompt_variants(tmp_path, minimal_cfg, pricing_snapshot
 
     out_det = tmp_path / "report_det.md"
     report_mod.render(
-        cfg=minimal_cfg, episodes=[ep], calls_path=calls_path,
+        cfg=minimal_cfg, episodes=[ep], raw_dir=tmp_path,
         pricing_snapshot=pricing_snapshot, output_path=out_det, assets_dir=tmp_path / "assets_det",
     )
     text_det = out_det.read_text()
@@ -294,7 +291,7 @@ def test_report_isolates_prompt_variants(tmp_path, minimal_cfg, pricing_snapshot
 
     out_seg = tmp_path / "report_seg.md"
     report_mod.render(
-        cfg=minimal_cfg, episodes=[ep], calls_path=calls_path,
+        cfg=minimal_cfg, episodes=[ep], raw_dir=tmp_path,
         pricing_snapshot=pricing_snapshot, output_path=out_seg, assets_dir=tmp_path / "assets_seg",
         prompt_variant="segmentation",
     )
@@ -309,22 +306,21 @@ def test_report_historical_record_without_prompt_variant_counts_as_detection(
 ):
     ep_dir = write_corpus_episode(tmp_path / "corpus", segments=SEGMENTS)
     ep = corpus.load_episode(ep_dir)
-    calls_path = tmp_path / "calls.jsonl"
-    append_jsonl(calls_path, {
+    append_call(tmp_path, {
         **CALL_TEMPLATE, "call_id": "c1", "episode_id": ep.ep_id,
         "parsed_ads": [{"start_time": 0.0, "end_time": 30.0}],
     })  # no prompt_variant key, as every call before this feature existed
 
     out_det = tmp_path / "report.md"
     report_mod.render(
-        cfg=minimal_cfg, episodes=[ep], calls_path=calls_path,
+        cfg=minimal_cfg, episodes=[ep], raw_dir=tmp_path,
         pricing_snapshot=pricing_snapshot, output_path=out_det, assets_dir=tmp_path / "assets",
     )
     assert "`m1`" in out_det.read_text()
 
     out_seg = tmp_path / "report_seg.md"
     report_mod.render(
-        cfg=minimal_cfg, episodes=[ep], calls_path=calls_path,
+        cfg=minimal_cfg, episodes=[ep], raw_dir=tmp_path,
         pricing_snapshot=pricing_snapshot, output_path=out_seg, assets_dir=tmp_path / "assets_seg",
         prompt_variant="segmentation",
     )
@@ -350,15 +346,14 @@ def test_nondefault_cell_chart_links_point_at_own_assets_dir(
 ):
     ep_dir = write_corpus_episode(tmp_path / "corpus", segments=SEGMENTS)
     ep = corpus.load_episode(ep_dir)
-    calls_path = tmp_path / "calls.jsonl"
-    append_jsonl(calls_path, {
+    append_call(tmp_path, {
         **CALL_TEMPLATE, "call_id": "c1", "episode_id": ep.ep_id,
         "prompt_variant": "segmentation", "addressing_mode": "segment_ids",
         "parsed_ads": [{"start": 0.0, "end": 30.0}],
     })
     report_md, assets_dir = report_mod.report_paths(tmp_path, "segmentation", "segment_ids")
     report_mod.render(
-        cfg=minimal_cfg, episodes=[ep], calls_path=calls_path,
+        cfg=minimal_cfg, episodes=[ep], raw_dir=tmp_path,
         pricing_snapshot=pricing_snapshot, output_path=report_md, assets_dir=assets_dir,
         prompt_variant="segmentation", addressing_mode="segment_ids",
     )

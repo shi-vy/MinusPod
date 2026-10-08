@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from benchmark import corpus
 from benchmark.report import compare as compare_mod
-from benchmark.storage import append_jsonl
+from benchmark.storage import append_call
 
 from tests.test_addressing_mode import CALL_TEMPLATE, SEGMENTS
 
@@ -14,7 +14,7 @@ from tests.test_addressing_mode import CALL_TEMPLATE, SEGMENTS
 def test_compare_with_no_data_at_all(tmp_path, minimal_cfg, pricing_snapshot):
     out = tmp_path / "comparison.md"
     compare_mod.render(
-        cfg=minimal_cfg, episodes=[], calls_path=tmp_path / "calls.jsonl",
+        cfg=minimal_cfg, episodes=[], raw_dir=tmp_path,
         pricing_snapshot=pricing_snapshot, output_path=out,
     )
     assert "No benchmark data yet" in out.read_text()
@@ -25,19 +25,18 @@ def test_compare_pairs_segmentation_segment_ids_against_detection_timestamps(
 ):
     ep_dir = write_corpus_episode(tmp_path / "corpus", segments=SEGMENTS)
     ep = corpus.load_episode(ep_dir)
-    calls_path = tmp_path / "calls.jsonl"
-    append_jsonl(calls_path, {
+    append_call(tmp_path, {
         **CALL_TEMPLATE, "call_id": "c1", "episode_id": ep.ep_id,
         "prompt_variant": "detection", "addressing_mode": "timestamps",
         "parsed_ads": [{"start_time": 0.0, "end_time": 30.0}],
     })
-    append_jsonl(calls_path, {
+    append_call(tmp_path, {
         **CALL_TEMPLATE, "call_id": "c2", "episode_id": ep.ep_id,
         "prompt_variant": "segmentation", "addressing_mode": "segment_ids",
         "parsed_ads": [{"start": 0.0, "end": 30.0}],
     })
     # Present in only one cell: must not appear in the comparison at all.
-    append_jsonl(calls_path, {
+    append_call(tmp_path, {
         **CALL_TEMPLATE, "call_id": "c3", "episode_id": ep.ep_id,
         "model": "solo-model", "prompt_variant": "segmentation", "addressing_mode": "timestamps",
         "parsed_ads": [{"start_time": 0.0, "end_time": 30.0}],
@@ -45,7 +44,7 @@ def test_compare_pairs_segmentation_segment_ids_against_detection_timestamps(
 
     out = tmp_path / "comparison.md"
     compare_mod.render(
-        cfg=minimal_cfg, episodes=[ep], calls_path=calls_path,
+        cfg=minimal_cfg, episodes=[ep], raw_dir=tmp_path,
         pricing_snapshot=pricing_snapshot, output_path=out,
     )
     text = out.read_text()
@@ -69,8 +68,7 @@ def test_compare_model_in_only_one_cell_is_omitted(
 ):
     ep_dir = write_corpus_episode(tmp_path / "corpus", segments=SEGMENTS)
     ep = corpus.load_episode(ep_dir)
-    calls_path = tmp_path / "calls.jsonl"
-    append_jsonl(calls_path, {
+    append_call(tmp_path, {
         **CALL_TEMPLATE, "call_id": "c1", "episode_id": ep.ep_id,
         "prompt_variant": "detection", "addressing_mode": "timestamps",
         "parsed_ads": [{"start_time": 0.0, "end_time": 30.0}],
@@ -78,7 +76,7 @@ def test_compare_model_in_only_one_cell_is_omitted(
 
     out = tmp_path / "comparison.md"
     compare_mod.render(
-        cfg=minimal_cfg, episodes=[ep], calls_path=calls_path,
+        cfg=minimal_cfg, episodes=[ep], raw_dir=tmp_path,
         pricing_snapshot=pricing_snapshot, output_path=out,
     )
     text = out.read_text()
@@ -98,18 +96,17 @@ def test_compare_cost_per_episode_is_divided_by_cell_episode_count(
     that grows with how many episodes that cell happened to cover."""
     ep1 = corpus.load_episode(write_corpus_episode(tmp_path / "corpus", ep_id="ep-1", segments=SEGMENTS))
     ep2 = corpus.load_episode(write_corpus_episode(tmp_path / "corpus", ep_id="ep-2", segments=SEGMENTS))
-    calls_path = tmp_path / "calls.jsonl"
-    append_jsonl(calls_path, {
+    append_call(tmp_path, {
         **CALL_TEMPLATE, "call_id": "det-1", "episode_id": ep1.ep_id,
         "prompt_variant": "detection", "addressing_mode": "timestamps",
         "parsed_ads": [{"start_time": 0.0, "end_time": 30.0}],
     })
-    append_jsonl(calls_path, {
+    append_call(tmp_path, {
         **CALL_TEMPLATE, "call_id": "det-2", "episode_id": ep2.ep_id,
         "prompt_variant": "detection", "addressing_mode": "timestamps",
         "parsed_ads": [{"start_time": 0.0, "end_time": 30.0}],
     })
-    append_jsonl(calls_path, {
+    append_call(tmp_path, {
         **CALL_TEMPLATE, "call_id": "seg-1", "episode_id": ep1.ep_id,
         "prompt_variant": "segmentation", "addressing_mode": "segment_ids",
         "parsed_ads": [{"start": 0.0, "end": 30.0}],
@@ -117,7 +114,7 @@ def test_compare_cost_per_episode_is_divided_by_cell_episode_count(
 
     out = tmp_path / "comparison.md"
     compare_mod.render(
-        cfg=minimal_cfg, episodes=[ep1, ep2], calls_path=calls_path,
+        cfg=minimal_cfg, episodes=[ep1, ep2], raw_dir=tmp_path,
         pricing_snapshot=pricing_snapshot, output_path=out,
     )
     cells = _row_cells(out.read_text(), "m1")
@@ -131,13 +128,12 @@ def test_compare_header_notes_cost_per_episode_divergence_from_per_cell_report(
 ):
     ep_dir = write_corpus_episode(tmp_path / "corpus", segments=SEGMENTS)
     ep = corpus.load_episode(ep_dir)
-    calls_path = tmp_path / "calls.jsonl"
-    append_jsonl(calls_path, {
+    append_call(tmp_path, {
         **CALL_TEMPLATE, "call_id": "c1", "episode_id": ep.ep_id,
         "prompt_variant": "detection", "addressing_mode": "timestamps",
         "parsed_ads": [{"start_time": 0.0, "end_time": 30.0}],
     })
-    append_jsonl(calls_path, {
+    append_call(tmp_path, {
         **CALL_TEMPLATE, "call_id": "c2", "episode_id": ep.ep_id,
         "prompt_variant": "segmentation", "addressing_mode": "segment_ids",
         "parsed_ads": [{"start": 0.0, "end": 30.0}],
@@ -145,7 +141,7 @@ def test_compare_header_notes_cost_per_episode_divergence_from_per_cell_report(
 
     out = tmp_path / "comparison.md"
     compare_mod.render(
-        cfg=minimal_cfg, episodes=[ep], calls_path=calls_path,
+        cfg=minimal_cfg, episodes=[ep], raw_dir=tmp_path,
         pricing_snapshot=pricing_snapshot, output_path=out,
     )
     text = out.read_text()
@@ -158,19 +154,18 @@ def test_compare_excludes_deprecated_models(
 ):
     ep_dir = write_corpus_episode(tmp_path / "corpus", segments=SEGMENTS)
     ep = corpus.load_episode(ep_dir)
-    calls_path = tmp_path / "calls.jsonl"
     for call_id, variant, mode, ads in (
         ("d1", "detection", "timestamps", [{"start_time": 0.0, "end_time": 30.0}]),
         ("d2", "segmentation", "segment_ids", [{"start": 0.0, "end": 30.0}]),
     ):
-        append_jsonl(calls_path, {
+        append_call(tmp_path, {
             **CALL_TEMPLATE, "call_id": call_id, "model": "m-old", "episode_id": ep.ep_id,
             "prompt_variant": variant, "addressing_mode": mode, "parsed_ads": ads,
         })
 
     out = tmp_path / "comparison.md"
     compare_mod.render(
-        cfg=minimal_cfg, episodes=[ep], calls_path=calls_path,
+        cfg=minimal_cfg, episodes=[ep], raw_dir=tmp_path,
         pricing_snapshot=pricing_snapshot, output_path=out,
     )
     assert "m-old" not in out.read_text()
@@ -181,14 +176,13 @@ def test_compare_renders_numeric_delta_and_pvalue_with_two_shared_episodes(
 ):
     ep1 = corpus.load_episode(write_corpus_episode(tmp_path / "corpus", ep_id="ep-1", segments=SEGMENTS))
     ep2 = corpus.load_episode(write_corpus_episode(tmp_path / "corpus", ep_id="ep-2", segments=SEGMENTS))
-    calls_path = tmp_path / "calls.jsonl"
     for ep, det_ads in ((ep1, [{"start_time": 0.0, "end_time": 30.0}]), (ep2, [{"start_time": 0.0, "end_time": 5.0}])):
-        append_jsonl(calls_path, {
+        append_call(tmp_path, {
             **CALL_TEMPLATE, "call_id": f"det-{ep.ep_id}", "episode_id": ep.ep_id,
             "prompt_variant": "detection", "addressing_mode": "timestamps",
             "parsed_ads": det_ads,
         })
-        append_jsonl(calls_path, {
+        append_call(tmp_path, {
             **CALL_TEMPLATE, "call_id": f"seg-{ep.ep_id}", "episode_id": ep.ep_id,
             "prompt_variant": "segmentation", "addressing_mode": "segment_ids",
             "parsed_ads": [{"start": 0.0, "end": 30.0}],
@@ -196,7 +190,7 @@ def test_compare_renders_numeric_delta_and_pvalue_with_two_shared_episodes(
 
     out = tmp_path / "comparison.md"
     compare_mod.render(
-        cfg=minimal_cfg, episodes=[ep1, ep2], calls_path=calls_path,
+        cfg=minimal_cfg, episodes=[ep1, ep2], raw_dir=tmp_path,
         pricing_snapshot=pricing_snapshot, output_path=out,
     )
     delta_cell, p_cell = _row_cells(out.read_text(), "m1")[-2:]

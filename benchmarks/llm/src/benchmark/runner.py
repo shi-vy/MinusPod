@@ -1,4 +1,4 @@
-"""Async fan-out runner: dispatches LLM calls and writes calls.jsonl."""
+"""Async fan-out runner: dispatches LLM calls and writes per-model call shards."""
 from __future__ import annotations
 
 import asyncio
@@ -17,10 +17,11 @@ from .corpus import Episode, load_episode, stamp_id_windows
 from .metrics import compliance_score, schema_audit
 from .storage import (
     SCHEMA_VERSION,
+    append_call,
     append_jsonl,
     append_response,
     hash_prompt,
-    read_jsonl,
+    read_calls,
     safe_model_id,
     sanitize_error,
     scan_calls,
@@ -40,7 +41,8 @@ class WorkUnit:
 
 @dataclass
 class RunPaths:
-    calls_jsonl: Path
+    raw: Path
+    calls_dir: Path
     episode_results_jsonl: Path
     responses_dir: Path
     prompts_dir: Path
@@ -49,7 +51,8 @@ class RunPaths:
     def for_root(cls, results_root: Path) -> "RunPaths":
         raw = results_root / "raw"
         return cls(
-            calls_jsonl=raw / "calls.jsonl",
+            raw=raw,
+            calls_dir=raw / "calls",
             episode_results_jsonl=raw / "episode_results.jsonl",
             responses_dir=raw / "responses",
             prompts_dir=raw / "prompts",
@@ -229,7 +232,7 @@ async def run(
     )
     id_windows_by_ep = _id_windows_for_episodes(episodes, addressing_mode)
 
-    completed, err_keys = scan_calls(paths.calls_jsonl)
+    completed, err_keys = scan_calls(read_calls(paths.raw))
     units, skipped = build_work_list(
         cfg, episodes,
         completed=completed,
@@ -353,7 +356,7 @@ async def run(
                 # chatty models (phi-4, some Gemini variants) that won't fit
                 # under a tight max_tokens budget even when not truncated.
                 "over_1024_tokens": (output_tokens or 0) > 1024,
-                "response_path": str(response_path.relative_to(paths.calls_jsonl.parent)) if response_path else None,
+                "response_path": str(response_path.relative_to(paths.raw)) if response_path else None,
                 "extraction_method": extraction_method,
                 "compliance_score": comp,
                 "id_contract_miss": id_contract_miss,
@@ -363,9 +366,9 @@ async def run(
                 "error": error_payload,
             }
             try:
-                append_jsonl(paths.calls_jsonl, record)
+                append_call(paths.raw, record)
             except Exception as write_e:
-                logger.exception("failed to append calls.jsonl record %s: %s", call_id, write_e)
+                logger.exception("failed to append call record %s: %s", call_id, write_e)
                 return
 
             if error_payload:
@@ -382,12 +385,12 @@ async def run(
 
 
 def derive_episode_results(cfg: BenchmarkConfig, episodes: list[Episode], *, paths: RunPaths) -> None:
-    """Recompute episode_results.jsonl from calls.jsonl. Idempotent."""
+    """Recompute episode_results.jsonl from the call shards. Idempotent."""
     if paths.episode_results_jsonl.exists():
         paths.episode_results_jsonl.unlink()
 
     by_trial: dict[tuple[str, str, int, str, str], list[dict]] = {}
-    for rec in read_jsonl(paths.calls_jsonl):
+    for rec in read_calls(paths.raw):
         if rec.get("error"):
             continue
         prompt_variant, addressing_mode = variants.record_cell(rec)

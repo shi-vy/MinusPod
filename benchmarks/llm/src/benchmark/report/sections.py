@@ -271,7 +271,7 @@ def _render_failures(calls: list[dict]) -> str:
         "",
         "### Sample messages (first 3 per category)",
         "",
-        "First three raw error messages per category, so you can see what the provider actually returned without grepping calls.jsonl. Messages are truncated to ~240 characters; full text lives in `results/raw/calls.jsonl`.",
+        "First three raw error messages per category, so you can see what the provider actually returned without grepping the call records. Messages are truncated to ~240 characters; full text lives in `results/raw/calls/<model>.jsonl`.",
         "",
     ]
     for cat, recs in sorted(by_bucket.items(), key=lambda x: -len(x[1])):

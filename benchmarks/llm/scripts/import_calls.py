@@ -1,4 +1,4 @@
-"""Import calls.jsonl rows + response-shard lines from another run's raw export."""
+"""Import call records + response-shard lines from another run's raw export."""
 from __future__ import annotations
 
 import argparse
@@ -9,7 +9,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "benchmarks" / "llm" / "src"))
 
-from benchmark.storage import dump_line, read_jsonl, safe_model_id  # noqa: E402
+from benchmark.storage import append_call, dump_line, read_calls, read_jsonl, safe_model_id  # noqa: E402
 
 DEST_RAW = Path(__file__).resolve().parents[1] / "results" / "raw"
 
@@ -30,13 +30,16 @@ def _insert_prompt_variant(row: dict, variant: str) -> dict:
 
 
 def import_calls(from_raw: Path, variant: str, dest_raw: Path = DEST_RAW) -> tuple[int, dict[str, int]]:
-    """Append new rows/shard lines from from_raw into dest_raw; returns (rows appended, {shard_filename: lines appended})."""
-    dest_calls = dest_raw / "calls.jsonl"
-    existing_ids = _load_call_ids(dest_calls)
+    """Append new rows/shard lines from from_raw into dest_raw; returns (rows appended, {shard_filename: lines appended}).
+
+    Reads from_raw via read_calls, which handles both a legacy flat
+    calls.jsonl (the #801-style checkout) and calls/ shards transparently.
+    """
+    existing_ids = {rec["call_id"] for rec in read_calls(dest_raw)}
 
     new_rows: list[dict] = []
     new_ids_by_model: dict[str, set[str]] = {}
-    for row in read_jsonl(from_raw / "calls.jsonl"):
+    for row in read_calls(from_raw):
         call_id = row["call_id"]
         if call_id in existing_ids:
             continue
@@ -45,11 +48,8 @@ def import_calls(from_raw: Path, variant: str, dest_raw: Path = DEST_RAW) -> tup
         new_rows.append(_insert_prompt_variant(row, variant))
         new_ids_by_model.setdefault(row["model"], set()).add(call_id)
 
-    if new_rows:
-        dest_calls.parent.mkdir(parents=True, exist_ok=True)
-        with dest_calls.open("a", encoding="utf-8") as f:
-            for row in new_rows:
-                f.write(dump_line(row))
+    for row in new_rows:
+        append_call(dest_raw, row)
 
     shard_counts = _import_shards(from_raw, dest_raw, new_ids_by_model)
     return len(new_rows), shard_counts
@@ -87,7 +87,7 @@ def main() -> None:
     args = parser.parse_args()
 
     rows_added, shard_counts = import_calls(args.from_raw, args.variant)
-    print(f"calls.jsonl: {rows_added} row(s) appended")
+    print(f"calls/: {rows_added} row(s) appended")
     for shard, count in sorted(shard_counts.items()):
         print(f"responses/{shard}: {count} line(s) appended")
 

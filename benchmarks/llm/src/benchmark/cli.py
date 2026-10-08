@@ -6,6 +6,7 @@ import dataclasses
 import hashlib
 import logging
 import shutil
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -20,7 +21,18 @@ from . import auth, capture as capture_mod, corpus as corpus_mod, migrate as mig
 from .report import compare as compare_mod
 from .config import BenchmarkConfig, load as load_config
 from .runner import build_work_list, precompute_prompt_hashes
-from .storage import find_call, hash_prompt, read_response, scan_calls
+from .storage import (
+    StorageError,
+    append_call,
+    call_shard,
+    calls_dir,
+    find_call,
+    hash_prompt,
+    read_calls,
+    read_jsonl,
+    read_response,
+    scan_calls,
+)
 
 app = typer.Typer(
     add_completion=False,
@@ -267,8 +279,11 @@ def run(
 
     if force:
         typer.echo("WARNING: --force will reset existing calls; abort if unintended.")
-        if paths.calls_jsonl.exists():
-            paths.calls_jsonl.unlink()
+        legacy = paths.raw / "calls.jsonl"
+        if legacy.exists():
+            legacy.unlink()
+        if paths.calls_dir.exists():
+            shutil.rmtree(paths.calls_dir)
 
     if dry_run:
         units, skipped = _preview(
@@ -293,7 +308,7 @@ def run(
     report_mod.render(
         cfg=cfg,
         episodes=episodes,
-        calls_path=paths.calls_jsonl,
+        raw_dir=paths.raw,
         pricing_snapshot=snap,
         output_path=output,
         assets_dir=assets,
@@ -336,7 +351,7 @@ def report(
     report_mod.render(
         cfg=cfg,
         episodes=episodes,
-        calls_path=paths.calls_jsonl,
+        raw_dir=paths.raw,
         pricing_snapshot=snap,
         output_path=output,
         assets_dir=assets,
@@ -361,7 +376,7 @@ def compare(
     compare_mod.render(
         cfg=cfg,
         episodes=episodes,
-        calls_path=paths.calls_jsonl,
+        raw_dir=paths.raw,
         pricing_snapshot=snap,
         output_path=output,
     )
@@ -413,10 +428,81 @@ def migrate_raw_cmd(
         )
 
 
+@dataclasses.dataclass
+class _MigrateCallsResult:
+    legacy_rows: int
+    appended: int
+    skipped: int
+    total_shard_rows: int
+
+
+def _migrate_calls(raw_dir: Path) -> _MigrateCallsResult:
+    """Fold legacy calls.jsonl rows into their per-model call shards.
+
+    Idempotent: a call_id already present in its shard is skipped rather than
+    appended again, so a rerun after an interrupted prior pass is safe.
+    """
+    legacy_rows = list(read_jsonl(raw_dir / "calls.jsonl"))
+
+    by_model: dict[str, list[dict]] = defaultdict(list)
+    for rec in legacy_rows:
+        by_model[rec["model"]].append(rec)
+
+    appended = skipped = 0
+    for model, recs in by_model.items():
+        shard = call_shard(raw_dir, model)
+        existing_ids = {r.get("call_id") for r in read_jsonl(shard)}
+        for rec in recs:
+            if rec.get("call_id") in existing_ids:
+                skipped += 1
+                continue
+            append_call(raw_dir, rec)
+            existing_ids.add(rec.get("call_id"))
+            appended += 1
+
+    all_ids = [
+        r.get("call_id")
+        for shard in sorted(calls_dir(raw_dir).glob("*.jsonl"))
+        for r in read_jsonl(shard)
+    ]
+    duplicates = [cid for cid, n in Counter(all_ids).items() if n > 1]
+    if duplicates:
+        raise StorageError(f"{len(duplicates)} call_id(s) duplicated across shards; aborting before delete")
+
+    return _MigrateCallsResult(
+        legacy_rows=len(legacy_rows), appended=appended, skipped=skipped, total_shard_rows=len(all_ids),
+    )
+
+
+@app.command("migrate-calls")
+def migrate_calls_cmd() -> None:
+    """One-time migration of results/raw/calls.jsonl into per-model shards (schema v3).
+
+    Idempotent (skips call_ids already present in their shard); verifies no
+    call_id is duplicated across shards before deleting calls.jsonl.
+    """
+    _setup_logging()
+    paths = runner_mod.RunPaths.for_root(_root() / "results")
+    legacy = paths.raw / "calls.jsonl"
+    if not legacy.is_file():
+        typer.echo(f"no {legacy} to migrate", err=True)
+        raise typer.Exit(1)
+    try:
+        result = _migrate_calls(paths.raw)
+    except StorageError as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(1) from e
+    legacy.unlink()
+    typer.echo(f"legacy rows: {result.legacy_rows}")
+    typer.echo(f"appended to shards: {result.appended}")
+    typer.echo(f"already present (skipped): {result.skipped}")
+    typer.echo(f"total rows across shards: {result.total_shard_rows}")
+
+
 def _find_call_or_exit(paths: runner_mod.RunPaths, call_id: str) -> dict:
-    rec = find_call(paths.calls_jsonl, call_id)
+    rec = find_call(paths.raw, call_id)
     if rec is None:
-        typer.echo(f"call_id not found in {paths.calls_jsonl}: {call_id}", err=True)
+        typer.echo(f"call_id not found under {paths.calls_dir}: {call_id}", err=True)
         raise typer.Exit(1)
     return rec
 
@@ -533,14 +619,16 @@ def rotate_raw_cmd(
 ) -> None:
     """Move results/raw to results/archive/<date>/raw/ so the next sweep starts clean.
 
-    calls.jsonl is append-only, so without rotation it accumulates every campaign
-    ever run. That is unbounded growth and a correctness hazard: the report dedups
-    per work unit without consulting prompt_hash, so a partially-completed sweep
-    silently blends its rows with the previous campaign's.
+    Call records are append-only (legacy calls.jsonl or calls/ shards), so
+    without rotation they accumulate every campaign ever run. That is unbounded
+    growth and a correctness hazard: the report dedups per work unit without
+    consulting prompt_hash, so a partially-completed sweep silently blends its
+    rows with the previous campaign's.
     """
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     src = _root() / "results" / "raw"
-    if not src.is_dir() or not (src / "calls.jsonl").is_file():
+    has_calls = (src / "calls.jsonl").is_file() or any((src / "calls").glob("*.jsonl"))
+    if not src.is_dir() or not has_calls:
         typer.echo("no results/raw to rotate", err=True)
         raise typer.Exit(1)
     dst = _root() / "results" / "archive" / today / "raw"
@@ -554,6 +642,7 @@ def rotate_raw_cmd(
     else:
         shutil.move(str(src), str(dst))
         (_root() / "results" / "raw" / "responses").mkdir(parents=True, exist_ok=True)
+        (_root() / "results" / "raw" / "calls").mkdir(parents=True, exist_ok=True)
     typer.echo(f"rotated {size_mb:.0f} MB to {dst}" + (" (original kept)" if keep else ""))
 
 
@@ -561,7 +650,7 @@ def _preview(cfg, episodes, *, paths, system_prompt, include_errored=False, addr
     hashes = precompute_prompt_hashes(
         cfg, episodes, system_prompt=system_prompt, addressing_mode=addressing_mode, prompt_variant=prompt_variant,
     )
-    completed, err_keys = scan_calls(paths.calls_jsonl)
+    completed, err_keys = scan_calls(read_calls(paths.raw))
     units, skipped = build_work_list(
         cfg, episodes, completed=completed, prompt_hashes=hashes,
         include_errored=include_errored, error_keys=err_keys,

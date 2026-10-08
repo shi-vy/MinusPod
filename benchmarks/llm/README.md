@@ -15,13 +15,13 @@ benchmarks/llm/
     candidates/              # gitignored work-in-progress captures
     pricing_snapshots/       # committed pricing history
   results/
-    raw/                     # calls.jsonl, episode_results.jsonl, responses/<model>.jsonl shards
+    raw/                     # calls/<model>.jsonl, responses/<model>.jsonl shards, episode_results.jsonl
     report.md                # current report
     report_assets/           # SVG charts referenced by report.md
     archive/                 # explicit snapshots: results/archive/<date>/
 ```
 
-Raw response bodies live in one JSONL shard per model (`results/raw/responses/<model>.jsonl`, lines of `{call_id, body}`), so the file count stays flat as the corpus grows. Prompts are not stored at all: they reconstruct deterministically from the corpus, and `benchmark show-prompt <call_id>` verifies the result against the `prompt_hash` recorded at call time. `benchmark show-response <call_id>` prints a single raw response body.
+Raw call records and response bodies each live in one JSONL shard per model (`results/raw/calls/<model>.jsonl` and `results/raw/responses/<model>.jsonl`, the latter lines of `{call_id, body}`), so the file count stays flat as the corpus grows and no single file approaches GitHub's 100 MB blob limit. Prompts are not stored at all: they reconstruct deterministically from the corpus, and `benchmark show-prompt <call_id>` verifies the result against the `prompt_hash` recorded at call time. `benchmark show-response <call_id>` prints a single raw response body.
 
 ## Setup
 
@@ -133,6 +133,14 @@ benchmark migrate-raw
 
 One-time conversion of the old per-call `.txt` layout to per-model JSONL shards. Verifies every body byte-exact before deleting, backs up `calls.jsonl`, and keeps any prompt file that does not reconstruct from the corpus. Safe to re-run if interrupted.
 
+### Migrate a v2 checkout (flat calls.jsonl)
+
+```sh
+benchmark migrate-calls
+```
+
+One-time conversion of a flat `results/raw/calls.jsonl` into per-model shards under `results/raw/calls/`. Skips any `call_id` already present in its shard, so it is safe to re-run if interrupted; deletes `calls.jsonl` only after verifying no `call_id` is duplicated across shards.
+
 ## Concurrency
 
 `benchmark run` dispatches calls via `asyncio.gather` against the OpenAI / Anthropic SDKs. Two semaphores cap concurrency:
@@ -140,7 +148,7 @@ One-time conversion of the old per-call `.txt` layout to per-model JSONL shards.
 - `[run] max_concurrent_calls` (default 8): global cap.
 - `[run] max_concurrent_per_provider` (default 4): per-provider cap.
 
-Two simultaneous `benchmark run` invocations against the same `calls.jsonl` are unsupported and will produce duplicate entries. The runner is single-process by design.
+Two simultaneous `benchmark run` invocations against the same shards are unsupported and will produce duplicate entries. The runner is single-process by design.
 
 ## Auth
 
@@ -148,7 +156,7 @@ MinusPod uses Flask sessions. `benchmark capture` reads the password from `MINUS
 
 ## Determinism
 
-Every `(model, episode, trial, window_index)` combination computes a `prompt_hash` over the system prompt, user prompt, model id, and temperature. The runner skips any tuple whose hash already appears in `calls.jsonl`. Editing windows (via `regenerate-windows --force`) changes the hash and forces a re-run for affected windows.
+Every `(model, episode, trial, window_index)` combination computes a `prompt_hash` over the system prompt, user prompt, model id, and temperature. The runner skips any tuple whose hash already appears in the call records. Editing windows (via `regenerate-windows --force`) changes the hash and forces a re-run for affected windows.
 
 ## Addressing-mode A/B
 
@@ -163,7 +171,7 @@ benchmark run                                    # timestamps mode (default)
 benchmark run --addressing-mode segment_ids       # segment-ID mode
 ```
 
-Both commands append to the same `calls.jsonl`; each call record carries the
+Both commands append to the same per-model call shards; each call record carries the
 `addressing_mode` it ran under (records written before this field existed are
 treated as `timestamps`). `benchmark report` and `benchmark run` both accept
 `--addressing-mode` and only render calls recorded under that mode, so a
@@ -196,7 +204,7 @@ default cell (`detection`, `timestamps`) keeps `results/report.md` and
 `results/report_assets/`; any other cell writes
 `results/report-<variant>-<mode>.md` and `results/report_assets-<variant>-
 <mode>/`, so cells never clobber each other's charts. `benchmark compare`
-renders every cell found in `calls.jsonl` side by side in
+renders every cell found in the call records side by side in
 `results/comparison.md`. `show-prompt` and `dump-prompt` also accept
 `--prompt-variant`.
 
@@ -218,13 +226,14 @@ will be re-run separately under it.
 
 ## Cost
 
-Costs are recomputed from token counts at report time using the latest pricing snapshot in `data/pricing_snapshots/`. The `*_at_runtime` fields in `calls.jsonl` preserve actual spend.
+Costs are recomputed from token counts at report time using the latest pricing snapshot in `data/pricing_snapshots/`. The `*_at_runtime` fields on each call record preserve actual spend.
 
 A full sweep across the recommended 32-model list and 7-episode corpus is roughly $80-$300 depending on model mix. Use `--dry-run` before kicking off to see the call count.
 
 ## Schema versions
 
-Every record in `calls.jsonl` and `episode_results.jsonl` carries `schema_version`. Schema changes require a coordinated writer/reader update + version bump.
+Every call record and `episode_results.jsonl` record carries `schema_version`. Schema changes require a coordinated writer/reader update + version bump.
 
 - v1: one `.txt` per call under `responses/`, one `.txt` per `prompt_hash` under `prompts/`; records carry `prompt_path`.
-- v2 (current): response bodies in per-model JSONL shards (`responses/<model>.jsonl`, keyed by `call_id`); prompts are not stored (reconstruct via `show-prompt`); `prompt_path` dropped and `response_path` points at the shard. Convert a v1 checkout with `benchmark migrate-raw`.
+- v2: response bodies in per-model JSONL shards (`responses/<model>.jsonl`, keyed by `call_id`); prompts are not stored (reconstruct via `show-prompt`); `prompt_path` dropped and `response_path` points at the shard. Convert a v1 checkout with `benchmark migrate-raw`.
+- v3 (current): call records also live in per-model JSONL shards (`calls/<model>.jsonl`) instead of one `calls.jsonl`; readers accept v2 and v3 records (the only difference is where the row lives). Convert a v2 checkout with `benchmark migrate-calls`.

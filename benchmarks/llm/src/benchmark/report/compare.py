@@ -15,7 +15,7 @@ from pathlib import Path
 
 from .. import pricing
 from ..corpus import Episode
-from ..storage import read_jsonl
+from ..storage import read_calls
 from ..variants import ADDRESSING_MODES, PROMPT_VARIANTS, record_cell
 from .aggregate import ModelStats, _aggregate, _dedup_last_write_wins, _paired_t_pvalue
 
@@ -42,11 +42,11 @@ def render(
     *,
     cfg,
     episodes: list[Episode],
-    calls_path: Path,
+    raw_dir: Path,
     pricing_snapshot: pricing.PricingSnapshot,
     output_path: Path,
 ) -> None:
-    all_calls = list(read_jsonl(calls_path))
+    all_calls = list(read_calls(raw_dir))
     calls_by_cell: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for r in all_calls:
         calls_by_cell[record_cell(r)].append(r)

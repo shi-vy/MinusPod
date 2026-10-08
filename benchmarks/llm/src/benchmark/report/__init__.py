@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .. import pricing
 from ..corpus import Episode
-from ..storage import read_jsonl
+from ..storage import read_calls
 from ..variants import record_cell
 from .aggregate import (
     _aggregate,
@@ -75,7 +75,7 @@ def render(
     *,
     cfg,
     episodes: list[Episode],
-    calls_path: Path,
+    raw_dir: Path,
     pricing_snapshot: pricing.PricingSnapshot,
     output_path: Path,
     assets_dir: Path,
@@ -83,7 +83,7 @@ def render(
     addressing_mode: str = "timestamps",
     prompt_variant: str = "detection",
 ) -> None:
-    """Render results/report.md from calls.jsonl.
+    """Render results/report.md from the call records under raw_dir.
 
     ``addressing_mode`` isolates the report to one addressing scheme: calls
     are filtered to records whose ``addressing_mode`` field (missing on every
@@ -102,7 +102,7 @@ def render(
     if title_suffixes:
         title += " (" + ", ".join(title_suffixes) + ")"
 
-    all_calls = list(read_jsonl(calls_path))
+    all_calls = list(read_calls(raw_dir))
     raw_calls = [r for r in all_calls if record_cell(r) == (prompt_variant, addressing_mode)]
     if not raw_calls:
         run_hint = "benchmark run"

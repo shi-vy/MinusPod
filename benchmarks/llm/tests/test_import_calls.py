@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from benchmark.storage import StorageError
+from benchmark.storage import StorageError, read_calls
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "import_calls.py"
 _spec = importlib.util.spec_from_file_location("import_calls", SCRIPT_PATH)
@@ -52,10 +52,9 @@ def test_inserts_prompt_variant_after_addressing_mode(tmp_path):
     assert rows_added == 2
     assert shard_counts == {"deepseek_deepseek-v4-flash.jsonl": 1, "gemma4_e4b.jsonl": 1}
 
-    lines = (dest / "calls.jsonl").read_text().splitlines()
-    assert len(lines) == 2
-    for line in lines:
-        row = json.loads(line)
+    rows = list(read_calls(dest))
+    assert len(rows) == 2
+    for row in rows:
         keys = list(row.keys())
         assert row["prompt_variant"] == "segmentation"
         assert keys.index("prompt_variant") == keys.index("addressing_mode") + 1
@@ -77,7 +76,7 @@ def test_existing_prompt_variant_is_overwritten_by_stamp(tmp_path):
     rows_added, _ = import_calls.import_calls(src, "segmentation", dest_raw=dest)
     assert rows_added == 1
 
-    row = json.loads((dest / "calls.jsonl").read_text().splitlines()[0])
+    row = list(read_calls(dest))[0]
     keys = list(row.keys())
     assert row["prompt_variant"] == "segmentation"
     assert keys.count("prompt_variant") == 1
@@ -93,7 +92,7 @@ def test_import_is_idempotent(tmp_path):
 
     assert rows_added_again == 0
     assert shard_counts_again == {}
-    assert len((dest / "calls.jsonl").read_text().splitlines()) == 2
+    assert len(list(read_calls(dest))) == 2
     assert len((dest / "responses" / "deepseek_deepseek-v4-flash.jsonl").read_text().splitlines()) == 1
     assert len((dest / "responses" / "gemma4_e4b.jsonl").read_text().splitlines()) == 1
 

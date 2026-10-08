@@ -7801,6 +7801,104 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
 
+  /system/config-backup:
+    get:
+      tags: [System]
+      summary: Download runtime configuration JSON
+      description: >-
+        Exports portable global and feed settings, including configured credentials.
+        Excludes the database, episodes, patterns, history, metrics, media, and administrator
+        sign-in credentials. Keep the downloaded file private. Limited to 5/hour.
+        The separate config-export endpoint produces a redacted diagnostic file.
+      operationId: downloadRuntimeConfig
+      responses:
+        '200':
+          description: Private configuration attachment with Cache-Control no-store
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuntimeConfigDocument'
+        '401':
+          description: Authentication required
+        '413':
+          description: Complete configuration exceeds the supported import request size
+        '500':
+          description: Configuration or credentials could not be exported
+
+  /system/config-import/preview:
+    post:
+      tags: [System]
+      summary: Preview runtime configuration changes
+      description: >-
+        Validates a configuration document and selected scope without writing settings.
+        Returns setting names and feed slugs, never credential values. Limited to 20/hour.
+      operationId: previewRuntimeConfigImport
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RuntimeConfigImportRequest'
+      responses:
+        '200':
+          description: Preview and destination-state token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuntimeConfigImportPreview'
+        '400':
+          description: Invalid configuration, scope, selection, or conflicting feed identity
+        '413':
+          description: Request exceeds 10 MiB
+
+  /system/config-import:
+    post:
+      tags: [System]
+      summary: Apply a previewed runtime configuration import
+      description: >-
+        Merges selected settings atomically and re-encrypts credentials for this installation.
+        Omitted settings and destination-only feeds remain unchanged. Does not restore a
+        database, episodes, history, metrics, patterns, or media. Limited to 5/hour.
+      operationId: applyRuntimeConfigImport
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/RuntimeConfigImportRequest'
+                - type: object
+                  required: [previewToken]
+                  properties:
+                    previewToken:
+                      type: string
+                      description: Token from previewing the same document and selection
+      responses:
+        '200':
+          description: Applied configuration and any feed-refresh warnings
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                  addedFeeds:
+                    type: array
+                    items: {type: string}
+                  updatedFeeds:
+                    type: array
+                    items: {type: string}
+                  warnings:
+                    type: array
+                    items: {type: string}
+        '400':
+          description: Invalid configuration, selection, or destination compatibility
+        '409':
+          description: Preview is stale; preview the selected configuration again
+        '413':
+          description: Request exceeds 10 MiB
+
   /system/config-export:
     get:
       tags:
@@ -11354,6 +11452,102 @@ components:
         example: 550e8400-e29b-41d4-a716-446655440000
 
   schemas:
+    RuntimeConfigDocument:
+      type: object
+      required: [format, formatVersion, settings, feeds]
+      properties:
+        format:
+          type: string
+          const: minuspod-runtime-config
+        formatVersion:
+          type: integer
+          const: 1
+        appVersion:
+          type: string
+        exportedAt:
+          type: string
+          format: date-time
+        containsSecrets:
+          type: boolean
+        settings:
+          type: object
+          additionalProperties: true
+          description: Portable runtime setting names and values. Null is allowed only for credentials, supported nullable overrides, and pattern_cleanup_model.
+        feeds:
+          type: array
+          items:
+            type: object
+            required: [slug, feedType, settings]
+            properties:
+              slug:
+                type: string
+              feedType:
+                type: string
+                enum: [subscribed, local, recents]
+              settings:
+                type: object
+                additionalProperties: true
+                description: Feed configuration only; no episodes or history.
+
+    RuntimeConfigImportRequest:
+      type: object
+      required: [document, scope]
+      properties:
+        document:
+          $ref: '#/components/schemas/RuntimeConfigDocument'
+        scope:
+          type: string
+          enum: [everything, global, feeds]
+          description: Everything means global and feed configuration only.
+        selectedFeeds:
+          type: array
+          uniqueItems: true
+          items: {type: string}
+          description: Feed slugs for feeds scope; omission selects all feeds in the document.
+
+    RuntimeConfigImportPreview:
+      type: object
+      properties:
+        previewToken:
+          type: string
+        scope:
+          type: string
+          enum: [everything, global, feeds]
+        settings:
+          type: array
+          items: {type: string}
+        changedSettings:
+          type: array
+          items:
+            type: object
+            properties:
+              kind:
+                type: string
+                const: setting
+              key:
+                type: string
+              secret:
+                type: boolean
+        addedFeeds:
+          type: array
+          items: {type: string}
+        updatedFeeds:
+          type: array
+          items: {type: string}
+        skippedUnknownSettings:
+          type: array
+          items: {type: string}
+        preservesTargetOnlyFeeds:
+          type: boolean
+        warning:
+          type: string
+        warnings:
+          type: array
+          items: {type: string}
+        selectedFeedSlugs:
+          type: array
+          items: {type: string}
+
     AddressingModeStats:
       type: object
       description: Compliance aggregate for one addressing mode (from addressing_log)
@@ -11836,6 +12030,9 @@ components:
         - $ref: '#/components/schemas/PatternCleanupSettings'
         - type: object
           properties:
+            modelMissing:
+              type: boolean
+              description: True when cleanup has an explicitly cleared model and needs a selection before a run. If false and model is blank, cleanup inherits from detection.
             inProgress:
               type: boolean
               description: Whether another run currently holds the cleanup lock.

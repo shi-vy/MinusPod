@@ -52,6 +52,8 @@ Every term the app uses, in plain words, with a link to the part of the docs tha
 
 **Confidence** - The detector's certainty (0-100%) that a flagged region is an ad. Only detections at or above the cut threshold are removed; the rest stay in the audio for review. [Configuration > Ad Detection Settings](configuration.md#ad-detection-settings)
 
+**Configuration transfer** - Exporting and restoring runtime global settings and feed configuration. It preserves episodes, history, metrics, and media. [Runtime configuration transfer](configuration-transfer.md)
+
 **Contaminated pattern** - A learned ad pattern that contains show content or other material that should not be matched as an ad. Pattern Cleanup can flag it for review; nothing changes until a suggestion is approved. [Pattern Cleanup](pattern-cleanup.md#suggestion-kinds)
 
 **Correction** - Your verdict on a detection: "Confirm ad" or "Not an ad". Corrections train future detection for that feed and can trigger a recut. [Web Interface > Ad Review tab](web-interface.md#ad-review-tab)

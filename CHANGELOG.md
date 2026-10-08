@@ -14,10 +14,12 @@ release notes.
 ### Added
 - Pattern Cleanup can suggest category changes alongside text and sponsor edits, including separate categories for split patterns.
 - Podping settings let users add, edit, remove, and reset RPC servers through the UI and API.
+- Export and restore runtime configuration for global settings, all feeds, or selected feeds. Preview configuration changes before applying them; episodes, history, and unselected feeds are preserved. (#823)
 
 ### Fixed
 - Retired search-index cleanup uses smaller write batches so it releases the database lock more often.
 - Processing history shows chapter-generation warnings. Failed chapter regeneration keeps existing chapters and reports the failure. Chapter generation respects cancellation and provider changes, and detailed response text is logged only at debug level.
+- Changing a provider, endpoint, or stage route clears affected model selections and shows a reminder to choose a model. Changing an API key keeps model selections. API requests can set replacement models in the same update.
 
 ## [2.98.2] - 2026-10-07
 

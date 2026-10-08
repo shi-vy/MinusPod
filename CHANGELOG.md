@@ -14,6 +14,9 @@ release notes.
 ### Added
 - Pattern Cleanup can suggest category changes alongside text and sponsor edits, including separate categories for split patterns.
 
+### Fixed
+- Retired search-index cleanup uses smaller write batches so it releases the database lock more often.
+
 ## [2.98.2] - 2026-10-07
 
 ### Fixed
